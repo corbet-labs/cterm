@@ -19,6 +19,45 @@ pub struct PtySize {
     pub pixel_height: u16,
 }
 
+impl PtySize {
+    pub const DEFAULT_CELL_WIDTH: u16 = 8;
+    pub const DEFAULT_CELL_HEIGHT: u16 = 16;
+
+    /// Fill missing cell and pixel dimensions with conservative terminal
+    /// defaults. POSIX `winsize` consumers rely on nonzero pixel values to
+    /// determine the character-cell size.
+    pub fn normalized(self) -> Self {
+        let cols = self.cols.max(1);
+        let rows = self.rows.max(1);
+        let pixel_width = if self.pixel_width == 0 {
+            cols.saturating_mul(Self::DEFAULT_CELL_WIDTH).max(1)
+        } else {
+            self.pixel_width
+        };
+        let pixel_height = if self.pixel_height == 0 {
+            rows.saturating_mul(Self::DEFAULT_CELL_HEIGHT).max(1)
+        } else {
+            self.pixel_height
+        };
+        Self {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        }
+    }
+
+    pub fn cell_width(self) -> f64 {
+        let size = self.normalized();
+        f64::from(size.pixel_width) / f64::from(size.cols)
+    }
+
+    pub fn cell_height(self) -> f64 {
+        let size = self.normalized();
+        f64::from(size.pixel_height) / f64::from(size.rows)
+    }
+}
+
 /// Errors that can occur with PTY operations
 #[derive(Error, Debug)]
 pub enum PtyError {
@@ -142,12 +181,13 @@ mod unix {
         }
 
         /// Resize the PTY
-        pub fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
+        pub fn resize(&self, size: PtySize) -> io::Result<()> {
+            let size = size.normalized();
             let size = libc::winsize {
-                ws_row: rows,
-                ws_col: cols,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
+                ws_row: size.rows,
+                ws_col: size.cols,
+                ws_xpixel: size.pixel_width,
+                ws_ypixel: size.pixel_height,
             };
 
             let ret = unsafe { libc::ioctl(self.master_fd, libc::TIOCSWINSZ, &size) };
@@ -404,11 +444,12 @@ mod unix {
             }
 
             // Set the initial window size
+            let pty_size = config.size.normalized();
             let size = libc::winsize {
-                ws_row: config.size.rows,
-                ws_col: config.size.cols,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
+                ws_row: pty_size.rows,
+                ws_col: pty_size.cols,
+                ws_xpixel: pty_size.pixel_width,
+                ws_ypixel: pty_size.pixel_height,
             };
             libc::ioctl(slave_fd, libc::TIOCSWINSZ, &size);
 
@@ -486,16 +527,9 @@ mod unix {
                 }
             }
 
-            // Set environment variables
-            for (key, value) in &config.env {
-                if let (Ok(key_c), Ok(value_c)) =
-                    (CString::new(key.as_str()), CString::new(value.as_str()))
-                {
-                    libc::setenv(key_c.as_ptr(), value_c.as_ptr(), 1);
-                }
-            }
-
-            // Set TERM environment variable
+            // Set terminal defaults before applying explicit child values so
+            // repeated `--env` entries and config values can intentionally
+            // override them.
             let term = CString::new("TERM").unwrap();
             let term_value = config.term.as_deref().unwrap_or("xterm-256color");
             let term_value = CString::new(term_value)
@@ -506,6 +540,14 @@ mod unix {
             let colorterm = CString::new("COLORTERM").unwrap();
             let colorterm_value = CString::new("truecolor").unwrap();
             libc::setenv(colorterm.as_ptr(), colorterm_value.as_ptr(), 1);
+
+            for (key, value) in &config.env {
+                if let (Ok(key_c), Ok(value_c)) =
+                    (CString::new(key.as_str()), CString::new(value.as_str()))
+                {
+                    libc::setenv(key_c.as_ptr(), value_c.as_ptr(), 1);
+                }
+            }
 
             // Determine the shell to execute
             let shell = config.shell.clone().unwrap_or_else(get_default_shell);
@@ -672,10 +714,11 @@ mod windows {
         }
 
         /// Resize the PTY
-        pub fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
+        pub fn resize(&self, size: PtySize) -> io::Result<()> {
+            let size = size.normalized();
             let size = COORD {
-                X: cols as i16,
-                Y: rows as i16,
+                X: size.cols.min(i16::MAX as u16) as i16,
+                Y: size.rows.min(i16::MAX as u16) as i16,
             };
             let hr = unsafe { ResizePseudoConsole(self.hpc, size) };
             if hr != S_OK {
@@ -813,9 +856,10 @@ mod windows {
             }
 
             // Create the pseudo console
+            let pty_size = config.size.normalized();
             let size = COORD {
-                X: config.size.cols as i16,
-                Y: config.size.rows as i16,
+                X: pty_size.cols.min(i16::MAX as u16) as i16,
+                Y: pty_size.rows.min(i16::MAX as u16) as i16,
             };
 
             let mut hpc: HANDLE = INVALID_HANDLE_VALUE;
@@ -869,11 +913,7 @@ mod windows {
 
             // Determine command to run
             let command = config.shell.clone().unwrap_or_else(get_default_shell);
-            let mut cmd_line = command.clone();
-            for arg in &config.args {
-                cmd_line.push(' ');
-                cmd_line.push_str(arg);
-            }
+            let cmd_line = windows_command_line(&command, &config.args);
 
             let cmd_wide: Vec<u16> = OsStr::new(&cmd_line)
                 .encode_wide()
@@ -955,27 +995,33 @@ mod windows {
 
     /// Build a Windows environment block with TERM and COLORTERM set
     fn build_environment_block(config: &PtyConfig) -> Vec<u16> {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
-        // Start with current environment
-        let mut env_map: HashMap<String, String> = std::env::vars().collect();
-
-        // Add config environment variables
-        for (key, value) in &config.env {
-            env_map.insert(key.clone(), value.clone());
+        // Windows environment names are case-insensitive. Key by a folded
+        // name to prevent duplicates while preserving the last spelling.
+        let mut env_map: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for (key, value) in std::env::vars() {
+            env_map.insert(key.to_ascii_uppercase(), (key, value));
         }
 
-        // Set TERM (use config value or default to xterm-256color)
+        // Set terminal defaults first; explicit child environment wins.
         let term_value = config.term.as_deref().unwrap_or("xterm-256color");
-        env_map.insert("TERM".to_string(), term_value.to_string());
-
-        // Set COLORTERM to indicate true color support
-        env_map.insert("COLORTERM".to_string(), "truecolor".to_string());
+        env_map.insert(
+            "TERM".to_string(),
+            ("TERM".to_string(), term_value.to_string()),
+        );
+        env_map.insert(
+            "COLORTERM".to_string(),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        );
+        for (key, value) in &config.env {
+            env_map.insert(key.to_ascii_uppercase(), (key.clone(), value.clone()));
+        }
 
         // Build the environment block
         // Format: KEY1=VALUE1\0KEY2=VALUE2\0...\0\0
         let mut block: Vec<u16> = Vec::new();
-        for (key, value) in &env_map {
+        for (key, value) in env_map.values() {
             let entry = format!("{}={}", key, value);
             block.extend(OsStr::new(&entry).encode_wide());
             block.push(0);
@@ -985,6 +1031,45 @@ mod windows {
 
         block
     }
+}
+
+/// Quote one argument using the parsing rules used by CommandLineToArgvW and
+/// the Microsoft C runtime. No shell is involved.
+#[cfg(any(windows, test))]
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(any(windows, test))]
+fn windows_command_line(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(quote_windows_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ============================================================================
@@ -1109,9 +1194,19 @@ impl Pty {
 
     /// Resize the PTY window.
     pub fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
+        self.resize_with_size(PtySize {
+            rows,
+            cols,
+            ..Default::default()
+        })
+    }
+
+    /// Resize the PTY, including its total pixel dimensions where the backend
+    /// supports them (POSIX PTYs and SSH window-change requests).
+    pub fn resize_with_size(&self, size: PtySize) -> io::Result<()> {
         match &self.backend {
-            Backend::Local(p) => p.resize(rows, cols),
-            Backend::Ssh(p) => p.resize(rows, cols),
+            Backend::Local(p) => p.resize(size),
+            Backend::Ssh(p) => p.resize(size),
         }
     }
 
@@ -1230,6 +1325,25 @@ mod tests {
         assert_eq!(size.pixel_height, 0);
     }
 
+    #[test]
+    fn quotes_windows_argv_without_shell_joining() {
+        assert_eq!(quote_windows_arg("plain"), "plain");
+        assert_eq!(quote_windows_arg(""), "\"\"");
+        assert_eq!(quote_windows_arg("two words"), "\"two words\"");
+        assert_eq!(quote_windows_arg("say\"hi"), "\"say\\\"hi\"");
+        assert_eq!(
+            quote_windows_arg(r"C:\Program Files\"),
+            r#""C:\Program Files\\""#
+        );
+        assert_eq!(
+            windows_command_line(
+                r"C:\Program Files\tool.exe",
+                &["two words".to_string(), "--literal".to_string()]
+            ),
+            r#""C:\Program Files\tool.exe" "two words" --literal"#
+        );
+    }
+
     /// Helper to wait with a timeout for tests
     #[allow(dead_code)]
     fn wait_with_timeout(pty: &mut Pty, timeout_ms: u64) -> Option<i32> {
@@ -1313,7 +1427,8 @@ mod tests {
             size: PtySize {
                 rows: 24,
                 cols: 80,
-                ..Default::default()
+                pixel_width: 720,
+                pixel_height: 480,
             },
             shell: Some("/bin/sh".to_string()),
             args: vec!["-c".to_string(), "sleep 1".to_string()],
@@ -1322,9 +1437,42 @@ mod tests {
 
         let pty = Pty::new(&config).expect("Failed to create PTY");
 
-        // Test resize
-        pty.resize(40, 120).expect("Failed to resize PTY");
-        pty.resize(25, 80).expect("Failed to resize PTY again");
+        let fd = pty.try_raw_fd().expect("local PTY should have a raw fd");
+        let mut observed: libc::winsize = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut observed) },
+            0
+        );
+        assert_eq!(
+            (
+                observed.ws_col,
+                observed.ws_row,
+                observed.ws_xpixel,
+                observed.ws_ypixel
+            ),
+            (80, 24, 720, 480)
+        );
+
+        pty.resize_with_size(PtySize {
+            cols: 120,
+            rows: 40,
+            pixel_width: 1080,
+            pixel_height: 800,
+        })
+        .expect("Failed to resize PTY");
+        assert_eq!(
+            unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut observed) },
+            0
+        );
+        assert_eq!(
+            (
+                observed.ws_col,
+                observed.ws_row,
+                observed.ws_xpixel,
+                observed.ws_ypixel
+            ),
+            (120, 40, 1080, 800)
+        );
 
         // Clean up
         let _ = pty.send_signal(15);
@@ -1550,8 +1698,16 @@ mod tests {
                 ..Default::default()
             },
             shell: Some("/bin/sh".to_string()),
-            args: vec!["-c".to_string(), "echo $TEST_VAR".to_string()],
-            env: vec![("TEST_VAR".to_string(), "test_value_123".to_string())],
+            args: vec![
+                "-c".to_string(),
+                "printf '%s|%s|%s\\n' \"$TEST_VAR\" \"$TERM\" \"$COLORTERM\"".to_string(),
+            ],
+            env: vec![
+                ("TEST_VAR".to_string(), "test_value_123".to_string()),
+                ("TERM".to_string(), "explicit-term".to_string()),
+                ("COLORTERM".to_string(), "explicit-color".to_string()),
+            ],
+            term: Some("configured-term".to_string()),
             ..Default::default()
         };
 
@@ -1564,6 +1720,10 @@ mod tests {
         let mut buf = [0u8; 1024];
         let n = reader.read(&mut buf).expect("Failed to read");
         let output = String::from_utf8_lossy(&buf[..n]);
-        assert!(output.contains("test_value_123"), "Output was: {}", output);
+        assert!(
+            output.contains("test_value_123|explicit-term|explicit-color"),
+            "Output was: {}",
+            output
+        );
     }
 }

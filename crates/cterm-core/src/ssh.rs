@@ -155,12 +155,20 @@ pub struct SshPty {
 impl SshPty {
     /// Open the connection, authenticate, and start a remote shell.
     pub fn connect(config: SshConfig, size: PtySize) -> Result<Self, PtyError> {
+        let size = size.normalized();
         let client = connect_and_authenticate(&config)?;
 
         let shared = SharedClient::from(client);
         let term = config.term.as_deref().unwrap_or("xterm-256color");
         let stream = shared
-            .shell(term, size.cols.max(1) as u32, size.rows.max(1) as u32)
+            .shell_stream(
+                term,
+                size.cols as u32,
+                size.rows as u32,
+                size.pixel_width as u32,
+                size.pixel_height as u32,
+                Vec::new(),
+            )
             .map_err(|e| PtyError::Spawn(format!("SSH shell request failed: {e}")))?;
         let channel_id = stream.channel_id();
 
@@ -199,13 +207,19 @@ impl SshPty {
         }
     }
 
-    pub fn resize(&self, rows: u16, cols: u16) -> io::Result<()> {
+    pub fn resize(&self, size: PtySize) -> io::Result<()> {
+        let new_size = size.normalized();
         if let Ok(mut size) = self.size.lock() {
-            size.rows = rows;
-            size.cols = cols;
+            *size = new_size;
         }
         self.client
-            .send_window_change(self.channel_id, cols as u32, rows as u32, 0, 0)
+            .send_window_change(
+                self.channel_id,
+                new_size.cols as u32,
+                new_size.rows as u32,
+                new_size.pixel_width as u32,
+                new_size.pixel_height as u32,
+            )
             .map_err(|e| io::Error::other(format!("window-change: {e}")))
     }
 

@@ -14,6 +14,7 @@ use crate::color::{AnsiColor, Color, Rgb};
 use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
+use crate::keyboard::KeyboardEnhancementFlags;
 use crate::screen::{
     ClearMode, ClipboardOperation, ClipboardSelection, CursorStyle, LineClearMode, MouseMode,
     Screen,
@@ -837,6 +838,14 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // Primary Device Attributes (DA1). DEC capability 4 advertises
+            // Sixel graphics support and is consumed by ratatui-image.
+            ('c', []) => {
+                let mode = first_param(&params_vec, 0);
+                if mode == 0 {
+                    self.screen.queue_response(b"\x1b[?62;4c".to_vec());
+                }
+            }
             // Set Top and Bottom Margins (DECSTBM)
             ('r', []) => {
                 let top = first_param(&params_vec, 1).saturating_sub(1);
@@ -858,7 +867,45 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             // Window manipulation (XTWINOPS)
             ('t', []) => {
-                log::trace!("Window manipulation: {:?}", params_vec);
+                if first_param(&params_vec, 0) == 16 {
+                    // Report character cell size in pixels: CSI 6;height;width t.
+                    let height = self.screen.cell_height_hint().round().max(1.0) as usize;
+                    let width = self.screen.cell_width_hint().round().max(1.0) as usize;
+                    self.screen
+                        .queue_response(format!("\x1b[6;{height};{width}t").into_bytes());
+                } else {
+                    log::trace!("Window manipulation: {:?}", params_vec);
+                }
+            }
+            // Query the active kitty keyboard progressive-enhancement flags.
+            ('u', [b'?']) => {
+                let flags = self.screen.keyboard_enhancement_flags().bits();
+                self.screen
+                    .queue_response(format!("\x1b[?{flags}u").into_bytes());
+            }
+            // Push keyboard flags. Unsupported bits are masked by Screen.
+            ('u', [b'>']) => {
+                let flags =
+                    KeyboardEnhancementFlags::from_bits_retain(first_param(&params_vec, 0) as u8);
+                self.screen.push_keyboard_enhancement_flags(flags);
+            }
+            // Pop one or more keyboard flag stack entries.
+            ('u', [b'<']) => {
+                self.screen
+                    .pop_keyboard_enhancement_flags(first_param(&params_vec, 1));
+            }
+            // Set/reset keyboard flags without changing stack depth.
+            ('u', [b'=']) => {
+                let requested =
+                    KeyboardEnhancementFlags::from_bits_retain(first_param(&params_vec, 0) as u8)
+                        & KeyboardEnhancementFlags::SUPPORTED;
+                let current = self.screen.keyboard_enhancement_flags();
+                let flags = match second_param(&params_vec, 1) {
+                    2 => current | requested,
+                    3 => current & !requested,
+                    _ => requested,
+                };
+                self.screen.set_keyboard_enhancement_flags(flags);
             }
             // Set Mode (SM) / Reset Mode (RM)
             ('h', [b'?']) | ('l', [b'?']) => {

@@ -122,6 +122,8 @@ async fn test_create_and_list_sessions() {
             env: Default::default(),
             term: None,
             ssh: None,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .await
         .expect("create_session failed");
@@ -173,6 +175,8 @@ async fn test_get_session() {
             env: Default::default(),
             term: None,
             ssh: None,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .await
         .expect("create_session failed");
@@ -221,6 +225,8 @@ async fn test_write_input_and_get_screen() {
             env: Default::default(),
             term: Some("xterm".to_string()),
             ssh: None,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .await
         .expect("create_session failed");
@@ -288,6 +294,8 @@ async fn test_resize() {
             env: Default::default(),
             term: None,
             ssh: None,
+            pixel_width: 640,
+            pixel_height: 384,
         })
         .await
         .expect("create_session failed");
@@ -300,6 +308,8 @@ async fn test_resize() {
             session_id: session_id.clone(),
             cols: 120,
             rows: 40,
+            pixel_width: 1080,
+            pixel_height: 800,
         })
         .await
         .expect("resize failed");
@@ -343,6 +353,8 @@ async fn test_get_cursor() {
             env: Default::default(),
             term: None,
             ssh: None,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .await
         .expect("create_session failed");
@@ -389,6 +401,8 @@ async fn test_get_screen_full() {
             env: Default::default(),
             term: None,
             ssh: None,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .await
         .expect("create_session failed");
@@ -441,6 +455,8 @@ async fn test_multiple_sessions() {
                 env: Default::default(),
                 term: None,
                 ssh: None,
+                pixel_width: 0,
+                pixel_height: 0,
             })
             .await
             .expect("create_session failed");

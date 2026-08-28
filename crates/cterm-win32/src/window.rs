@@ -2,6 +2,7 @@
 //!
 //! Manages the main window, tabs, terminal rendering, and message handling.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,9 +22,11 @@ use cterm_core::color::Rgb;
 use cterm_core::mouse::{encode_mouse_event, MouseButton as ReportButton, MouseModifiers};
 use cterm_core::pty::{PtyConfig, PtySize};
 use cterm_core::screen::{FileTransferOperation, MouseMode, ScreenConfig};
-use cterm_core::term::{Terminal, TerminalEvent};
+use cterm_core::term::{Key, Modifiers as CoreModifiers, Terminal, TerminalEvent};
+use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
 use cterm_ui::events::{Action, Modifiers};
 use cterm_ui::theme::Theme;
+use winapi::um::winuser;
 
 use crate::clipboard;
 use crate::dpi::{self, DpiInfo};
@@ -43,10 +46,87 @@ pub const WM_APP_BELL: u32 = WM_APP + 4;
 /// Commands sent to the daemon I/O thread
 pub enum DaemonCmd {
     Write(Vec<u8>),
-    Resize(u32, u32),
+    Resize {
+        cols: u32,
+        rows: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    },
     SetTitle(String),
     SetTabColor(String),
     SetTemplateName(String),
+}
+
+const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
+
+/// Classify a Win32 key message without consulting mutable keyboard state.
+fn key_event_kind(msg: u32, key_data: usize) -> Option<KeyEventKind> {
+    match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN if key_data & PREVIOUS_KEY_STATE_BIT != 0 => {
+            Some(KeyEventKind::Repeat)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => Some(KeyEventKind::Press),
+        WM_KEYUP | WM_SYSKEYUP => Some(KeyEventKind::Release),
+        _ => None,
+    }
+}
+
+/// Map the standard PC-101 base-layout ASCII identity required by the kitty
+/// protocol. Ordinary layout/IME text still stays on WM_CHAR.
+fn ascii_key_for_vk(vk: u16) -> Option<char> {
+    Some(match vk as i32 {
+        value @ 0x30..=0x39 => value as u8 as char,
+        value @ 0x41..=0x5a => (b'a' + (value as u8 - b'A')) as char,
+        winuser::VK_SPACE => ' ',
+        winuser::VK_OEM_MINUS => '-',
+        winuser::VK_OEM_PLUS => '=',
+        winuser::VK_OEM_4 => '[',
+        winuser::VK_OEM_6 => ']',
+        winuser::VK_OEM_1 => ';',
+        winuser::VK_OEM_7 => '\'',
+        winuser::VK_OEM_3 => '`',
+        winuser::VK_OEM_5 => '\\',
+        winuser::VK_OEM_COMMA => ',',
+        winuser::VK_OEM_PERIOD => '.',
+        winuser::VK_OEM_2 => '/',
+        _ => return None,
+    })
+}
+
+fn mapped_terminal_key(vk: u16, modifiers: Modifiers, enhanced_text: bool) -> Option<Key> {
+    let functional = match vk as i32 {
+        winuser::VK_UP => Key::Up,
+        winuser::VK_DOWN => Key::Down,
+        winuser::VK_LEFT => Key::Left,
+        winuser::VK_RIGHT => Key::Right,
+        winuser::VK_HOME => Key::Home,
+        winuser::VK_END => Key::End,
+        winuser::VK_PRIOR => Key::PageUp,
+        winuser::VK_NEXT => Key::PageDown,
+        winuser::VK_INSERT => Key::Insert,
+        winuser::VK_DELETE => Key::Delete,
+        winuser::VK_BACK => Key::Backspace,
+        winuser::VK_RETURN => Key::Enter,
+        winuser::VK_TAB => Key::Tab,
+        winuser::VK_ESCAPE => Key::Escape,
+        value if (winuser::VK_F1..=winuser::VK_F12).contains(&value) => {
+            Key::F((value - winuser::VK_F1 + 1) as u8)
+        }
+        _ => {
+            if enhanced_text {
+                return ascii_key_for_vk(vk).map(Key::Char);
+            }
+            if modifiers.contains(Modifiers::CTRL)
+                && !modifiers.intersects(Modifiers::ALT | Modifiers::SUPER)
+            {
+                return ascii_key_for_vk(vk)
+                    .filter(char::is_ascii_alphabetic)
+                    .map(Key::Char);
+            }
+            return None;
+        }
+    };
+    Some(functional)
 }
 
 /// Tab entry
@@ -91,6 +171,14 @@ pub struct WindowState {
     last_mouse_pos: (f32, f32),
     /// Last reported pointer cell, to avoid flooding drag reports per pixel.
     last_mouse_cell: Option<(usize, usize)>,
+    /// Key releases paired with key-down events consumed by application
+    /// shortcuts must not leak into enhanced keyboard reporting.
+    suppressed_key_releases: HashSet<u16>,
+    /// Physical keys whose presses were emitted as enhanced events.
+    reported_keys: HashMap<u16, Key>,
+    /// Modified text keys handled on WM_KEYDOWN; their generated WM_CHAR or
+    /// WM_SYSCHAR messages must not be delivered a second time.
+    enhanced_text_keys: HashSet<u16>,
     #[allow(dead_code)]
     menu_handle: winapi::shared::windef::HMENU,
     /// Skip close confirmation (set during relaunch)
@@ -132,6 +220,9 @@ impl WindowState {
             mouse_report_button: None,
             last_mouse_pos: (0.0, 0.0),
             last_mouse_cell: None,
+            suppressed_key_releases: HashSet::new(),
+            reported_keys: HashMap::new(),
+            enhanced_text_keys: HashSet::new(),
             menu_handle,
             skip_close_confirm: false,
             remote_manager: cterm_client::RemoteManager::new(),
@@ -150,10 +241,51 @@ impl WindowState {
 
     /// Create a new tab
     pub fn new_tab(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
+        let shell = self
+            .config
+            .general
+            .default_shell
+            .clone()
+            .unwrap_or_else(|| std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
+        let initial_title = std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Terminal")
+            .to_string();
+        let opts = cterm_client::CreateSessionOpts {
+            shell: self.config.general.default_shell.clone(),
+            args: self.config.general.shell_args.clone(),
+            cwd: self
+                .config
+                .general
+                .working_directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            env: self
+                .config
+                .general
+                .env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            term: self.config.general.term.clone(),
+            ..Default::default()
+        };
+        self.new_tab_with_options(opts, initial_title, false)
+    }
+
+    /// Create a local PTY tab from an argv-safe process specification.
+    pub fn new_tab_with_options(
+        &mut self,
+        opts: cterm_client::CreateSessionOpts,
+        initial_title: String,
+        title_locked: bool,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
         let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
 
         // Get terminal size
         let (cols, rows) = self.terminal_size();
+        let (pixel_width, pixel_height) = self.terminal_pixel_size();
 
         // Create terminal
         let screen_config = ScreenConfig {
@@ -164,37 +296,18 @@ impl WindowState {
             size: PtySize {
                 cols: cols as u16,
                 rows: rows as u16,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: pixel_width.min(u16::MAX as u32) as u16,
+                pixel_height: pixel_height.min(u16::MAX as u32) as u16,
             },
-            shell: self.config.general.default_shell.clone(),
-            args: self.config.general.shell_args.clone(),
-            cwd: self.config.general.working_directory.clone(),
-            env: self
-                .config
-                .general
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            term: self.config.general.term.clone(),
+            shell: opts.shell,
+            args: opts.args,
+            cwd: opts.cwd.map(std::path::PathBuf::from),
+            env: opts.env,
+            term: opts.term,
         };
 
         let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
         let terminal = Arc::new(Mutex::new(terminal));
-
-        // Get shell basename for initial title
-        let shell = self
-            .config
-            .general
-            .default_shell
-            .clone()
-            .unwrap_or_else(|| std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
-        let initial_title = std::path::Path::new(&shell)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Terminal")
-            .to_string();
 
         // Start PTY reader thread
         let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
@@ -206,7 +319,7 @@ impl WindowState {
             color: None,
             background_color: None,
             has_bell: false,
-            title_locked: false,
+            title_locked,
             reader_handle: Some(reader_handle),
             session_id: None,
             daemon_cmd_tx: None,
@@ -330,8 +443,22 @@ impl WindowState {
             size: PtySize {
                 cols: cols as u16,
                 rows: rows as u16,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: (self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.cell_dimensions().width)
+                    .unwrap_or(8.0)
+                    * cols as f32)
+                    .round()
+                    .clamp(1.0, u16::MAX as f32) as u16,
+                pixel_height: (self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.cell_dimensions().height)
+                    .unwrap_or(16.0)
+                    * rows as f32)
+                    .round()
+                    .clamp(1.0, u16::MAX as f32) as u16,
             },
             shell,
             args,
@@ -445,8 +572,22 @@ impl WindowState {
             size: PtySize {
                 cols: cols as u16,
                 rows: rows as u16,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: (self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.cell_dimensions().width)
+                    .unwrap_or(8.0)
+                    * cols as f32)
+                    .round()
+                    .clamp(1.0, u16::MAX as f32) as u16,
+                pixel_height: (self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.cell_dimensions().height)
+                    .unwrap_or(16.0)
+                    * rows as f32)
+                    .round()
+                    .clamp(1.0, u16::MAX as f32) as u16,
             },
             shell,
             args,
@@ -498,7 +639,7 @@ impl WindowState {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_daemon_tab(
         &mut self,
-        opts: cterm_client::CreateSessionOpts,
+        mut opts: cterm_client::CreateSessionOpts,
         title: String,
         color: Option<String>,
         background_color: Option<String>,
@@ -507,11 +648,28 @@ impl WindowState {
     ) -> u64 {
         let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
         let (cols, rows) = self.terminal_size();
+        let (pixel_width, pixel_height) = self.terminal_pixel_size();
+
+        // Older call sites initialize only rows and columns. Populate the new
+        // pixel fields at the shared create boundary so every daemon-backed tab
+        // starts with the real viewport geometry.
+        if opts.pixel_width == 0 {
+            opts.pixel_width = pixel_width;
+        }
+        if opts.pixel_height == 0 {
+            opts.pixel_height = pixel_height;
+        }
 
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.resize_with_pixels(
+            cols,
+            rows,
+            pixel_width.min(u16::MAX as u32) as u16,
+            pixel_height.min(u16::MAX as u32) as u16,
+        );
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonCmd>();
         let write_tx = cmd_tx.clone();
@@ -586,6 +744,7 @@ impl WindowState {
     ) -> u64 {
         let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
         let (cols, rows) = self.terminal_size();
+        let (pixel_width, pixel_height) = self.terminal_pixel_size();
 
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
@@ -596,8 +755,20 @@ impl WindowState {
         if let Some(ref screen_data) = screen_snapshot {
             cterm_app::daemon_session::apply_screen_snapshot(&mut terminal, screen_data);
         }
+        terminal.resize_with_pixels(
+            cols,
+            rows,
+            pixel_width.min(u16::MAX as u32) as u16,
+            pixel_height.min(u16::MAX as u32) as u16,
+        );
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonCmd>();
+        let _ = cmd_tx.send(DaemonCmd::Resize {
+            cols: cols as u32,
+            rows: rows as u32,
+            pixel_width,
+            pixel_height,
+        });
         let write_tx = cmd_tx.clone();
         terminal.set_write_fn(Box::new(move |data: &[u8]| {
             let _ = write_tx.send(DaemonCmd::Write(data.to_vec()));
@@ -887,6 +1058,17 @@ impl WindowState {
 
     /// Get terminal size in cells
     pub fn terminal_size(&self) -> (usize, usize) {
+        let (width, height) = self.terminal_pixel_size();
+
+        if let Some(ref renderer) = self.renderer {
+            renderer.terminal_size(width, height)
+        } else {
+            (80, 24)
+        }
+    }
+
+    /// Get the terminal viewport size in pixels, excluding window chrome.
+    pub fn terminal_pixel_size(&self) -> (u32, u32) {
         let mut rect = RECT::default();
         unsafe { GetClientRect(self.hwnd, &mut rect).ok() };
 
@@ -898,11 +1080,7 @@ impl WindowState {
         let notification_bar_height = self.notification_bar.height() as u32;
         let terminal_height = height.saturating_sub(tab_bar_height + notification_bar_height);
 
-        if let Some(ref renderer) = self.renderer {
-            renderer.terminal_size(width, terminal_height)
-        } else {
-            (80, 24)
-        }
+        (width.max(1), terminal_height.max(1))
     }
 
     /// Handle window resize
@@ -913,12 +1091,23 @@ impl WindowState {
 
         // Resize all terminals
         let (cols, rows) = self.terminal_size();
+        let (pixel_width, pixel_height) = self.terminal_pixel_size();
         for tab in &self.tabs {
             let mut term = tab.terminal.lock().unwrap();
-            term.resize(cols, rows);
+            term.resize_with_pixels(
+                cols,
+                rows,
+                pixel_width.min(u16::MAX as u32) as u16,
+                pixel_height.min(u16::MAX as u32) as u16,
+            );
             // Forward resize to daemon if this is a daemon-backed tab
             if let Some(ref tx) = tab.daemon_cmd_tx {
-                let _ = tx.send(DaemonCmd::Resize(cols as u32, rows as u32));
+                let _ = tx.send(DaemonCmd::Resize {
+                    cols: cols as u32,
+                    rows: rows as u32,
+                    pixel_width,
+                    pixel_height,
+                });
             }
         }
     }
@@ -965,54 +1154,89 @@ impl WindowState {
         Ok(())
     }
 
-    /// Handle keyboard input
-    pub fn on_key_down(&mut self, vk: u16, _scancode: u16) -> bool {
+    /// Handle a physical keyboard event. Text-producing keys deliberately stay
+    /// on WM_CHAR so Windows remains authoritative for layouts, dead keys, and
+    /// IME composition.
+    pub fn on_key_event(&mut self, vk: u16, kind: KeyEventKind) -> bool {
         let modifiers = keycode::get_modifiers();
 
-        // Check for shortcuts first
+        if kind == KeyEventKind::Release {
+            self.enhanced_text_keys.remove(&vk);
+            if self.suppressed_key_releases.remove(&vk) {
+                return true;
+            }
+            if let Some(key) = self.reported_keys.remove(&vk) {
+                if let Some(terminal) = self.active_terminal() {
+                    let mut term = terminal.lock().unwrap();
+                    let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
+                    if let Some(bytes) = term.handle_reported_key_release(key, core_modifiers) {
+                        if let Err(e) = term.write(&bytes) {
+                            log::error!("Failed to write key release to PTY: {}", e);
+                        }
+                        drop(term);
+                        self.invalidate();
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+
+        // Check for shortcuts before forwarding key-down/repeat events.
         if let Some(key) = keycode::vk_to_keycode(vk) {
             if let Some(action) = self.shortcuts.match_event(key, modifiers) {
+                self.suppressed_key_releases.insert(vk);
                 self.handle_action(action.clone());
                 return true;
             }
         }
 
-        // Check modifier-only keys
-        if keycode::is_modifier_key(vk) {
-            return false;
-        }
+        let enhanced_text = modifiers
+            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+            && !keycode::is_altgr_active()
+            && self.active_terminal().is_some_and(|terminal| {
+                terminal
+                    .lock()
+                    .unwrap()
+                    .screen()
+                    .keyboard_enhancement_flags()
+                    .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            });
 
-        // Send to terminal
+        let Some(key) = mapped_terminal_key(vk, modifiers, enhanced_text) else {
+            return false;
+        };
+        let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
+
         if let Some(terminal) = self.active_terminal() {
             let mut term = terminal.lock().unwrap();
-            let app_cursor = term.screen().modes.application_cursor;
-
-            // Get terminal sequence for special keys
-            if let Some(seq) = keycode::vk_to_terminal_seq(vk, modifiers, app_cursor) {
-                term.write(seq.as_bytes()).ok();
+            if let Some(bytes) = term.handle_key_event(key, core_modifiers, kind) {
+                let track_release = kind == KeyEventKind::Press
+                    && term
+                        .handle_reported_key_release(key, core_modifiers)
+                        .is_some();
+                if let Err(e) = term.write(&bytes) {
+                    log::error!("Failed to write key event to PTY: {}", e);
+                }
                 // Drop the lock before invalidate() — UpdateWindow dispatches WM_PAINT
                 // synchronously, and render() needs to lock the terminal.
                 drop(term);
-                self.invalidate();
-                return true;
-            }
-
-            // Ctrl+letter → send control character (Ctrl+A=0x01 .. Ctrl+Z=0x1a)
-            // We handle this here rather than in WM_CHAR to keep all terminal
-            // input in one place and avoid double-send issues.
-            if modifiers.contains(Modifiers::CTRL)
-                && !modifiers.contains(Modifiers::ALT)
-                && (0x41..=0x5A).contains(&(vk as i32))
-            {
-                let ctrl_char = (vk as u8) - b'A' + 1;
-                term.write(&[ctrl_char]).ok();
-                drop(term);
+                if enhanced_text && matches!(key, Key::Char(_)) {
+                    self.enhanced_text_keys.insert(vk);
+                }
+                if track_release {
+                    self.reported_keys.insert(vk, key);
+                }
                 self.invalidate();
                 return true;
             }
         }
 
         false
+    }
+
+    fn suppress_generated_text_message(&self) -> bool {
+        !self.enhanced_text_keys.is_empty()
     }
 
     /// Handle character input
@@ -1486,9 +1710,23 @@ impl WindowState {
     /// Called when font size changes to resize terminals
     fn on_font_size_changed(&mut self) {
         let (cols, rows) = self.terminal_size();
+        let (pixel_width, pixel_height) = self.terminal_pixel_size();
         for tab in &self.tabs {
             let mut term = tab.terminal.lock().unwrap();
-            term.resize(cols, rows);
+            term.resize_with_pixels(
+                cols,
+                rows,
+                pixel_width.min(u16::MAX as u32) as u16,
+                pixel_height.min(u16::MAX as u32) as u16,
+            );
+            if let Some(ref tx) = tab.daemon_cmd_tx {
+                let _ = tx.send(DaemonCmd::Resize {
+                    cols: cols as u32,
+                    rows: rows as u32,
+                    pixel_width,
+                    pixel_height,
+                });
+            }
         }
         self.invalidate();
     }
@@ -2211,14 +2449,37 @@ pub fn create_window(config: &Config, theme: &Theme) -> windows::core::Result<HW
     // Create window state
     let mut state = Box::new(WindowState::new(hwnd, config, theme));
     state.init_renderer()?;
-    state.new_tab().map_err(|e| {
-        log::error!("Failed to create initial tab: {}", e);
-        windows::core::Error::from_win32()
-    })?;
+    let args = crate::get_args();
+    let opts = args.initial_session_options(config, 0, 0);
+    state
+        .new_tab_with_options(opts, args.initial_title(config), args.title.is_some())
+        .map_err(|e| {
+            log::error!("Failed to create initial tab: {}", e);
+            windows::core::Error::from_win32()
+        })?;
 
-    // Store state pointer in window
+    if let Some(ref title) = args.title {
+        let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
+        }
+    }
+
+    // Install the state before changing window geometry: ShowWindow and the
+    // fullscreen transition can synchronously dispatch WM_SIZE.
+    let state_ptr = Box::into_raw(state);
     unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+    }
+
+    if args.fullscreen {
+        unsafe {
+            (*state_ptr).toggle_fullscreen();
+        }
+    } else if args.maximized {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
     }
 
     Ok(hwnd)
@@ -2540,8 +2801,16 @@ async fn run_daemon_io_loop(
                         });
                     }
                 }
-                DaemonCmd::Resize(c, r) => {
-                    if let Err(e) = cmd_session.resize(c, r).await {
+                DaemonCmd::Resize {
+                    cols,
+                    rows,
+                    pixel_width,
+                    pixel_height,
+                } => {
+                    if let Err(e) = cmd_session
+                        .resize_with_pixels(cols, rows, pixel_width, pixel_height)
+                        .await
+                    {
                         log::error!("Failed to resize daemon session: {}", e);
                     }
                 }
@@ -2622,7 +2891,7 @@ async fn run_daemon_io_loop(
                             Ok(chunk) => {
                                 {
                                     let mut term = terminal.lock().unwrap();
-                                    let events = term.process(&chunk.data);
+                                    let events = term.process_mirror(&chunk.data);
                                     for event in events {
                                         match event {
                                             TerminalEvent::TitleChanged(_) => {
@@ -2737,10 +3006,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
 
-        WM_KEYDOWN | WM_SYSKEYDOWN => {
+        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let vk = (wparam.0 & 0xFFFF) as u16;
-            let scancode = ((lparam.0 >> 16) & 0xFF) as u16;
-            if state.on_key_down(vk, scancode) {
+            let kind = key_event_kind(msg, lparam.0 as usize)
+                .expect("matched messages always have a key-event kind");
+            if state.on_key_event(vk, kind) {
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -2748,17 +3018,27 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         }
 
         WM_CHAR => {
-            if let Some(c) = char::from_u32(wparam.0 as u32) {
-                // Only handle printable characters here. Control characters like
-                // Enter (\r), Tab (\t), Backspace (\x08), and Escape (\x1b) are
-                // already handled in WM_KEYDOWN via vk_to_terminal_seq.
-                // TranslateMessage generates WM_CHAR for them too, so we must
-                // skip them here to avoid double input.
-                if !c.is_control() {
-                    state.on_char(c);
+            if !state.suppress_generated_text_message() {
+                if let Some(c) = char::from_u32(wparam.0 as u32) {
+                    // Only handle printable characters here. Control characters like
+                    // Enter (\r), Tab (\t), Backspace (\x08), and Escape (\x1b) are
+                    // already handled from their physical key messages.
+                    // TranslateMessage generates WM_CHAR for them too, so we must
+                    // skip them here to avoid double input.
+                    if !c.is_control() {
+                        state.on_char(c);
+                    }
                 }
             }
             LRESULT(0)
+        }
+
+        WM_SYSCHAR => {
+            if state.suppress_generated_text_message() {
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
 
         WM_LBUTTONDOWN => {
@@ -2867,6 +3147,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_KILLFOCUS => {
             // Send focus out event to terminal if DECSET 1004 is enabled
             state.send_focus_event(false);
+            // Windows may not deliver matching key-up messages after focus moves.
+            state.suppressed_key_releases.clear();
+            state.reported_keys.clear();
+            state.enhanced_text_keys.clear();
             LRESULT(0)
         }
 
@@ -2915,4 +3199,69 @@ fn parse_hex_color(hex: &str) -> Option<Rgb> {
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
 
     Some(Rgb::new(r, g, b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_message_kind_distinguishes_press_repeat_and_release() {
+        assert_eq!(key_event_kind(WM_KEYDOWN, 0), Some(KeyEventKind::Press));
+        assert_eq!(
+            key_event_kind(WM_SYSKEYDOWN, PREVIOUS_KEY_STATE_BIT),
+            Some(KeyEventKind::Repeat)
+        );
+        assert_eq!(key_event_kind(WM_KEYUP, 0), Some(KeyEventKind::Release));
+        assert_eq!(
+            key_event_kind(WM_SYSKEYUP, PREVIOUS_KEY_STATE_BIT),
+            Some(KeyEventKind::Release)
+        );
+        assert_eq!(key_event_kind(WM_CHAR, 0), None);
+    }
+
+    #[test]
+    fn physical_mapping_keeps_layout_text_on_wm_char() {
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_UP as u16, Modifiers::empty(), false),
+            Some(Key::Up)
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_F12 as u16, Modifiers::empty(), false),
+            Some(Key::F(12))
+        );
+        assert_eq!(mapped_terminal_key(0x41, Modifiers::empty(), false), None);
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_OEM_1 as u16, Modifiers::CTRL, false),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_ctrl_letters_and_enhanced_ascii_are_mapped_exactly() {
+        assert_eq!(
+            mapped_terminal_key(0x41, Modifiers::CTRL, false),
+            Some(Key::Char('a'))
+        );
+        assert_eq!(
+            mapped_terminal_key(0x5a, Modifiers::CTRL | Modifiers::SHIFT, false),
+            Some(Key::Char('z'))
+        );
+        assert_eq!(
+            mapped_terminal_key(0x41, Modifiers::CTRL | Modifiers::ALT, false),
+            None
+        );
+        assert_eq!(
+            mapped_terminal_key(
+                winuser::VK_OEM_1 as u16,
+                Modifiers::CTRL | Modifiers::SHIFT,
+                true,
+            ),
+            Some(Key::Char(';'))
+        );
+        assert_eq!(
+            mapped_terminal_key(0x32, Modifiers::ALT, true),
+            Some(Key::Char('2'))
+        );
+    }
 }

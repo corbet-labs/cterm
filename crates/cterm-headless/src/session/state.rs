@@ -87,8 +87,7 @@ impl SessionState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        cols: usize,
-        rows: usize,
+        size: PtySize,
         shell: Option<String>,
         args: Vec<String>,
         cwd: Option<std::path::PathBuf>,
@@ -96,12 +95,11 @@ impl SessionState {
         term: Option<String>,
         scrollback_lines: usize,
     ) -> Result<Arc<Self>> {
+        let size = size.normalized();
+        let cols = size.cols as usize;
+        let rows = size.rows as usize;
         let pty_config = PtyConfig {
-            size: PtySize {
-                cols: cols as u16,
-                rows: rows as u16,
-                ..Default::default()
-            },
+            size,
             shell,
             args,
             cwd,
@@ -141,14 +139,16 @@ impl SessionState {
     /// being established. It has a screen but no PTY yet; [`Self::is_running`]
     /// reports it as alive (via the `connecting` flag) so it is not reaped while
     /// connecting. Call [`Self::spawn_ssh_connect`] to drive the connection.
-    pub fn new_ssh_connecting(
-        id: String,
-        cols: usize,
-        rows: usize,
-        scrollback_lines: usize,
-    ) -> Arc<Self> {
+    pub fn new_ssh_connecting(id: String, size: PtySize, scrollback_lines: usize) -> Arc<Self> {
+        let size = size.normalized();
+        let cols = size.cols as usize;
+        let rows = size.rows as usize;
         let screen_config = ScreenConfig { scrollback_lines };
-        let terminal = Terminal::new(cols, rows, screen_config);
+        let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.screen_mut().set_cell_width_hint(size.cell_width());
+        terminal
+            .screen_mut()
+            .set_cell_height_hint(size.cell_height());
 
         let (output_tx, _) = broadcast::channel(1024);
         let (event_tx, _) = broadcast::channel(256);
@@ -181,14 +181,9 @@ impl SessionState {
     pub fn spawn_ssh_connect(
         self: &Arc<Self>,
         mut ssh_config: cterm_core::SshConfig,
-        cols: usize,
-        rows: usize,
+        size: PtySize,
     ) {
-        let size = PtySize {
-            cols: cols as u16,
-            rows: rows as u16,
-            ..Default::default()
-        };
+        let size = size.normalized();
         let state = Arc::clone(self);
 
         tokio::spawn(async move {
@@ -536,6 +531,19 @@ impl SessionState {
         self.terminal.write().resize(cols, rows);
     }
 
+    /// Resize the terminal with total pixel dimensions from the UI.
+    pub fn resize_with_pixels(
+        &self,
+        cols: usize,
+        rows: usize,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) {
+        self.terminal
+            .write()
+            .resize_with_pixels(cols, rows, pixel_width, pixel_height);
+    }
+
     /// Send a signal to the child process
     pub fn send_signal(&self, signal: i32) -> Result<()> {
         self.terminal.read().send_signal(signal)?;
@@ -555,19 +563,16 @@ impl SessionState {
         }; // terminal lock released here
 
         if !responses.is_empty() {
+            let response = responses.concat();
             match self.pty_writer.get() {
                 Some(writer) => {
-                    for response in responses {
-                        writer.send(&response);
-                    }
+                    writer.send(&response);
                 }
                 None => {
                     // No PTY writer yet: write responses directly (no-op without a PTY).
                     let mut term = self.terminal.write();
-                    for response in responses {
-                        if let Err(e) = term.write(&response) {
-                            log::error!("Failed to send response to PTY: {e}");
-                        }
+                    if let Err(e) = term.write(&response) {
+                        log::error!("Failed to send response to PTY: {e}");
                     }
                 }
             }

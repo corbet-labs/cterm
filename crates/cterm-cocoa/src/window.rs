@@ -19,6 +19,7 @@ use cterm_app::config::Config;
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_ui::theme::Theme;
 
+use crate::cg_renderer::CGRenderer;
 use crate::quick_open::{OpenTabEntry, QuickOpenOverlay, QUICK_OPEN_HEIGHT};
 use crate::terminal_view::TerminalView;
 
@@ -272,10 +273,20 @@ define_class!(
     }
 );
 
-/// Approximate ratio of cell width to font size
-const CELL_WIDTH_RATIO: f64 = 0.6;
-/// Approximate ratio of cell height to font size
-const CELL_HEIGHT_RATIO: f64 = 1.2;
+fn ensure_session_pixel_size(config: &Config, opts: &mut cterm_client::CreateSessionOpts) {
+    let (cell_width, cell_height) =
+        CGRenderer::measure_cell_size(&config.appearance.font.family, config.appearance.font.size);
+    if opts.pixel_width == 0 {
+        opts.pixel_width = (cell_width * opts.cols.max(1) as f64)
+            .round()
+            .clamp(1.0, u32::MAX as f64) as u32;
+    }
+    if opts.pixel_height == 0 {
+        opts.pixel_height = (cell_height * opts.rows.max(1) as f64)
+            .round()
+            .clamp(1.0, u32::MAX as f64) as u32;
+    }
+}
 
 impl CtermWindow {
     /// Common window initialization: calculate size, allocate, init NSWindow,
@@ -287,8 +298,10 @@ impl CtermWindow {
         title: &str,
         pending_tab_color: Option<String>,
     ) -> Retained<Self> {
-        let cell_width = config.appearance.font.size * CELL_WIDTH_RATIO;
-        let cell_height = config.appearance.font.size * CELL_HEIGHT_RATIO;
+        let (cell_width, cell_height) = CGRenderer::measure_cell_size(
+            &config.appearance.font.family,
+            config.appearance.font.size,
+        );
         let width = cell_width * 80.0;
         let height = cell_height * 24.0;
 
@@ -366,7 +379,7 @@ impl CtermWindow {
             cwd,
             ..Default::default()
         };
-        this.spawn_initial_daemon_session_with_opts(opts, None, daemon_socket);
+        this.spawn_initial_daemon_session_with_opts(opts, None, daemon_socket, false);
         this
     }
 
@@ -382,7 +395,7 @@ impl CtermWindow {
             cwd,
             ..Default::default()
         };
-        self.spawn_initial_daemon_session_with_opts(opts, None, None);
+        self.spawn_initial_daemon_session_with_opts(opts, None, None, false);
     }
 
     /// Spawn a daemon session with custom options in the background and attach when ready.
@@ -392,11 +405,13 @@ impl CtermWindow {
     /// current tab (e.g. when opening a new tab on a remote ctermd).
     fn spawn_initial_daemon_session_with_opts(
         &self,
-        opts: cterm_client::CreateSessionOpts,
+        mut opts: cterm_client::CreateSessionOpts,
         background_color: Option<String>,
         daemon_socket: Option<std::path::PathBuf>,
+        title_locked: bool,
     ) {
         let config = self.ivars().config.clone();
+        ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
         let window_ptr = self as *const Self as usize;
 
@@ -428,6 +443,7 @@ impl CtermWindow {
                         if let Some(ref bg) = background_color {
                             terminal_view.set_background_override(Some(bg));
                         }
+                        terminal_view.set_title_locked(title_locked);
                         window.attach_terminal_view(terminal_view);
                     });
                 }
@@ -449,7 +465,22 @@ impl CtermWindow {
         background_color: Option<String>,
     ) -> Retained<Self> {
         let this = Self::init_window(mtm, config, theme, &title, color.clone());
-        this.spawn_initial_daemon_session_with_opts(opts, background_color, None);
+        this.spawn_initial_daemon_session_with_opts(opts, background_color, None, false);
+        this
+    }
+
+    /// Create a CLI-launched window, optionally locking an explicit title
+    /// against subsequent OSC title updates.
+    pub fn new_cli_daemon(
+        mtm: MainThreadMarker,
+        config: &Config,
+        theme: &Theme,
+        opts: cterm_client::CreateSessionOpts,
+        title: String,
+        title_locked: bool,
+    ) -> Retained<Self> {
+        let this = Self::init_window(mtm, config, theme, &title, None);
+        this.spawn_initial_daemon_session_with_opts(opts, None, None, title_locked);
         this
     }
 
@@ -550,7 +581,7 @@ impl CtermWindow {
     /// daemon.
     pub fn spawn_daemon_tab(
         &self,
-        opts: cterm_client::CreateSessionOpts,
+        mut opts: cterm_client::CreateSessionOpts,
         template_name: Option<String>,
         color: Option<String>,
         background_color: Option<String>,
@@ -558,6 +589,7 @@ impl CtermWindow {
         daemon_socket: Option<std::path::PathBuf>,
     ) {
         let config = self.ivars().config.clone();
+        ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
         // SAFETY: self is MainThreadOnly, we use the raw pointer only inside
         // dispatch2::Queue::main().exec_async() which runs on the main thread

@@ -177,6 +177,17 @@ impl SessionHandle {
 
     /// Resize the terminal
     pub async fn resize(&self, cols: u32, rows: u32) -> Result<()> {
+        self.resize_with_pixels(cols, rows, 0, 0).await
+    }
+
+    /// Resize the terminal with total pixel dimensions supplied by the UI.
+    pub async fn resize_with_pixels(
+        &self,
+        cols: u32,
+        rows: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Result<()> {
         self.client
             .lock()
             .await
@@ -184,6 +195,8 @@ impl SessionHandle {
                 session_id: self.session_id.clone(),
                 cols,
                 rows,
+                pixel_width,
+                pixel_height,
             })
             .await?;
 

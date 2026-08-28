@@ -96,6 +96,24 @@ cargo run --release
 
 The binary will be at `target/release/cterm`.
 
+### Launching a command
+
+`--execute` starts an executable directly. Arguments after the command are
+passed as a trailing argument vector; cterm does not join them into a shell
+command line.
+
+```bash
+cterm --execute my-tui -- --profile "Jane Doe" --literal-flag
+cterm --directory ./workspace --env MODE=review --env COLOR=always \
+  --execute my-tui -- input.json
+```
+
+`--env NAME=VALUE` is repeatable. Command-line values override `[general.env]`
+values, and the last repeated name wins. An explicit command, directory,
+environment value, or title creates a fresh session instead of reconnecting to
+an unrelated existing daemon session. `--maximized` and `--fullscreen` control
+the initial native window.
+
 ## Configuration
 
 Configuration files are stored in platform-specific locations:
@@ -295,6 +313,20 @@ cterm supports DEC Sixel graphics for inline image display:
 - DECSDM mode for controlling image placement and scrolling
 - Images scroll with terminal content
 - Grid cells under images are cleared (xterm-compatible behavior)
+- DA1 reports Sixel capability (`CSI ? 62 ; 4 c`)
+- `CSI 16 t` reports the renderer's current character-cell height and width
+
+### Enhanced keyboard events
+
+cterm implements the kitty progressive keyboard protocol's disambiguation and
+event-type flags. Applications can request flags `1|2` to receive unambiguous
+press, repeat, and release events for functional keys and disambiguated modified
+keys. Main and alternate screens keep independent flag stacks.
+
+All-key, alternate-key, and associated-text reporting are currently masked out
+when requested. Those modes require layout- and IME-accurate physical key data
+that is not available consistently across GTK, AppKit, and Win32; cterm reports
+only the flags it can honor on every backend.
 
 Test with:
 ```bash

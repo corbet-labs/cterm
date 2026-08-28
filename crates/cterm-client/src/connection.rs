@@ -144,6 +144,10 @@ impl SshTunnelHandle {
 pub struct CreateSessionOpts {
     pub cols: u32,
     pub rows: u32,
+    /// Total terminal viewport width in pixels.
+    pub pixel_width: u32,
+    /// Total terminal viewport height in pixels.
+    pub pixel_height: u32,
     pub shell: Option<String>,
     pub args: Vec<String>,
     pub cwd: Option<String>,
@@ -559,6 +563,8 @@ impl DaemonConnection {
                 env: opts.env.into_iter().collect(),
                 term: opts.term,
                 ssh: opts.ssh,
+                pixel_width: opts.pixel_width,
+                pixel_height: opts.pixel_height,
             })
             .await?;
 

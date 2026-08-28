@@ -32,6 +32,18 @@ pub struct CGRenderer {
 }
 
 impl CGRenderer {
+    fn load_font(font_name: &str, font_size: f64) -> Retained<NSFont> {
+        NSFont::fontWithName_size(&NSString::from_str(font_name), font_size)
+            .or_else(|| NSFont::fontWithName_size(&NSString::from_str("Menlo"), font_size))
+            .unwrap_or_else(|| NSFont::monospacedSystemFontOfSize_weight(font_size, 0.0))
+    }
+
+    /// Measure the exact cell size used by the renderer for this font.
+    pub fn measure_cell_size(font_name: &str, font_size: f64) -> (f64, f64) {
+        let font = Self::load_font(font_name, font_size);
+        (Self::get_advance_for_glyph(&font), font_size * 1.2)
+    }
+
     /// Create a new CoreGraphics renderer
     pub fn new(
         mtm: MainThreadMarker,
@@ -40,10 +52,7 @@ impl CGRenderer {
         theme: &Theme,
         bold_is_bright: bool,
     ) -> Self {
-        // Try to get the specified font, fall back to Menlo
-        let font = NSFont::fontWithName_size(&NSString::from_str(font_name), font_size)
-            .or_else(|| NSFont::fontWithName_size(&NSString::from_str("Menlo"), font_size))
-            .unwrap_or_else(|| NSFont::monospacedSystemFontOfSize_weight(font_size, 0.0));
+        let font = Self::load_font(font_name, font_size);
 
         // Create bold/italic/bold-italic variants via NSFontManager
         let fm = NSFontManager::sharedFontManager(mtm);

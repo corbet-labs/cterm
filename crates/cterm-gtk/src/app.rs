@@ -1,5 +1,6 @@
 //! Application setup and management
 
+use gtk4::prelude::GtkWindowExt;
 use gtk4::{gdk, Application, CssProvider};
 
 use cterm_app::config::{load_config, Config};
@@ -26,8 +27,13 @@ pub fn build_ui(app: &Application) {
     // Apply CSS styling
     apply_css(&theme);
 
-    // Try to reconnect to existing daemon sessions before creating a new one
-    let reconnected = {
+    let args = crate::get_args();
+
+    // An explicit launch always creates the requested child. Reconnecting here
+    // would silently ignore --execute, --directory, and --env.
+    let reconnected = if args.requests_fresh_session() {
+        None
+    } else {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
@@ -60,10 +66,30 @@ pub fn build_ui(app: &Application) {
             window.add_reconnected_tab(recon, None);
         }
         log::info!("Reconnected to daemon sessions, skipping normal startup");
+        if args.maximized {
+            window.window.maximize();
+        }
+        if args.fullscreen {
+            window.window.fullscreen();
+        }
         window.present();
     } else {
         // Normal startup - create the main window with a fresh session
-        let window = CtermWindow::new(app, &config, &theme);
+        let opts = args.initial_session_options(&config, 80, 24);
+        let window = CtermWindow::new_with_initial_session(
+            app,
+            &config,
+            &theme,
+            opts,
+            args.initial_title(&config),
+            args.title.is_some(),
+        );
+        if args.maximized {
+            window.window.maximize();
+        }
+        if args.fullscreen {
+            window.window.fullscreen();
+        }
         window.present();
     }
 }

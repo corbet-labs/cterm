@@ -6,6 +6,7 @@
 use crate::cell::{Cell, CellStyle};
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
+use crate::keyboard::KeyboardEnhancementFlags;
 use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -423,6 +424,10 @@ pub struct Screen {
     cell_height_hint: f64,
     /// Cell width hint in pixels (set by UI layer for image column calculations)
     cell_width_hint: f64,
+    /// Keyboard enhancement stack for the primary screen.
+    keyboard_main_stack: Vec<KeyboardEnhancementFlags>,
+    /// Keyboard enhancement stack for the alternate screen.
+    keyboard_alt_stack: Vec<KeyboardEnhancementFlags>,
     /// DRCS fonts (soft fonts) keyed by designator
     drcs_fonts: HashMap<String, DrcsFont>,
     /// Total number of lines ever pushed to scrollback (monotonically increasing).
@@ -474,6 +479,8 @@ impl Screen {
             next_file_transfer_id: 0,
             cell_height_hint: 16.0, // Default assumption
             cell_width_hint: 8.0,   // Default assumption
+            keyboard_main_stack: Vec::new(),
+            keyboard_alt_stack: Vec::new(),
             drcs_fonts: HashMap::new(),
             scrollback_total_pushed: 0,
         }
@@ -482,6 +489,60 @@ impl Screen {
     /// Queue a response to be sent back through the PTY
     pub fn queue_response(&mut self, response: Vec<u8>) {
         self.pending_responses.push(response);
+    }
+
+    /// Active kitty keyboard progressive-enhancement flags.
+    pub fn keyboard_enhancement_flags(&self) -> KeyboardEnhancementFlags {
+        self.active_keyboard_stack()
+            .last()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Replace the current keyboard mode, applying only supported flags.
+    pub fn set_keyboard_enhancement_flags(&mut self, flags: KeyboardEnhancementFlags) {
+        let flags = flags & KeyboardEnhancementFlags::SUPPORTED;
+        let stack = self.active_keyboard_stack_mut();
+        if let Some(current) = stack.last_mut() {
+            *current = flags;
+        } else {
+            stack.push(flags);
+        }
+    }
+
+    /// Push a keyboard mode. The stack is bounded to avoid untrusted terminal
+    /// output growing memory without limit.
+    pub fn push_keyboard_enhancement_flags(&mut self, flags: KeyboardEnhancementFlags) {
+        const MAX_DEPTH: usize = 16;
+        let flags = flags & KeyboardEnhancementFlags::SUPPORTED;
+        let stack = self.active_keyboard_stack_mut();
+        if stack.len() == MAX_DEPTH {
+            stack.remove(0);
+        }
+        stack.push(flags);
+    }
+
+    /// Pop one or more keyboard modes. An empty stack means legacy mode.
+    pub fn pop_keyboard_enhancement_flags(&mut self, count: usize) {
+        let stack = self.active_keyboard_stack_mut();
+        let new_len = stack.len().saturating_sub(count);
+        stack.truncate(new_len);
+    }
+
+    fn active_keyboard_stack(&self) -> &[KeyboardEnhancementFlags] {
+        if self.modes.alternate_screen {
+            &self.keyboard_alt_stack
+        } else {
+            &self.keyboard_main_stack
+        }
+    }
+
+    fn active_keyboard_stack_mut(&mut self) -> &mut Vec<KeyboardEnhancementFlags> {
+        if self.modes.alternate_screen {
+            &mut self.keyboard_alt_stack
+        } else {
+            &mut self.keyboard_main_stack
+        }
     }
 
     /// Queue a clipboard operation (from OSC 52)
@@ -1143,6 +1204,8 @@ impl Screen {
         self.scroll_offset = 0;
         self.images.clear();
         self.drcs_fonts.clear();
+        self.keyboard_main_stack.clear();
+        self.keyboard_alt_stack.clear();
     }
 
     /// Search for text in scrollback and visible buffer

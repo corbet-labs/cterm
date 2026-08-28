@@ -1,6 +1,7 @@
 //! Terminal rendering widget using Cairo
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +18,7 @@ use cterm_core::color::{Color, Rgb};
 use cterm_core::mouse::{encode_mouse_event, MouseButton, MouseModifiers};
 use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
+use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
 use cterm_ui::theme::Theme;
 
 /// Cell dimensions calculated from font metrics
@@ -457,8 +459,19 @@ impl TerminalWidget {
         drop(dims);
 
         if cols > 0 && rows > 0 {
+            let pixel_width = width.clamp(1, u16::MAX as i32) as u16;
+            let pixel_height = height.clamp(1, u16::MAX as i32) as u16;
             let mut term = self.terminal.lock();
-            term.resize(cols, rows);
+            term.resize_with_pixels(cols, rows, pixel_width, pixel_height);
+            drop(term);
+            if let Some(ref tx) = self.daemon_cmd_tx {
+                let _ = tx.send(DaemonCommand::Resize {
+                    cols: cols as u32,
+                    rows: rows as u32,
+                    pixel_width: u32::from(pixel_width),
+                    pixel_height: u32::from(pixel_height),
+                });
+            }
         }
 
         self.drawing_area.queue_draw();
@@ -540,13 +553,19 @@ impl TerminalWidget {
             drawing_area_preedit_end.queue_draw();
         });
 
+        let enhanced_keys: Rc<RefCell<HashMap<u32, Key>>> = Rc::new(RefCell::new(HashMap::new()));
+
         // Manage IM focus when the DrawingArea gains/loses keyboard focus
         let im_focus = im_context.clone();
+        let enhanced_focus = Rc::clone(&enhanced_keys);
         self.drawing_area.connect_has_focus_notify(move |widget| {
             if widget.has_focus() {
                 im_focus.focus_in();
             } else {
                 im_focus.focus_out();
+                // A compositor may not deliver key-up after focus moves.
+                // Do not classify the next physical press as a repeat.
+                enhanced_focus.borrow_mut().clear();
             }
         });
         // If the drawing area already has focus, activate IM immediately
@@ -557,7 +576,8 @@ impl TerminalWidget {
         // Key press handler
         let terminal_key = Arc::clone(&terminal);
         let im_key = im_context.clone();
-        key_controller.connect_key_pressed(move |controller, keyval, _keycode, state| {
+        let enhanced_keys_down = Rc::clone(&enhanced_keys);
+        key_controller.connect_key_pressed(move |controller, keyval, keycode, state| {
             // Reset scroll to bottom on any user input
             {
                 let mut term = terminal_key.lock();
@@ -566,17 +586,11 @@ impl TerminalWidget {
                 }
             }
 
-            // Ctrl+Shift combinations are handled by the window's CAPTURE
-            // controller (shortcuts). If they reach here, just ignore.
             let has_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-            let has_shift = state.contains(gdk::ModifierType::SHIFT_MASK)
-                || keyval.to_unicode().is_some_and(|c| c.is_uppercase());
-            if has_ctrl && has_shift {
-                return glib::Propagation::Proceed;
-            }
 
-            // Let the IM context try to handle the key first.
-            // This handles Ctrl+Space (IBus trigger), Japanese composition, etc.
+            // Let the IM context try to handle the key first. This must happen
+            // before enhanced-character routing so triggers such as Ctrl+Space
+            // and active composition continue to belong to the input method.
             if let Some(event) = controller.current_event() {
                 if im_key.filter_keypress(&event) {
                     return glib::Propagation::Stop;
@@ -584,6 +598,30 @@ impl TerminalWidget {
             }
 
             let modifiers = gtk_state_to_modifiers(state);
+            let protocol_key = keyval_to_key(keyval).or_else(|| {
+                keyval
+                    .to_lower()
+                    .to_unicode()
+                    .map(cterm_core::term::Key::Char)
+            });
+            if let Some(key) = protocol_key {
+                let mut term = terminal_key.lock();
+                if should_route_enhanced_key(&term, key, modifiers) {
+                    let kind = if enhanced_keys_down.borrow().contains_key(&keycode) {
+                        KeyEventKind::Repeat
+                    } else {
+                        enhanced_keys_down.borrow_mut().insert(keycode, key);
+                        KeyEventKind::Press
+                    };
+                    if let Some(bytes) = term.handle_key_event(key, modifiers, kind) {
+                        if let Err(e) = term.write(&bytes) {
+                            log::error!("Failed to write enhanced key event to PTY: {e}");
+                        }
+                    }
+                    return glib::Propagation::Stop;
+                }
+            }
+
             let has_alt = state.contains(gdk::ModifierType::ALT_MASK);
 
             // Handle special keys (arrows, function keys, etc.)
@@ -651,9 +689,22 @@ impl TerminalWidget {
             glib::Propagation::Proceed
         });
 
-        // Key release handler — IM contexts need release events too
+        // Key release handler — report releases for physical keys routed by
+        // kitty event mode; all other releases still reach the IM context.
         let im_release = im_context.clone();
-        key_controller.connect_key_released(move |controller, _keyval, _keycode, _state| {
+        let terminal_release = Arc::clone(&terminal);
+        let enhanced_keys_up = Rc::clone(&enhanced_keys);
+        key_controller.connect_key_released(move |controller, _keyval, keycode, state| {
+            if let Some(key) = enhanced_keys_up.borrow_mut().remove(&keycode) {
+                let modifiers = gtk_state_to_modifiers(state);
+                let mut term = terminal_release.lock();
+                if let Some(bytes) = term.handle_reported_key_release(key, modifiers) {
+                    if let Err(e) = term.write(&bytes) {
+                        log::error!("Failed to write enhanced key release to PTY: {e}");
+                    }
+                }
+                return;
+            }
             if let Some(event) = controller.current_event() {
                 im_release.filter_keypress(&event);
             }
@@ -1240,11 +1291,21 @@ impl TerminalWidget {
                 if cols > 0 && rows > 0 {
                     // Resize local terminal (screen buffer)
                     let mut term = terminal.lock();
-                    term.resize(cols, rows);
+                    term.resize_with_pixels(
+                        cols,
+                        rows,
+                        width.clamp(1, u16::MAX as i32) as u16,
+                        height.clamp(1, u16::MAX as i32) as u16,
+                    );
                     drop(term);
 
                     // Notify daemon of resize via command channel
-                    let _ = cmd_tx.send(DaemonCommand::Resize(cols as u32, rows as u32));
+                    let _ = cmd_tx.send(DaemonCommand::Resize {
+                        cols: cols as u32,
+                        rows: rows as u32,
+                        pixel_width: width.max(1) as u32,
+                        pixel_height: height.max(1) as u32,
+                    });
                 }
             });
     }
@@ -1281,6 +1342,8 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY — write callback forwards via channel
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.screen_mut().set_cell_width_hint(cell_dims.width);
+        terminal.screen_mut().set_cell_height_hint(cell_dims.height);
         let write_tx = cmd_tx.clone();
         terminal.set_write_fn(Box::new(move |data: &[u8]| {
             let _ = write_tx.send(DaemonCommand::Write(data.to_vec()));
@@ -1343,6 +1406,8 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.screen_mut().set_cell_width_hint(cell_dims.width);
+        terminal.screen_mut().set_cell_height_hint(cell_dims.height);
 
         // Apply screen snapshot BEFORE wrapping in Arc<Mutex<>>
         recon.apply_screen(&mut terminal);
@@ -1513,8 +1578,21 @@ impl TerminalWidget {
                                     });
                                 }
                             }
-                            DaemonCommand::Resize(cols, rows) => {
-                                if let Err(e) = cmd_session.resize(cols, rows).await {
+                            DaemonCommand::Resize {
+                                cols,
+                                rows,
+                                pixel_width,
+                                pixel_height,
+                            } => {
+                                if let Err(e) = cmd_session
+                                    .resize_with_pixels(
+                                        cols,
+                                        rows,
+                                        pixel_width,
+                                        pixel_height,
+                                    )
+                                    .await
+                                {
                                     log::error!("Failed to resize daemon session: {}", e);
                                 }
                             }
@@ -1651,7 +1729,7 @@ impl TerminalWidget {
                 match msg {
                     PtyMessage::Data(data) => {
                         let mut term = terminal_main.lock();
-                        let events = term.process(&data);
+                        let events = term.process_mirror(&data);
 
                         for event in events {
                             match event {
@@ -1814,7 +1892,12 @@ enum PtyMessage {
 /// Commands sent to the daemon I/O thread
 enum DaemonCommand {
     Write(Vec<u8>),
-    Resize(u32, u32),
+    Resize {
+        cols: u32,
+        rows: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    },
     /// Kill the remote PTY and shut down the I/O loop.
     Destroy,
     /// Tell the daemon to detach (keeping the remote PTY alive) and shut down
@@ -2171,6 +2254,22 @@ fn gtk_state_to_modifiers(state: gdk::ModifierType) -> Modifiers {
     }
 
     modifiers
+}
+
+fn should_route_enhanced_key(term: &Terminal, key: Key, modifiers: Modifiers) -> bool {
+    let flags = term.screen().keyboard_enhancement_flags();
+    let events = flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
+    let disambiguate = flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES);
+
+    match key {
+        Key::Char(_) => {
+            disambiguate
+                && modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+        }
+        Key::Escape => disambiguate || events,
+        Key::Enter | Key::Tab | Key::Backspace => false,
+        _ => events,
+    }
 }
 
 /// Convert GDK keyval to terminal Key

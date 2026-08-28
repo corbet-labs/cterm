@@ -47,6 +47,34 @@ impl SessionManager {
         env: Vec<(String, String)>,
         term: Option<String>,
     ) -> Result<Arc<SessionState>> {
+        self.create_session_with_size(
+            cterm_core::PtySize {
+                cols: cols.clamp(1, u16::MAX as usize) as u16,
+                rows: rows.clamp(1, u16::MAX as usize) as u16,
+                ..Default::default()
+            },
+            shell,
+            args,
+            cwd,
+            env,
+            term,
+        )
+    }
+
+    /// Create a terminal session with complete cell and pixel dimensions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_size(
+        &self,
+        size: cterm_core::PtySize,
+        shell: Option<String>,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        term: Option<String>,
+    ) -> Result<Arc<SessionState>> {
+        let size = size.normalized();
+        let cols = size.cols as usize;
+        let rows = size.rows as usize;
         let id = generate_session_id();
 
         // Check for collision (extremely unlikely with UUID v4)
@@ -56,8 +84,7 @@ impl SessionManager {
 
         let state = SessionState::new(
             id.clone(),
-            cols,
-            rows,
+            size,
             shell,
             args,
             cwd,
@@ -89,6 +116,25 @@ impl SessionManager {
         rows: usize,
         ssh_config: cterm_core::SshConfig,
     ) -> Result<Arc<SessionState>> {
+        self.create_ssh_session_with_size(
+            cterm_core::PtySize {
+                cols: cols.clamp(1, u16::MAX as usize) as u16,
+                rows: rows.clamp(1, u16::MAX as usize) as u16,
+                ..Default::default()
+            },
+            ssh_config,
+        )
+    }
+
+    /// Create a native SSH session with complete cell and pixel dimensions.
+    pub fn create_ssh_session_with_size(
+        &self,
+        size: cterm_core::PtySize,
+        ssh_config: cterm_core::SshConfig,
+    ) -> Result<Arc<SessionState>> {
+        let size = size.normalized();
+        let cols = size.cols as usize;
+        let rows = size.rows as usize;
         let id = generate_session_id();
 
         if self.sessions.read().contains_key(&id) {
@@ -96,7 +142,7 @@ impl SessionManager {
         }
 
         let host = ssh_config.host.clone();
-        let state = SessionState::new_ssh_connecting(id.clone(), cols, rows, self.scrollback_lines);
+        let state = SessionState::new_ssh_connecting(id.clone(), size, self.scrollback_lines);
 
         // Store the session before driving the connection so prompt/event
         // subscribers can attach immediately.
@@ -104,7 +150,7 @@ impl SessionManager {
         self.sessions.write().insert(id, Arc::clone(&state));
 
         // Drive the SSH connection (and prompts) on a background task.
-        state.spawn_ssh_connect(ssh_config, cols, rows);
+        state.spawn_ssh_connect(ssh_config, size);
 
         log::info!(
             "Created SSH session {} to {} ({}x{}, connecting)",

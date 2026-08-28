@@ -12,6 +12,7 @@ pub mod drcs;
 pub mod grid;
 pub mod image_decode;
 pub mod iterm2;
+pub mod keyboard;
 pub mod mouse;
 pub mod parser;
 pub mod pty;
@@ -27,6 +28,7 @@ pub use drcs::{DecdldDecoder, DrcsFont, DrcsGlyph};
 pub use grid::Grid;
 pub use image_decode::{decode_image, DecodedImage, ImageDecodeError};
 pub use iterm2::{Iterm2Dimension, Iterm2FileParams};
+pub use keyboard::{KeyEventKind, KeyboardEnhancementFlags};
 pub use parser::Parser;
 #[cfg(unix)]
 pub use pty::save_original_nofile_limit;

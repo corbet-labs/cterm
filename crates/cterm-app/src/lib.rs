@@ -4,6 +4,7 @@
 //! including configuration management, session handling, sticky tabs,
 //! seamless upgrade functionality, and daemon session management.
 
+pub mod cli;
 pub mod config;
 pub mod daemon_reconnect;
 pub mod daemon_session;

@@ -396,6 +396,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
+ "clap",
  "cterm-client",
  "cterm-core",
  "cterm-proto",

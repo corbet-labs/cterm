@@ -3,6 +3,7 @@
 //! NSView subclass that renders the terminal using CoreGraphics.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -21,8 +22,8 @@ use parking_lot::Mutex;
 
 use cterm_app::config::Config;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
-use cterm_core::term::TerminalEvent;
-use cterm_core::Terminal;
+use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
+use cterm_core::{KeyEventKind, KeyboardEnhancementFlags, Terminal};
 use cterm_ui::theme::Theme;
 
 use crate::cg_renderer::CGRenderer;
@@ -30,6 +31,79 @@ use crate::file_transfer::PendingFileManager;
 use crate::mouse::{self, MouseButton, MouseModifiers};
 use crate::notification_bar::{NotificationBar, NOTIFICATION_BAR_HEIGHT};
 use crate::{clipboard, keycode};
+
+fn key_event_kind(is_repeat: bool) -> KeyEventKind {
+    if is_repeat {
+        KeyEventKind::Repeat
+    } else {
+        KeyEventKind::Press
+    }
+}
+
+fn terminal_key_for_keycode(keycode: u16) -> Option<Key> {
+    Some(match keycode {
+        // Arrow keys
+        0x7E => Key::Up,
+        0x7D => Key::Down,
+        0x7B => Key::Left,
+        0x7C => Key::Right,
+        // Navigation
+        0x73 => Key::Home,
+        0x77 => Key::End,
+        0x74 => Key::PageUp,
+        0x79 => Key::PageDown,
+        // Editing
+        0x72 => Key::Insert,
+        0x75 => Key::Delete,
+        0x33 => Key::Backspace,
+        0x24 => Key::Enter,
+        0x30 => Key::Tab,
+        0x35 => Key::Escape,
+        // Function keys
+        0x7A => Key::F(1),
+        0x78 => Key::F(2),
+        0x63 => Key::F(3),
+        0x76 => Key::F(4),
+        0x60 => Key::F(5),
+        0x61 => Key::F(6),
+        0x62 => Key::F(7),
+        0x64 => Key::F(8),
+        0x65 => Key::F(9),
+        0x6D => Key::F(10),
+        0x67 => Key::F(11),
+        0x6F => Key::F(12),
+        _ => return None,
+    })
+}
+
+fn exactly_one_char(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let character = chars.next()?;
+    chars.next().is_none().then_some(character)
+}
+
+fn unmodified_key_char(text: &str) -> Option<char> {
+    let character = exactly_one_char(text)?;
+    let mut lowercase = character.to_lowercase();
+    let character = lowercase.next()?;
+    lowercase.next().is_none().then_some(character)
+}
+
+fn direct_modified_key_char(
+    event_text: &str,
+    base_text: &str,
+    alt_may_produce_text: bool,
+) -> Option<char> {
+    let event = exactly_one_char(event_text)?;
+    let base = unmodified_key_char(base_text)?;
+    if alt_may_produce_text && !event.is_control() {
+        let mut lowercase = event.to_lowercase();
+        if lowercase.next() != Some(base) || lowercase.next().is_some() {
+            return None;
+        }
+    }
+    Some(base)
+}
 
 /// Shared state between the view and PTY thread
 struct ViewState {
@@ -64,7 +138,12 @@ impl Default for ViewState {
 /// Commands sent to the daemon I/O thread
 enum DaemonCommand {
     Write(Vec<u8>),
-    Resize(u32, u32),
+    Resize {
+        cols: u32,
+        rows: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    },
     Destroy,
     SetTitle(String),
     SetTabColor(String),
@@ -93,6 +172,8 @@ pub struct TerminalViewIvars {
     session_id: RefCell<Option<String>>,
     /// Marked text for IME input (Japanese, Chinese, etc.)
     marked_text: RefCell<String>,
+    /// Keys whose presses were sent directly to the terminal instead of Cocoa text input
+    reported_keys: RefCell<HashMap<u16, Key>>,
     /// Notification bar for file transfers
     notification_bar: RefCell<Option<Retained<NotificationBar>>>,
     /// Pending file manager for file transfers
@@ -218,11 +299,22 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            use cterm_core::term::Key;
+            log::debug!(
+                "keyDown: keyCode={}, modifiers={:?}",
+                event.keyCode(),
+                event.modifierFlags()
+            );
 
-            log::debug!("keyDown: keyCode={}, modifiers={:?}", event.keyCode(), event.modifierFlags());
-
+            let raw_keycode = event.keyCode();
+            let kind = key_event_kind(event.isARepeat());
             let modifiers = keycode::modifiers_from_event(event);
+            let core_mods = CoreModifiers::from_bits_truncate(modifiers.bits());
+
+            // Clear any stale press for a newly pressed physical key. Repeats retain the
+            // original identity so keyUp can report the same key even if the layout changes.
+            if kind == KeyEventKind::Press {
+                self.ivars().reported_keys.borrow_mut().remove(&raw_keycode);
+            }
 
             // Let Command+key combinations pass through to the menu system
             // Command is never part of terminal sequences
@@ -253,9 +345,18 @@ define_class!(
                 }
             }
 
+            let keyboard_flags = self
+                .ivars()
+                .terminal
+                .lock()
+                .screen()
+                .keyboard_enhancement_flags();
+
             // Handle Option+Arrow keys specially to match macOS Terminal.app behavior
-            let raw_keycode = event.keyCode();
-            if modifiers.contains(cterm_ui::events::Modifiers::ALT) {
+            // when no application has requested enhanced keyboard events.
+            if keyboard_flags.is_empty()
+                && modifiers.contains(cterm_ui::events::Modifiers::ALT)
+            {
                 let seq: Option<&[u8]> = match raw_keycode {
                     0x7B => Some(b"\x1bb"),  // Option+Left: backward-word (ESC b)
                     0x7C => Some(b"\x1bf"),  // Option+Right: forward-word (ESC f)
@@ -270,52 +371,52 @@ define_class!(
                 }
             }
 
-            // Convert macOS keycode to terminal Key
-            let key = match raw_keycode {
-                // Arrow keys
-                0x7E => Some(Key::Up),
-                0x7D => Some(Key::Down),
-                0x7B => Some(Key::Left),
-                0x7C => Some(Key::Right),
-                // Navigation
-                0x73 => Some(Key::Home),
-                0x77 => Some(Key::End),
-                0x74 => Some(Key::PageUp),
-                0x79 => Some(Key::PageDown),
-                // Editing
-                0x72 => Some(Key::Insert),
-                0x75 => Some(Key::Delete),
-                0x33 => Some(Key::Backspace),
-                0x24 => Some(Key::Enter),
-                0x30 => Some(Key::Tab),
-                0x35 => Some(Key::Escape),
-                // Function keys
-                0x7A => Some(Key::F(1)),
-                0x78 => Some(Key::F(2)),
-                0x63 => Some(Key::F(3)),
-                0x76 => Some(Key::F(4)),
-                0x60 => Some(Key::F(5)),
-                0x61 => Some(Key::F(6)),
-                0x62 => Some(Key::F(7)),
-                0x64 => Some(Key::F(8)),
-                0x65 => Some(Key::F(9)),
-                0x6D => Some(Key::F(10)),
-                0x67 => Some(Key::F(11)),
-                0x6F => Some(Key::F(12)),
-                _ => None,
-            };
-
-            // Convert cterm_ui Modifiers to cterm_core Modifiers
-            let core_mods = cterm_core::term::Modifiers::from_bits_truncate(modifiers.bits());
-
-            // If it's a special key, use Terminal::handle_key to get the escape sequence
-            if let Some(key) = key {
-                let terminal = self.ivars().terminal.lock();
-                if let Some(data) = terminal.handle_key(key, core_mods) {
-                    drop(terminal);
+            // Functional keys bypass Cocoa text input. Remember keys handled here so keyUp
+            // can emit a matching release only when the corresponding press was reported.
+            if let Some(key) = terminal_key_for_keycode(raw_keycode) {
+                if let Some(data) = self.terminal_key_event(key, core_mods, kind) {
+                    self.ivars()
+                        .reported_keys
+                        .borrow_mut()
+                        .insert(raw_keycode, key);
                     log::debug!("Special key: {:?} -> {:?}", key, data);
                     self.write_to_pty(&data);
                     return;
+                }
+            }
+
+            // Kitty disambiguation needs the base key plus modifiers. Only bypass Cocoa text
+            // input when both strings identify exactly one scalar; dead keys and composed text
+            // stay on interpretKeyEvents so IME behavior is unchanged.
+            if keyboard_flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+                && modifiers.intersects(
+                    cterm_ui::events::Modifiers::CTRL | cterm_ui::events::Modifiers::ALT,
+                )
+            {
+                let event_text = keycode::characters_from_event(event);
+                let base_text = keycode::characters_ignoring_modifiers(event);
+                let key = event_text
+                    .as_deref()
+                    .zip(base_text.as_deref())
+                    .and_then(|(event_text, base_text)| {
+                        direct_modified_key_char(
+                            event_text,
+                            base_text,
+                            modifiers.contains(cterm_ui::events::Modifiers::ALT),
+                        )
+                    })
+                    .map(Key::Char);
+
+                if let Some(key) = key {
+                    if let Some(data) = self.terminal_key_event(key, core_mods, kind) {
+                        self.ivars()
+                            .reported_keys
+                            .borrow_mut()
+                            .insert(raw_keycode, key);
+                        log::debug!("Enhanced character key: {:?} -> {:?}", key, data);
+                        self.write_to_pty(&data);
+                        return;
+                    }
                 }
             }
 
@@ -346,6 +447,31 @@ define_class!(
             log::debug!("Routing key event through interpretKeyEvents for IME");
             let events = NSArray::from_slice(&[event]);
             self.interpretKeyEvents(&events);
+        }
+
+        #[unsafe(method(keyUp:))]
+        fn key_up(&self, event: &NSEvent) {
+            let raw_keycode = event.keyCode();
+            let key = self.ivars().reported_keys.borrow_mut().remove(&raw_keycode);
+
+            if let Some(key) = key {
+                let modifiers = keycode::modifiers_from_event(event);
+                let core_mods = CoreModifiers::from_bits_truncate(modifiers.bits());
+                let data = self
+                    .ivars()
+                    .terminal
+                    .lock()
+                    .handle_reported_key_release(key, core_mods);
+                if let Some(data) = data {
+                    log::debug!("Key release: {:?} -> {:?}", key, data);
+                    self.write_to_pty(&data);
+                }
+                return;
+            }
+
+            // Cocoa owns releases for menu shortcuts, IME input, and other keys whose presses
+            // were not sent directly to the terminal.
+            let _: () = unsafe { msg_send![super(self), keyUp: event] };
         }
 
         #[unsafe(method(mouseDown:))]
@@ -1299,6 +1425,18 @@ struct ViewInitOptions {
 }
 
 impl TerminalView {
+    fn terminal_key_event(
+        &self,
+        key: Key,
+        modifiers: CoreModifiers,
+        kind: KeyEventKind,
+    ) -> Option<Vec<u8>> {
+        self.ivars()
+            .terminal
+            .lock()
+            .handle_key_event(key, modifiers, kind)
+    }
+
     /// Common initialization: allocate NSView, set ivars, init frame, setup notification bar
     fn init_view(
         mtm: MainThreadMarker,
@@ -1325,6 +1463,7 @@ impl TerminalView {
             template_name: RefCell::new(options.template_name),
             session_id: RefCell::new(None),
             marked_text: RefCell::new(String::new()),
+            reported_keys: RefCell::new(HashMap::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
             color_palette: theme.colors.clone(),
@@ -1594,8 +1733,16 @@ impl TerminalView {
                                 });
                             }
                         }
-                        DaemonCommand::Resize(cols, rows) => {
-                            if let Err(e) = cmd_session.resize(cols, rows).await {
+                        DaemonCommand::Resize {
+                            cols,
+                            rows,
+                            pixel_width,
+                            pixel_height,
+                        } => {
+                            if let Err(e) = cmd_session
+                                .resize_with_pixels(cols, rows, pixel_width, pixel_height)
+                                .await
+                            {
                                 log::error!("Failed to resize daemon session: {}", e);
                             }
                         }
@@ -1700,7 +1847,7 @@ impl TerminalView {
                                 match result {
                                     Ok(chunk) => {
                                         let mut term = terminal.lock();
-                                        let events = term.process(&chunk.data);
+                                        let events = term.process_mirror(&chunk.data);
 
                                         for event in events {
                                             match event {
@@ -1922,13 +2069,23 @@ impl TerminalView {
 
         if cols > 0 && rows > 0 {
             let mut terminal = self.ivars().terminal.lock();
-            terminal.resize(cols, rows);
+            terminal.resize_with_pixels(
+                cols,
+                rows,
+                frame.size.width.round().clamp(1.0, u16::MAX as f64) as u16,
+                frame.size.height.round().clamp(1.0, u16::MAX as f64) as u16,
+            );
             drop(terminal);
             log::debug!("Resized terminal to {}x{}", cols, rows);
 
             // Notify daemon of resize (if connected)
             if let Some(ref tx) = *self.ivars().daemon_cmd_tx.borrow() {
-                let _ = tx.send(DaemonCommand::Resize(cols as u32, rows as u32));
+                let _ = tx.send(DaemonCommand::Resize {
+                    cols: cols as u32,
+                    rows: rows as u32,
+                    pixel_width: frame.size.width.round().max(1.0) as u32,
+                    pixel_height: frame.size.height.round().max(1.0) as u32,
+                });
             }
         }
     }
@@ -2607,5 +2764,41 @@ impl TerminalView {
             .map_err(std::io::Error::other)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod keyboard_event_tests {
+    use super::*;
+
+    #[test]
+    fn maps_press_and_repeat_event_kinds() {
+        assert_eq!(key_event_kind(false), KeyEventKind::Press);
+        assert_eq!(key_event_kind(true), KeyEventKind::Repeat);
+    }
+
+    #[test]
+    fn maps_functional_keycodes() {
+        assert_eq!(terminal_key_for_keycode(0x7E), Some(Key::Up));
+        assert_eq!(terminal_key_for_keycode(0x75), Some(Key::Delete));
+        assert_eq!(terminal_key_for_keycode(0x7A), Some(Key::F(1)));
+        assert_eq!(terminal_key_for_keycode(0x6F), Some(Key::F(12)));
+        assert_eq!(terminal_key_for_keycode(0x00), None);
+    }
+
+    #[test]
+    fn accepts_only_one_unicode_scalar_for_direct_reporting() {
+        assert_eq!(exactly_one_char("a"), Some('a'));
+        assert_eq!(exactly_one_char("é"), Some('é'));
+        assert_eq!(exactly_one_char(""), None);
+        assert_eq!(exactly_one_char("ab"), None);
+        assert_eq!(exactly_one_char("e\u{301}"), None);
+        assert_eq!(unmodified_key_char("A"), Some('a'));
+        assert_eq!(unmodified_key_char("İ"), None);
+        assert_eq!(direct_modified_key_char("a", "a", true), Some('a'));
+        assert_eq!(direct_modified_key_char("A", "A", true), Some('a'));
+        assert_eq!(direct_modified_key_char("å", "a", true), None);
+        assert_eq!(direct_modified_key_char("\u{1}", "A", false), Some('a'));
+        assert_eq!(direct_modified_key_char("\u{1}", "A", true), Some('a'));
     }
 }

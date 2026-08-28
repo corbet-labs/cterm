@@ -3,6 +3,7 @@
 //! Handles NSApplication lifecycle and main event loop.
 
 use clap::Parser;
+use cterm_app::cli::Args;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
@@ -13,46 +14,12 @@ use objc2_app_kit::{
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
-use std::path::PathBuf;
 
 use cterm_app::config::{load_config, Config};
 use cterm_ui::theme::Theme;
 
 use crate::menu;
 use crate::window::CtermWindow;
-
-/// Command-line arguments for cterm
-#[derive(Parser, Debug)]
-#[command(
-    name = "cterm",
-    version,
-    about = "A high-performance terminal emulator"
-)]
-pub struct Args {
-    /// Execute a command instead of the default shell
-    #[arg(short = 'e', long = "execute")]
-    pub command: Option<String>,
-
-    /// Set the working directory
-    #[arg(short = 'd', long = "directory")]
-    pub directory: Option<PathBuf>,
-
-    /// Start in fullscreen mode
-    #[arg(long)]
-    pub fullscreen: bool,
-
-    /// Start maximized
-    #[arg(long)]
-    pub maximized: bool,
-
-    /// Set the window title
-    #[arg(short = 't', long = "title")]
-    pub title: Option<String>,
-
-    /// Receive upgrade state from a file path (internal use)
-    #[arg(long, hide = true)]
-    pub upgrade_state: Option<String>,
-}
 
 /// Global application arguments (accessible from window creation)
 static APP_ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
@@ -185,8 +152,9 @@ define_class!(
                 }
             }
 
-            // Try to reconnect to existing daemon sessions
-            {
+            // Try to reconnect to existing daemon sessions. Explicit child
+            // launches must never be replaced by an old session.
+            if !get_args().requests_fresh_session() {
                 let config = self.ivars().config.clone();
                 let theme = self.ivars().theme.clone();
 
@@ -225,6 +193,15 @@ define_class!(
                                             window.makeKeyAndOrderFront(None);
                                         }
                                     }
+                                    if let Some(window) = self.ivars().windows.borrow().first() {
+                                        let args = get_args();
+                                        if args.maximized {
+                                            window.performZoom(None);
+                                        }
+                                        if args.fullscreen {
+                                            window.toggleFullScreen(None);
+                                        }
+                                    }
                                     // Skip normal startup since we reconnected to existing sessions
                                     #[allow(deprecated)]
                                     NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
@@ -239,7 +216,16 @@ define_class!(
 
             // Normal startup - create the main window
             log::debug!("Creating main window...");
-            let window = CtermWindow::new(mtm, &self.ivars().config, &self.ivars().theme);
+            let args = get_args();
+            let opts = args.initial_session_options(&self.ivars().config, 80, 24);
+            let window = CtermWindow::new_cli_daemon(
+                mtm,
+                &self.ivars().config,
+                &self.ivars().theme,
+                opts,
+                args.initial_title(&self.ivars().config),
+                args.title.is_some(),
+            );
             log::debug!("Main window created");
 
             // Store window reference
@@ -248,6 +234,12 @@ define_class!(
 
             // Show the window
             window.makeKeyAndOrderFront(None);
+            if args.maximized {
+                window.performZoom(None);
+            }
+            if args.fullscreen {
+                window.toggleFullScreen(None);
+            }
             log::info!("Window shown (makeKeyAndOrderFront)");
 
             // Activate the app to bring window to front

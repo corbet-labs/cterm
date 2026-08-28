@@ -267,6 +267,40 @@ impl CtermWindow {
         cterm_window
     }
 
+    /// Create a window whose first daemon session has explicit process
+    /// options (used by the command-line launch path).
+    pub fn new_with_initial_session(
+        app: &Application,
+        config: &Config,
+        theme: &Theme,
+        opts: cterm_client::CreateSessionOpts,
+        title: String,
+        title_locked: bool,
+    ) -> Self {
+        let window = Self::new_empty(app, config, theme);
+        spawn_daemon_tab(
+            &window.notebook,
+            &window.tabs,
+            &window.next_tab_id,
+            &window.config,
+            &window.theme,
+            &window.tab_bar,
+            &window.window,
+            &window.has_bell,
+            &window.file_manager,
+            &window.notification_bar,
+            opts,
+            title,
+            None,
+            None,
+            false,
+            title_locked,
+            None,
+            None,
+        );
+        window
+    }
+
     /// Set up window actions for the menu
     fn setup_actions(&self) {
         let window = &self.window;
@@ -2470,6 +2504,7 @@ fn create_new_tab(
         None,
         None,
         false,
+        false,
         None,
         daemon_socket,
     );
@@ -2516,6 +2551,7 @@ fn create_docker_tab(
         Some("#0db7ed".to_string()),
         None,
         false,
+        false,
         None,
         None,
     );
@@ -2539,14 +2575,24 @@ fn spawn_daemon_tab(
     has_bell: &Rc<RefCell<bool>>,
     file_manager: &Rc<RefCell<PendingFileManager>>,
     notification_bar: &NotificationBar,
-    opts: cterm_client::CreateSessionOpts,
+    mut opts: cterm_client::CreateSessionOpts,
     title: String,
     color: Option<String>,
     background_color: Option<String>,
     keep_open: bool,
+    title_locked: bool,
     remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
     daemon_socket: Option<std::path::PathBuf>,
 ) {
+    if opts.pixel_width == 0 || opts.pixel_height == 0 {
+        let cell_dims = calculate_initial_cell_dimensions(&config.borrow());
+        opts.pixel_width = (cell_dims.width * opts.cols.max(1) as f64)
+            .round()
+            .clamp(1.0, u32::MAX as f64) as u32;
+        opts.pixel_height = (cell_dims.height * opts.rows.max(1) as f64)
+            .round()
+            .clamp(1.0, u32::MAX as f64) as u32;
+    }
     let notebook = notebook.clone();
     let tabs = Rc::clone(tabs);
     let next_tab_id = Rc::clone(next_tab_id);
@@ -2634,7 +2680,7 @@ fn spawn_daemon_tab(
                             page_num,
                             title.clone(),
                             terminal,
-                            false,
+                            title_locked,
                             sid,
                             daemon_socket,
                             remote_name.clone(),
@@ -2873,6 +2919,7 @@ fn create_tab_from_template(
             template.color.clone(),
             template.background_color.clone(),
             template.keep_open,
+            false,
             remote,
             None,
         );

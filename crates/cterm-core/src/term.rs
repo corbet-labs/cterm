@@ -3,8 +3,9 @@
 //! Provides a high-level interface for terminal emulation.
 
 use crate::parser::Parser;
-use crate::pty::{Pty, PtyConfig, PtyError};
+use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
 use crate::screen::{ClipboardOperation, Screen, ScreenConfig, SearchResult};
+use crate::{KeyEventKind, KeyboardEnhancementFlags};
 
 /// Events emitted by the terminal
 #[derive(Debug, Clone)]
@@ -61,14 +62,21 @@ impl Terminal {
         screen_config: ScreenConfig,
         pty_config: &PtyConfig,
     ) -> Result<Self, PtyError> {
+        let cols = cols.clamp(1, u16::MAX as usize);
+        let rows = rows.clamp(1, u16::MAX as usize);
         let mut config = pty_config.clone();
         config.size.cols = cols as u16;
         config.size.rows = rows as u16;
+        config.size = config.size.normalized();
 
         let pty = Pty::new(&config)?;
 
+        let mut screen = Screen::new(cols, rows, screen_config);
+        screen.set_cell_width_hint(config.size.cell_width());
+        screen.set_cell_height_hint(config.size.cell_height());
+
         Ok(Self {
-            screen: Screen::new(cols, rows, screen_config),
+            screen,
             parser: Parser::new(),
             pty: Some(pty),
             write_fn: None,
@@ -127,6 +135,13 @@ impl Terminal {
             }
         }
 
+        events
+    }
+
+    /// Parse output mirrored from a daemon-owned PTY without sending terminal
+    /// query replies a second time. The daemon is the authoritative responder.
+    pub fn process_mirror(&mut self, data: &[u8]) -> Vec<TerminalEvent> {
+        let (events, _responses) = self.process_collecting(data);
         events
     }
 
@@ -212,9 +227,54 @@ impl Terminal {
 
     /// Resize the terminal
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        let pixel_width = (self.screen.cell_width_hint() * cols as f64)
+            .round()
+            .clamp(1.0, u16::MAX as f64) as u16;
+        let pixel_height = (self.screen.cell_height_hint() * rows as f64)
+            .round()
+            .clamp(1.0, u16::MAX as f64) as u16;
+        self.resize_with_pixels(cols, rows, pixel_width, pixel_height);
+    }
+
+    /// Resize the screen and PTY with total pixel dimensions supplied by the UI.
+    pub fn resize_with_pixels(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) {
+        let cols = cols.clamp(1, u16::MAX as usize);
+        let rows = rows.clamp(1, u16::MAX as usize);
+        // Older callers only know about rows and columns. Preserve the current
+        // measured cell geometry for those callers instead of reverting to the
+        // conservative creation-time default on every resize.
+        let pixel_width = if pixel_width == 0 {
+            (self.screen.cell_width_hint() * cols as f64)
+                .round()
+                .clamp(1.0, u16::MAX as f64) as u16
+        } else {
+            pixel_width
+        };
+        let pixel_height = if pixel_height == 0 {
+            (self.screen.cell_height_hint() * rows as f64)
+                .round()
+                .clamp(1.0, u16::MAX as f64) as u16
+        } else {
+            pixel_height
+        };
+        let size = PtySize {
+            cols: cols as u16,
+            rows: rows as u16,
+            pixel_width,
+            pixel_height,
+        }
+        .normalized();
         self.screen.resize(cols, rows);
+        self.screen.set_cell_width_hint(size.cell_width());
+        self.screen.set_cell_height_hint(size.cell_height());
         if let Some(ref pty) = self.pty {
-            let _ = pty.resize(rows as u16, cols as u16);
+            let _ = pty.resize_with_size(size);
         }
     }
 
@@ -323,6 +383,159 @@ impl Terminal {
 
     /// Handle keyboard input and generate appropriate escape sequences
     pub fn handle_key(&self, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
+        self.handle_key_event(key, modifiers, KeyEventKind::Press)
+    }
+
+    /// Handle a physical key event, honoring the active kitty keyboard mode.
+    pub fn handle_key_event(
+        &self,
+        key: Key,
+        modifiers: Modifiers,
+        kind: KeyEventKind,
+    ) -> Option<Vec<u8>> {
+        let flags = self.screen.keyboard_enhancement_flags();
+        let report_events = flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
+        let report_all = flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+        let disambiguate =
+            report_all || flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES);
+
+        if kind == KeyEventKind::Release && !report_events {
+            return None;
+        }
+
+        match key {
+            Key::Char(c) => {
+                let needs_escape = report_all
+                    || modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER);
+                if disambiguate && needs_escape {
+                    Some(csi_u_key(c as u32, modifiers, kind, report_events))
+                } else if kind == KeyEventKind::Release {
+                    None
+                } else {
+                    self.handle_legacy_key(key, modifiers)
+                }
+            }
+            Key::Enter | Key::Tab | Key::Backspace => {
+                if report_all {
+                    let codepoint = match key {
+                        Key::Enter => 13,
+                        Key::Tab => 9,
+                        Key::Backspace => 127,
+                        _ => unreachable!(),
+                    };
+                    Some(csi_u_key(codepoint, modifiers, kind, report_events))
+                } else if kind == KeyEventKind::Release {
+                    None
+                } else {
+                    self.handle_legacy_key(key, modifiers)
+                }
+            }
+            Key::Escape => {
+                if disambiguate || report_events {
+                    Some(csi_u_key(27, modifiers, kind, report_events))
+                } else if kind == KeyEventKind::Release {
+                    None
+                } else {
+                    self.handle_legacy_key(key, modifiers)
+                }
+            }
+            Key::Up => enhanced_cursor_key(
+                b'A',
+                modifiers,
+                kind,
+                disambiguate || report_events,
+                report_events,
+            )
+            .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::Down => enhanced_cursor_key(
+                b'B',
+                modifiers,
+                kind,
+                disambiguate || report_events,
+                report_events,
+            )
+            .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::Right => enhanced_cursor_key(
+                b'C',
+                modifiers,
+                kind,
+                disambiguate || report_events,
+                report_events,
+            )
+            .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::Left => enhanced_cursor_key(
+                b'D',
+                modifiers,
+                kind,
+                disambiguate || report_events,
+                report_events,
+            )
+            .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::Home => enhanced_cursor_key(
+                b'H',
+                modifiers,
+                kind,
+                disambiguate || report_events,
+                report_events,
+            )
+            .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::End => enhanced_cursor_key(
+                b'F',
+                modifiers,
+                kind,
+                disambiguate || report_events,
+                report_events,
+            )
+            .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::PageUp => enhanced_tilde_key(5, modifiers, kind, report_events)
+                .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::PageDown => enhanced_tilde_key(6, modifiers, kind, report_events)
+                .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::Insert => enhanced_tilde_key(2, modifiers, kind, report_events)
+                .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::Delete => enhanced_tilde_key(3, modifiers, kind, report_events)
+                .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::F(n) => enhanced_function_key(n, modifiers, kind, report_events)
+                .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+        }
+    }
+
+    /// Encode the release paired with a key press that the UI already sent as
+    /// an enhanced event. Release-time modifiers are authoritative, but a
+    /// character remains a CSI-u event even if Ctrl/Alt was released first.
+    pub fn handle_reported_key_release(&self, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
+        let flags = self.screen.keyboard_enhancement_flags();
+        if !flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES) {
+            return None;
+        }
+
+        if let Key::Char(c) = key {
+            let disambiguate = flags.intersects(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            );
+            if disambiguate {
+                return Some(csi_u_key(c as u32, modifiers, KeyEventKind::Release, true));
+            }
+        }
+
+        self.handle_key_event(key, modifiers, KeyEventKind::Release)
+    }
+
+    fn handle_non_release_legacy(
+        &self,
+        key: Key,
+        modifiers: Modifiers,
+        kind: KeyEventKind,
+    ) -> Option<Vec<u8>> {
+        if kind == KeyEventKind::Release {
+            None
+        } else {
+            self.handle_legacy_key(key, modifiers)
+        }
+    }
+
+    fn handle_legacy_key(&self, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
         let app_cursor = self.screen.modes.application_cursor;
         let _app_keypad = self.screen.modes.application_keypad;
 
@@ -396,6 +609,89 @@ impl Terminal {
     }
 }
 
+fn csi_u_key(
+    codepoint: u32,
+    modifiers: Modifiers,
+    kind: KeyEventKind,
+    report_events: bool,
+) -> Vec<u8> {
+    let modifier = modifier_param(modifiers);
+    if report_events {
+        format!("\x1b[{codepoint};{modifier}:{}u", kind.protocol_value()).into_bytes()
+    } else {
+        format!("\x1b[{codepoint};{modifier}u").into_bytes()
+    }
+}
+
+fn enhanced_cursor_key(
+    key: u8,
+    modifiers: Modifiers,
+    kind: KeyEventKind,
+    enabled: bool,
+    report_events: bool,
+) -> Option<Vec<u8>> {
+    enabled.then(|| {
+        let modifier = modifier_param(modifiers);
+        if !report_events {
+            return if modifier == 1 {
+                vec![b'\x1b', b'[', key]
+            } else {
+                format!("\x1b[1;{modifier}{}", key as char).into_bytes()
+            };
+        }
+        format!(
+            "\x1b[1;{}:{}{}",
+            modifier,
+            kind.protocol_value(),
+            key as char
+        )
+        .into_bytes()
+    })
+}
+
+fn enhanced_tilde_key(
+    code: u8,
+    modifiers: Modifiers,
+    kind: KeyEventKind,
+    report_events: bool,
+) -> Option<Vec<u8>> {
+    report_events.then(|| {
+        format!(
+            "\x1b[{code};{}:{}~",
+            modifier_param(modifiers),
+            kind.protocol_value()
+        )
+        .into_bytes()
+    })
+}
+
+fn enhanced_function_key(
+    n: u8,
+    modifiers: Modifiers,
+    kind: KeyEventKind,
+    report_events: bool,
+) -> Option<Vec<u8>> {
+    if !report_events {
+        return None;
+    }
+
+    match n {
+        1..=4 => {
+            let final_char = b"PQRS"[(n - 1) as usize];
+            enhanced_cursor_key(final_char, modifiers, kind, true, true)
+        }
+        5 => enhanced_tilde_key(15, modifiers, kind, true),
+        6 => enhanced_tilde_key(17, modifiers, kind, true),
+        7 => enhanced_tilde_key(18, modifiers, kind, true),
+        8 => enhanced_tilde_key(19, modifiers, kind, true),
+        9 => enhanced_tilde_key(20, modifiers, kind, true),
+        10 => enhanced_tilde_key(21, modifiers, kind, true),
+        11 => enhanced_tilde_key(23, modifiers, kind, true),
+        12 => enhanced_tilde_key(24, modifiers, kind, true),
+        _ => None,
+    }
+}
+
 fn cursor_key(key: u8, modifiers: Modifiers, app_cursor: bool) -> Vec<u8> {
     let modifier = modifier_param(modifiers);
 
@@ -457,6 +753,9 @@ fn modifier_param(modifiers: Modifiers) -> u8 {
     if modifiers.contains(Modifiers::CTRL) {
         param += 4;
     }
+    if modifiers.contains(Modifiers::SUPER) {
+        param += 8;
+    }
     param
 }
 
@@ -495,6 +794,7 @@ bitflags::bitflags! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_terminal_new() {
@@ -541,6 +841,114 @@ mod tests {
     }
 
     #[test]
+    fn reports_sixel_and_measured_cell_geometry_in_probe_order() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.resize_with_pixels(80, 24, 800, 480);
+
+        let (_events, responses) = term.process_collecting(b"\x1b[c\x1b[16t\x1b[5n");
+
+        assert_eq!(
+            responses,
+            [
+                b"\x1b[?62;4c".to_vec(),
+                b"\x1b[6;20;10t".to_vec(),
+                b"\x1b[0n".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_sixel_after_advertising_the_capability() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        term.process(b"\x1bPq~\x1b\\");
+
+        let images = term.screen().visible_images();
+        assert_eq!(images.len(), 1);
+        assert_eq!((images[0].pixel_width, images[0].pixel_height), (1, 6));
+    }
+
+    #[test]
+    fn daemon_mirror_never_sends_duplicate_query_replies() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&writes);
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.set_write_fn(Box::new(move |data| {
+            observed.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }));
+
+        term.process_mirror(b"\x1b[c\x1b[16t\x1b[5n");
+
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kitty_keyboard_event_mode_reports_press_repeat_and_release() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let (_, responses) = term.process_collecting(b"\x1b[>3u\x1b[?u");
+        assert_eq!(responses, [b"\x1b[?3u".to_vec()]);
+
+        assert_eq!(
+            term.handle_key_event(Key::Up, Modifiers::empty(), KeyEventKind::Press),
+            Some(b"\x1b[1;1:1A".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::Up, Modifiers::empty(), KeyEventKind::Repeat),
+            Some(b"\x1b[1;1:2A".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::Up, Modifiers::empty(), KeyEventKind::Release),
+            Some(b"\x1b[1;1:3A".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::Char('c'), Modifiers::CTRL, KeyEventKind::Release),
+            Some(b"\x1b[99;5:3u".to_vec())
+        );
+        assert_eq!(
+            term.handle_reported_key_release(Key::Char('c'), Modifiers::empty()),
+            Some(b"\x1b[99;1:3u".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::F(8), Modifiers::SHIFT, KeyEventKind::Repeat),
+            Some(b"\x1b[19;2:2~".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::Char('c'), Modifiers::SUPER, KeyEventKind::Press),
+            Some(b"\x1b[99;9:1u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguation_uses_csi_cursor_keys_even_in_application_mode() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.process(b"\x1b[?1h\x1b[>1u");
+
+        assert_eq!(
+            term.handle_key_event(Key::Up, Modifiers::empty(), KeyEventKind::Press),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::Up, Modifiers::CTRL, KeyEventKind::Press),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_masks_unsupported_all_key_mode_and_separates_screens() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let (_, responses) = term.process_collecting(b"\x1b[>11u\x1b[?u");
+        assert_eq!(responses, [b"\x1b[?3u".to_vec()]);
+
+        let (_, responses) = term.process_collecting(b"\x1b[?1049h\x1b[?u");
+        assert_eq!(responses, [b"\x1b[?0u".to_vec()]);
+
+        let (_, responses) = term.process_collecting(b"\x1b[>1u\x1b[?1049l\x1b[?u");
+        assert_eq!(responses, [b"\x1b[?3u".to_vec()]);
+    }
+
+    #[test]
     fn test_terminal_resize() {
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
 
@@ -550,6 +958,16 @@ mod tests {
         assert_eq!(term.cols(), 100);
         assert_eq!(term.rows(), 30);
         assert_eq!(term.screen().get_cell(0, 0).unwrap().c, 'X');
+    }
+
+    #[test]
+    fn zero_pixel_resize_preserves_measured_cell_size() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.resize_with_pixels(80, 24, 720, 480);
+        term.resize_with_pixels(100, 30, 0, 0);
+
+        assert_eq!(term.screen().cell_width_hint(), 9.0);
+        assert_eq!(term.screen().cell_height_hint(), 20.0);
     }
 
     #[test]

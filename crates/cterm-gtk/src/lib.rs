@@ -21,42 +21,9 @@ mod upgrade_receiver;
 mod window;
 
 use clap::Parser;
+pub use cterm_app::cli::Args;
 use gtk4::prelude::*;
-use gtk4::Application;
-use std::path::PathBuf;
-
-/// Command-line arguments for cterm
-#[derive(Parser, Debug)]
-#[command(
-    name = "cterm",
-    version,
-    about = "A high-performance terminal emulator"
-)]
-pub struct Args {
-    /// Execute a command instead of the default shell
-    #[arg(short = 'e', long = "execute")]
-    pub command: Option<String>,
-
-    /// Set the working directory
-    #[arg(short = 'd', long = "directory")]
-    pub directory: Option<PathBuf>,
-
-    /// Start in fullscreen mode
-    #[arg(long)]
-    pub fullscreen: bool,
-
-    /// Start maximized
-    #[arg(long)]
-    pub maximized: bool,
-
-    /// Set the window title
-    #[arg(short = 't', long = "title")]
-    pub title: Option<String>,
-
-    /// Path to upgrade state file (internal use)
-    #[arg(long, hide = true)]
-    pub upgrade_state: Option<String>,
-}
+use gtk4::{gio, Application};
 
 /// Global application arguments (accessible from window creation)
 static APP_ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
@@ -131,9 +98,13 @@ pub fn run() {
     let _ = libadwaita::init();
 
     // Create the GTK application
-    let app = Application::builder()
-        .application_id("com.cterm.terminal")
-        .build();
+    let mut builder = Application::builder().application_id("com.cterm.terminal");
+    if get_args().requires_non_unique_instance() {
+        // An explicit child launch must create its own window/session even if
+        // another cterm application instance already owns the app id.
+        builder = builder.flags(gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = builder.build();
 
     // Connect to the activate signal
     app.connect_activate(|app| {

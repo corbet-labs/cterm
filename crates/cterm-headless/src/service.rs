@@ -75,6 +75,13 @@ impl TerminalService for TerminalServiceImpl {
 
         let cols = req.cols.max(1) as usize;
         let rows = req.rows.max(1) as usize;
+        let size = cterm_core::PtySize {
+            cols: cols.min(u16::MAX as usize) as u16,
+            rows: rows.min(u16::MAX as usize) as u16,
+            pixel_width: req.pixel_width.min(u16::MAX as u32) as u16,
+            pixel_height: req.pixel_height.min(u16::MAX as u32) as u16,
+        }
+        .normalized();
 
         // Native SSH session: open a puressh connection instead of a local shell.
         if let Some(ssh) = req.ssh {
@@ -112,13 +119,13 @@ impl TerminalService for TerminalServiceImpl {
 
             let session = self
                 .session_manager
-                .create_ssh_session(cols, rows, ssh_config)
+                .create_ssh_session_with_size(size, ssh_config)
                 .map_err(Status::from)?;
 
             return Ok(Response::new(CreateSessionResponse {
                 session_id: session.id.clone(),
-                cols: cols as u32,
-                rows: rows as u32,
+                cols: u32::from(size.cols),
+                rows: u32::from(size.rows),
             }));
         }
 
@@ -126,9 +133,8 @@ impl TerminalService for TerminalServiceImpl {
 
         let session = self
             .session_manager
-            .create_session(
-                cols,
-                rows,
+            .create_session_with_size(
+                size,
                 req.shell,
                 req.args,
                 req.cwd.map(PathBuf::from),
@@ -139,8 +145,8 @@ impl TerminalService for TerminalServiceImpl {
 
         Ok(Response::new(CreateSessionResponse {
             session_id: session.id.clone(),
-            cols: cols as u32,
-            rows: rows as u32,
+            cols: u32::from(size.cols),
+            rows: u32::from(size.rows),
         }))
     }
 
@@ -514,7 +520,12 @@ impl TerminalService for TerminalServiceImpl {
             .get_session(&req.session_id)
             .map_err(Status::from)?;
 
-        session.resize(req.cols as usize, req.rows as usize);
+        session.resize_with_pixels(
+            req.cols.max(1) as usize,
+            req.rows.max(1) as usize,
+            req.pixel_width.min(u16::MAX as u32) as u16,
+            req.pixel_height.min(u16::MAX as u32) as u16,
+        );
 
         Ok(Response::new(ResizeResponse { success: true }))
     }

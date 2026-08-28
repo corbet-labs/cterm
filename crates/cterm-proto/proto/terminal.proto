@@ -141,6 +141,11 @@ message CreateSessionRequest {
 
   // When set, open a native SSH session instead of spawning a local shell.
   optional SshParams ssh = 8;
+
+  // Total terminal viewport size in pixels. Zero lets the daemon use a
+  // conservative cell-size fallback for older clients.
+  uint32 pixel_width = 9;
+  uint32 pixel_height = 10;
 }
 
 message CreateSessionResponse {
@@ -510,6 +515,8 @@ message TerminalModes {
   optional string charset_g0 = 5;
   optional string charset_g1 = 6;
   bool charset_g1_active = 7;
+  // Active kitty progressive-keyboard flags (supported bits only).
+  uint32 keyboard_enhancement_flags = 8;
 }
 
 message GetCellRequest {
@@ -552,6 +559,8 @@ message ResizeRequest {
   string session_id = 1;
   uint32 cols = 2;
   uint32 rows = 3;
+  uint32 pixel_width = 4;
+  uint32 pixel_height = 5;
 }
 
 message ResizeResponse {

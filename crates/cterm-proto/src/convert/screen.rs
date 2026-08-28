@@ -237,6 +237,7 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
         charset_g0: screen.modes.charset_g0.clone(),
         charset_g1: screen.modes.charset_g1.clone(),
         charset_g1_active: screen.modes.charset_g1_active,
+        keyboard_enhancement_flags: u32::from(screen.keyboard_enhancement_flags().bits()),
     }
 }
 
@@ -346,6 +347,11 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.modes.charset_g0 = modes.charset_g0.clone();
         screen.modes.charset_g1 = modes.charset_g1.clone();
         screen.modes.charset_g1_active = modes.charset_g1_active;
+        screen.set_keyboard_enhancement_flags(
+            cterm_core::KeyboardEnhancementFlags::from_bits_retain(
+                modes.keyboard_enhancement_flags as u8,
+            ),
+        );
     }
 
     // Restore DRCS soft fonts

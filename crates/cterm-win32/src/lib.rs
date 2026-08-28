@@ -29,44 +29,11 @@ pub mod upgrade_receiver;
 pub mod window;
 
 use clap::Parser;
-use std::path::PathBuf;
+pub use cterm_app::cli::Args;
 
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, TranslateMessage, MSG,
 };
-
-/// Command-line arguments for cterm
-#[derive(Parser, Debug)]
-#[command(
-    name = "cterm",
-    version,
-    about = "A high-performance terminal emulator"
-)]
-pub struct Args {
-    /// Execute a command instead of the default shell
-    #[arg(short = 'e', long = "execute")]
-    pub command: Option<String>,
-
-    /// Set the working directory
-    #[arg(short = 'd', long = "directory")]
-    pub directory: Option<PathBuf>,
-
-    /// Start in fullscreen mode
-    #[arg(long)]
-    pub fullscreen: bool,
-
-    /// Start maximized
-    #[arg(long)]
-    pub maximized: bool,
-
-    /// Set the window title
-    #[arg(short = 't', long = "title")]
-    pub title: Option<String>,
-
-    /// Path to upgrade state file (internal use)
-    #[arg(long, hide = true)]
-    pub upgrade_state: Option<String>,
-}
 
 /// Global application arguments (accessible from window creation)
 static APP_ARGS: std::sync::OnceLock<Args> = std::sync::OnceLock::new();
@@ -174,15 +141,7 @@ mod tests {
 
     #[test]
     fn test_args_parsing() {
-        // Just verify the Args struct can be constructed
-        let args = Args {
-            command: None,
-            directory: None,
-            fullscreen: false,
-            maximized: false,
-            title: None,
-            upgrade_state: None,
-        };
+        let args = Args::try_parse_from(["cterm"]).unwrap();
         assert!(!args.fullscreen);
         assert!(args.upgrade_state.is_none());
     }
