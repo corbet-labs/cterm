@@ -42,7 +42,7 @@ edition = "2021"
 rust-version = "1.88"
 authors = ["cterm contributors"]
 license = "MIT"
-repository = "https://github.com/KarpelesLab/cterm"
+repository = "https://github.com/corbet-labs/cterm"
 description = "A high-performance, customizable terminal emulator"
 
 [workspace.dependencies]

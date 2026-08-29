@@ -71,6 +71,11 @@ for _attempt in $(seq 1 30); do
     fi
 
     if grep -q 'wl_compositor.*create_surface' "$OUTPUT_DIR/cterm.stderr.log"; then
+        if grep -Eqi 'panic|Gdk-CRITICAL|Gtk-ERROR|segmentation fault' \
+            "$OUTPUT_DIR/cterm.stderr.log" "$OUTPUT_DIR/cterm.log" 2>/dev/null; then
+            log "ERROR: cterm created a surface but reported a fatal renderer diagnostic"
+            exit 1
+        fi
         log "cterm created a native Wayland surface"
         log "=== Test completed ==="
         exit 0

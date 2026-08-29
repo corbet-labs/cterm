@@ -1,14 +1,14 @@
 # cterm
 
-A high-performance, customizable terminal emulator built in pure Rust. Features native UI on macOS (AppKit/CoreGraphics), GTK4 on Linux, and native Win32 on Windows, with a modular architecture and optimizations for running AI coding assistants like Claude Code.
+A high-performance, customizable terminal emulator built in Rust. cterm uses native AppKit/CoreGraphics on macOS, Win32/Direct2D on Windows, and GTK4 on Wayland for Linux. X11 is intentionally not a supported Linux backend.
 
 ## Features
 
 ### Terminal Emulation
 - **High Performance**: Custom VT100/ANSI terminal emulator with efficient screen buffer management
 - **True Color Support**: Full 24-bit RGB color with 256-color palette fallback
-- **Unicode Support**: Proper handling of wide characters, combining characters, and emoji
-- **Scrollback Buffer**: Configurable scrollback with efficient memory usage
+- **Unicode Support**: Extended grapheme clusters, combining characters, ZWJ emoji, flags, and wide cells
+- **Scrollback Buffer**: Configurable history with grapheme-safe resize reflow
 - **Find in Scrollback**: Search through terminal history with regex support
 
 ### User Interface
@@ -39,47 +39,65 @@ A high-performance, customizable terminal emulator built in pure Rust. Features 
 - **Auto-Update**: Built-in update checker with GitHub releases integration and release notes display
 - **Debug Log Viewer**: In-app log viewer for troubleshooting (Windows)
 
+## Platform status
+
+| Platform | Local terminal UI | CI contract |
+|---|---|---|
+| macOS (Intel/Apple Silicon) | AppKit/CoreGraphics | Native build, unit/integration tests, and UI automation |
+| Windows x64 | Win32/Direct2D + ConPTY | Native build, unit/integration tests, and UI automation |
+| Linux x86_64/ARM64 | GTK4 on Wayland only | Native build, unit/integration tests, and a headless-Wayland UI smoke test |
+| FreeBSD 14.4 | No desktop UI yet | `cterm-core` and `cterm-ui` tests in a FreeBSD VM |
+| Android/iOS | Not currently supported | Distant local-terminal targets; no release or CI contract yet |
+
+The three desktop renderers display terminal text, selections, cursor shapes,
+Sixel images, and text attributes natively. FreeBSD currently validates the
+portable Rust core only. Linux builds do not include or test an X11 fallback.
+
 ## Installation
 
 ### Pre-built Binaries
 
 | Platform | Download |
 |----------|----------|
-| **macOS** (Universal) | [DMG Installer](https://github.com/KarpelesLab/cterm/releases/latest/download/cterm-macos-universal.dmg) |
-| **Windows** (x64) | [Installer](https://github.com/KarpelesLab/cterm/releases/latest/download/cterm-windows-x86_64-setup.exe) · [ZIP](https://github.com/KarpelesLab/cterm/releases/latest/download/cterm-windows-x86_64.zip) |
-| **Linux** (x64) | [tar.gz](https://github.com/KarpelesLab/cterm/releases/latest/download/cterm-linux-x86_64.tar.gz) |
-| **Linux** (ARM64) | [tar.gz](https://github.com/KarpelesLab/cterm/releases/latest/download/cterm-linux-arm64.tar.gz) |
+| **macOS** (Universal) | [DMG Installer](https://github.com/corbet-labs/cterm/releases/latest/download/cterm-macos-universal.dmg) |
+| **Windows** (x64) | [Installer](https://github.com/corbet-labs/cterm/releases/latest/download/cterm-windows-x86_64-setup.exe) · [ZIP](https://github.com/corbet-labs/cterm/releases/latest/download/cterm-windows-x86_64.zip) |
+| **Linux** (x64) | [tar.gz](https://github.com/corbet-labs/cterm/releases/latest/download/cterm-linux-x86_64.tar.gz) |
+| **Linux** (ARM64) | [tar.gz](https://github.com/corbet-labs/cterm/releases/latest/download/cterm-linux-arm64.tar.gz) |
 
-Or browse all releases on the [GitHub Releases](https://github.com/KarpelesLab/cterm/releases) page.
+Or browse all releases on the [GitHub Releases](https://github.com/corbet-labs/cterm/releases) page.
 
 ### Building from Source
 
 #### Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.88 or later
+- Protocol Buffers compiler (`protoc`)
 
-**Linux only** - GTK4 development libraries:
+**Linux only** - GTK4, libadwaita, Pango, and Cairo development libraries. A
+Wayland compositor is required at runtime; X11-only sessions are unsupported.
 
 **Debian/Ubuntu:**
 ```bash
-sudo apt install libgtk-4-dev
+sudo apt install libgtk-4-dev libadwaita-1-dev libpango1.0-dev libcairo2-dev protobuf-compiler
 ```
 
 **Fedora:**
 ```bash
-sudo dnf install gtk4-devel
+sudo dnf install gtk4-devel libadwaita-devel pango-devel cairo-devel protobuf-compiler
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S gtk4
+sudo pacman -S gtk4 libadwaita pango cairo protobuf
 ```
 
 **macOS:**
-No additional dependencies required - uses native AppKit/CoreGraphics.
+Uses native AppKit/CoreGraphics. Install `protobuf` for source builds (for
+example, `brew install protobuf`).
 
 **Windows:**
-No additional dependencies required - uses native Win32/Direct2D.
+Uses native Win32/Direct2D. Install `protoc` for source builds (the public CI
+uses Chocolatey).
 
 #### Build
 
@@ -440,6 +458,8 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 
 - Split panes
 - Plugin system
+- Additional foot-compatible behavior and performance work
+- Android and iOS local-terminal frontends (distant targets)
 
 ## License
 

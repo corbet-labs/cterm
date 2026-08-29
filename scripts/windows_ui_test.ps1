@@ -207,6 +207,17 @@ Start-Sleep -Seconds 1
 # Take screenshot after command execution
 Take-Screenshot -Name "03_after_enter" -Hwnd $hwnd
 
+# Capturing a file is not sufficient: require the native terminal frame to
+# change after keyboard input so a frozen/blank Direct2D renderer fails CI.
+$startupScreenshot = Join-Path $OutputDir "01_startup.png"
+$commandScreenshot = Join-Path $OutputDir "03_after_enter.png"
+$startupHash = (Get-FileHash -Algorithm SHA256 $startupScreenshot).Hash
+$commandHash = (Get-FileHash -Algorithm SHA256 $commandScreenshot).Hash
+if ($startupHash -eq $commandHash) {
+    throw "Terminal screenshot did not change after command input"
+}
+Log "Renderer produced a changed frame after command input"
+
 # Type another command
 Log "Typing 'dir'..."
 [System.Windows.Forms.SendKeys]::SendWait("dir")
