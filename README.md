@@ -336,7 +336,7 @@ cterm supports DEC Sixel graphics for inline image display:
 - DECSDM mode for controlling image placement and scrolling
 - Images scroll with terminal content
 - Grid cells under images are cleared (xterm-compatible behavior)
-- DA1 reports Sixel capability (`CSI ? 62 ; 4 c`)
+- DA1 reports Sixel, ANSI color, and OSC 52 capabilities (`CSI ? 62 ; 4 ; 22 ; 52 c`)
 - `CSI 16 t` reports the renderer's current character-cell height and width
 
 ### Enhanced keyboard events

@@ -62,6 +62,8 @@ enum Osc1337State {
 pub struct Parser {
     state_machine: vte::Parser,
     dcs_state: DcsState,
+    /// Most recent graphic character for ECMA-48 REP.
+    last_printed: Option<char>,
     /// State for intercepting OSC 1337 File sequences
     osc_1337_state: Osc1337State,
     /// Whether an OSC 1337 string terminator (BEL or ESC \) was seen
@@ -79,6 +81,7 @@ impl Parser {
         Self {
             state_machine: vte::Parser::new(),
             dcs_state: DcsState::None,
+            last_printed: None,
             osc_1337_state: Osc1337State::None,
             osc_1337_terminated: false,
         }
@@ -104,6 +107,7 @@ impl Parser {
             let mut performer = ScreenPerformer {
                 screen,
                 dcs_state: &mut self.dcs_state,
+                last_printed: &mut self.last_printed,
             };
             self.state_machine.advance(&mut performer, byte);
         }
@@ -359,10 +363,12 @@ impl Parser {
 struct ScreenPerformer<'a> {
     screen: &'a mut Screen,
     dcs_state: &'a mut DcsState,
+    last_printed: &'a mut Option<char>,
 }
 
 impl vte::Perform for ScreenPerformer<'_> {
     fn print(&mut self, c: char) {
+        *self.last_printed = Some(c);
         self.screen.put_char(c);
     }
 
@@ -729,13 +735,13 @@ impl vte::Perform for ScreenPerformer<'_> {
                 let n = first_param(&params_vec, 1) as i32;
                 self.screen.move_cursor_relative(-n, 0);
             }
-            // Cursor Down (CUD)
-            ('B', []) => {
+            // Cursor Down (CUD) / Vertical Position Relative (VPR)
+            ('B', []) | ('e', []) => {
                 let n = first_param(&params_vec, 1) as i32;
                 self.screen.move_cursor_relative(n, 0);
             }
-            // Cursor Forward (CUF)
-            ('C', []) => {
+            // Cursor Forward (CUF) / Horizontal Position Relative (HPR)
+            ('C', []) | ('a', []) => {
                 let n = first_param(&params_vec, 1) as i32;
                 self.screen.move_cursor_relative(0, n);
             }
@@ -756,8 +762,8 @@ impl vte::Perform for ScreenPerformer<'_> {
                 self.screen.move_cursor_relative(-n, 0);
                 self.screen.cursor.col = 0;
             }
-            // Cursor Horizontal Absolute (CHA)
-            ('G', []) => {
+            // Cursor Horizontal Absolute (CHA) / Horizontal Position Absolute (HPA)
+            ('G', []) | ('`', []) => {
                 let col = first_param(&params_vec, 1).saturating_sub(1);
                 self.screen.cursor.col = col.min(self.screen.width().saturating_sub(1));
             }
@@ -826,6 +832,17 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // Repeat the preceding graphic character (REP). Bound the repeat
+            // count to one screen, matching foot's denial-of-service guard.
+            ('b', []) => {
+                if let Some(c) = *self.last_printed {
+                    let max_count = self.screen.width().saturating_mul(self.screen.height());
+                    let count = first_param(&params_vec, 1).min(max_count);
+                    for _ in 0..count {
+                        self.screen.put_char(c);
+                    }
+                }
+            }
             // Cursor Backward Tabulation (CBT)
             ('Z', []) => {
                 let n = first_param(&params_vec, 1);
@@ -877,12 +894,26 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
-            // Primary Device Attributes (DA1). DEC capability 4 advertises
-            // Sixel graphics support and is consumed by ratatui-image.
+            // Primary Device Attributes (DA1). Advertise only capabilities
+            // implemented end to end: Sixel, ANSI color, and OSC 52.
             ('c', []) => {
                 let mode = first_param(&params_vec, 0);
                 if mode == 0 {
-                    self.screen.queue_response(b"\x1b[?62;4c".to_vec());
+                    self.screen.queue_response(b"\x1b[?62;4;22;52c".to_vec());
+                }
+            }
+            // Secondary Device Attributes (DA2): VT220 plus cterm version.
+            ('c', [b'>']) => {
+                if first_param(&params_vec, 0) == 0 {
+                    self.screen
+                        .queue_response(secondary_device_attributes().into_bytes());
+                }
+            }
+            // Tertiary Device Attributes (DA3): four-byte manufacturer ID.
+            ('c', [b'=']) => {
+                if first_param(&params_vec, 0) == 0 {
+                    self.screen
+                        .queue_response(b"\x1bP!|4354524D\x1b\\".to_vec());
                 }
             }
             // Set Top and Bottom Margins (DECSTBM)
@@ -906,14 +937,35 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             // Window manipulation (XTWINOPS)
             ('t', []) => {
-                if first_param(&params_vec, 0) == 16 {
-                    // Report character cell size in pixels: CSI 6;height;width t.
-                    let height = self.screen.cell_height_hint().round().max(1.0) as usize;
-                    let width = self.screen.cell_width_hint().round().max(1.0) as usize;
-                    self.screen
-                        .queue_response(format!("\x1b[6;{height};{width}t").into_bytes());
+                let operation = first_param(&params_vec, 0);
+                let cell_height = self.screen.cell_height_hint().round().max(1.0) as usize;
+                let cell_width = self.screen.cell_width_hint().round().max(1.0) as usize;
+                let rows = self.screen.height();
+                let cols = self.screen.width();
+                let response = match operation {
+                    11 => Some("\x1b[1t".to_string()),
+                    13 => Some("\x1b[3;0;0t".to_string()),
+                    14 if params_vec.get(1).copied().unwrap_or(0) != 2 => Some(format!(
+                        "\x1b[4;{};{}t",
+                        rows.saturating_mul(cell_height),
+                        cols.saturating_mul(cell_width)
+                    )),
+                    16 => Some(format!("\x1b[6;{cell_height};{cell_width}t")),
+                    18 => Some(format!("\x1b[8;{rows};{cols}t")),
+                    _ => None,
+                };
+                if let Some(response) = response {
+                    self.screen.queue_response(response.into_bytes());
                 } else {
-                    log::trace!("Window manipulation: {:?}", params_vec);
+                    log::trace!("Window manipulation: {params_vec:?}");
+                }
+            }
+            // XTVERSION terminal name/version report.
+            ('q', [b'>']) => {
+                if first_param(&params_vec, 0) == 0 {
+                    self.screen.queue_response(
+                        format!("\x1bP>|cterm({})\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes(),
+                    );
                 }
             }
             // Query the active kitty keyboard progressive-enhancement flags.
@@ -1125,6 +1177,15 @@ enum XtgettcapCapability {
     Value(Vec<u8>),
 }
 
+fn secondary_device_attributes() -> String {
+    format!(
+        "\x1b[>1;{:0>2}{:0>2}{:0>2};0c",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR"),
+        env!("CARGO_PKG_VERSION_PATCH")
+    )
+}
+
 /// Build foot/xterm-compatible XTGETTCAP replies. The shape and parsing are
 /// adapted from Rio; the table deliberately contains only capabilities cterm
 /// implements end to end.
@@ -1203,6 +1264,7 @@ fn xtgettcap_capability(name: &[u8], cols: usize, lines: usize) -> Option<Xtgett
         b"Ss" => Value(b"\x1b[%p1%d q".to_vec()),
         b"Se" => Value(b"\x1b[0 q".to_vec()),
         b"Smulx" => Value(b"\x1b[4:%p1%dm".to_vec()),
+        b"rep" => Value(b"%p1%c\x1b[%p2%{1}%-%db".to_vec()),
         b"Sync" => Value(b"\x1bP=%p1%ds\x1b\\".to_vec()),
         b"kxIN" => Value(b"\x1b[I".to_vec()),
         b"kxOUT" => Value(b"\x1b[O".to_vec()),
@@ -1604,6 +1666,8 @@ impl ScreenPerformer<'_> {
             }
             // DECTCEM - Show Cursor
             25 => self.screen.modes.show_cursor = set,
+            // Cursor blinking mode
+            12 => self.screen.cursor.blink = set,
             // DECNKM - Numeric Keypad Mode.  This is equivalent to DECKPAM /
             // DECKPNM, but expressed as a DEC private mode.
             66 => self.screen.modes.application_keypad = set,
@@ -1694,6 +1758,7 @@ impl ScreenPerformer<'_> {
             7 => self.screen.modes.auto_wrap,
             45 => self.screen.modes.reverse_wrap,
             9 => self.screen.modes.mouse_mode == MouseMode::X10,
+            12 => self.screen.cursor.blink,
             25 => self.screen.modes.show_cursor,
             47 | 1047 | 1049 => self.screen.modes.alternate_screen,
             66 => self.screen.modes.application_keypad,
@@ -1808,6 +1873,45 @@ mod tests {
 
         assert_eq!(screen.cursor.row, 5);
         assert_eq!(screen.cursor.col, 10);
+    }
+
+    #[test]
+    fn test_foot_relative_cursor_aliases_and_repeat() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[2;2H\x1b[3a\x1b[2e\x1b[7`");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (3, 6));
+
+        parser.parse(&mut screen, b"x\x1b[5b");
+        assert_eq!(screen.grid().row(3).unwrap().text(), "      xxxxxx");
+        assert_eq!(screen.cursor.col, 12);
+    }
+
+    #[test]
+    fn test_device_and_window_reports_match_foot_shapes() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b[c\x1b[>c\x1b[=c\x1b[>q\x1b[11t\x1b[13t\x1b[14t\x1b[16t\x1b[18t",
+        );
+
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[?62;4;22;52c".to_vec(),
+                secondary_device_attributes().into_bytes(),
+                b"\x1bP!|4354524D\x1b\\".to_vec(),
+                format!("\x1bP>|cterm({})\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes(),
+                b"\x1b[1t".to_vec(),
+                b"\x1b[3;0;0t".to_vec(),
+                b"\x1b[4;384;640t".to_vec(),
+                b"\x1b[6;16;8t".to_vec(),
+                b"\x1b[8;24;80t".to_vec(),
+            ]
+        );
     }
 
     #[test]
