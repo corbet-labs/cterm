@@ -2465,7 +2465,7 @@ fn spawn_synchronized_update_watchdog(
 ) -> std::sync::mpsc::Sender<Option<Instant>> {
     let (tx, rx) = std::sync::mpsc::channel::<Option<Instant>>();
     thread::spawn(move || {
-        let mut deadline = None;
+        let mut deadline: Option<Instant> = None;
         loop {
             let message = match deadline {
                 Some(target) => rx.recv_timeout(target.saturating_duration_since(Instant::now())),
