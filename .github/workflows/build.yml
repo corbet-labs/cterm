@@ -115,7 +115,6 @@ jobs:
             libcairo2-dev \
             libglib2.0-dev \
             protobuf-compiler \
-            wayland-utils \
             weston
 
       - name: Setup Rust

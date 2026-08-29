@@ -106,6 +106,26 @@ mod unix {
     /// Child processes restore this so shells get the expected default limit.
     static ORIGINAL_NOFILE_LIMIT: AtomicU64 = AtomicU64::new(0);
 
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    fn rlim_to_u64(limit: libc::rlim_t) -> Option<u64> {
+        u64::try_from(limit).ok()
+    }
+
+    #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
+    fn rlim_to_u64(limit: libc::rlim_t) -> Option<u64> {
+        Some(limit)
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    fn u64_to_rlim(limit: u64) -> Option<libc::rlim_t> {
+        libc::rlim_t::try_from(limit).ok()
+    }
+
+    #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
+    fn u64_to_rlim(limit: u64) -> Option<libc::rlim_t> {
+        Some(limit)
+    }
+
     /// Save the current soft RLIMIT_NOFILE. Call this before raising the limit.
     pub fn save_original_nofile_limit() {
         let mut rlim = libc::rlimit {
@@ -113,7 +133,10 @@ mod unix {
             rlim_max: 0,
         };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } == 0 {
-            ORIGINAL_NOFILE_LIMIT.store(rlim.rlim_cur, Ordering::Relaxed);
+            // `rlim_t` is unsigned on Linux/macOS but signed on FreeBSD.
+            if let Some(limit) = rlim_to_u64(rlim.rlim_cur) {
+                ORIGINAL_NOFILE_LIMIT.store(limit, Ordering::Relaxed);
+            }
         }
     }
 
@@ -579,7 +602,7 @@ mod unix {
 
             // Restore the original RLIMIT_NOFILE so child gets the expected default
             let orig = ORIGINAL_NOFILE_LIMIT.load(Ordering::Relaxed);
-            if orig > 0 {
+            if let Some(orig) = (orig > 0).then(|| u64_to_rlim(orig)).flatten() {
                 let mut rlim = libc::rlimit {
                     rlim_cur: 0,
                     rlim_max: 0,

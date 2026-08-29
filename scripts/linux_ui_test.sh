@@ -44,8 +44,7 @@ for attempt in $(seq 1 40); do
     sleep 0.25
 done
 
-wayland-info >"$OUTPUT_DIR/wayland-info.log" 2>&1
-log "Wayland compositor is reachable"
+log "Wayland compositor socket is ready"
 
 export RUST_LOG=debug
 export CTERM_LOG_FILE="$OUTPUT_DIR/cterm.log"
