@@ -117,8 +117,9 @@ pub fn load_daemon_auth_secret(path: &Path) -> io::Result<DaemonAuthSecret> {
             .iter()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
-        for (index, pair) in encoded.chunks_exact(2).enumerate() {
-            bytes[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+        for (index, output) in bytes.iter_mut().enumerate() {
+            let offset = index * 2;
+            *output = (hex_nibble(encoded[offset]) << 4) | hex_nibble(encoded[offset + 1]);
         }
     } else {
         return Err(io::Error::new(
