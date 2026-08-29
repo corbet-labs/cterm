@@ -168,6 +168,7 @@ jobs:
   test-freebsd:
     name: Test core (FreeBSD 14.4)
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs: format
     steps:
       - uses: actions/checkout@v7
