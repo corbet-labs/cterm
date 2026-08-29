@@ -379,6 +379,12 @@ message DirtyRowsUpdate {
   optional CursorPosition cursor = 2;
   // Include terminal modes when they changed
   optional TerminalModes modes = 3;
+  // Include the complete image set only when it changed.
+  TerminalImages images = 4;
+}
+
+message TerminalImages {
+  repeated TerminalImage images = 1;
 }
 
 message DirtyRow {
@@ -418,6 +424,20 @@ message GetScreenResponse {
   TerminalModes modes = 7;
   // DRCS soft fonts
   repeated DrcsFont drcs_fonts = 8;
+  // Inline terminal images. Image lines are absolute indexes into the
+  // scrollback-plus-visible buffer represented by this snapshot.
+  repeated TerminalImage images = 9;
+}
+
+message TerminalImage {
+  uint64 id = 1;
+  uint32 col = 2;
+  uint64 line = 3;
+  uint32 cell_width = 4;
+  uint32 cell_height = 5;
+  bytes rgba = 6;
+  uint32 pixel_width = 7;
+  uint32 pixel_height = 8;
 }
 
 // DRCS (Dynamically Redefinable Character Sets) soft font

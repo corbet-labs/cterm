@@ -15,7 +15,8 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
-    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_FACTORY_OPTIONS,
+    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES, D2D1_FACTORY_OPTIONS,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
@@ -332,6 +333,10 @@ impl TerminalRenderer {
             self.draw_selection(screen, &selection)?;
         }
 
+        // Inline images replace their underlying cells and are composited
+        // before the cursor, matching the Cocoa and GTK renderers.
+        self.draw_images(screen)?;
+
         // Draw cursor
         self.draw_cursor(screen)?;
 
@@ -339,6 +344,75 @@ impl TerminalRenderer {
         unsafe {
             let rt = self.render_target.as_ref().unwrap();
             rt.EndDraw(None, None)?;
+        }
+
+        Ok(())
+    }
+
+    /// Draw decoded SIXEL and other inline images through Direct2D.
+    fn draw_images(&self, screen: &Screen) -> windows::core::Result<()> {
+        let rt = self.render_target.clone().unwrap();
+        let base: ID2D1RenderTarget = rt.cast()?;
+        let bitmap_properties = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+
+        for image in screen.visible_images() {
+            let Some(visible_row) = screen.image_visible_row(image) else {
+                continue;
+            };
+            let Some(pitch) = image
+                .pixel_width
+                .checked_mul(4)
+                .and_then(|pitch| u32::try_from(pitch).ok())
+            else {
+                log::warn!("Terminal image {} has an invalid Direct2D pitch", image.id);
+                continue;
+            };
+            let Some(pixels) = cterm_ui::rgba_to_premultiplied_bgra(image.data.as_slice()) else {
+                log::warn!("Terminal image {} has invalid RGBA data", image.id);
+                continue;
+            };
+            let Ok(width) = u32::try_from(image.pixel_width) else {
+                log::warn!("Terminal image {} is too wide for Direct2D", image.id);
+                continue;
+            };
+            let Ok(height) = u32::try_from(image.pixel_height) else {
+                log::warn!("Terminal image {} is too tall for Direct2D", image.id);
+                continue;
+            };
+
+            let bitmap = unsafe {
+                base.CreateBitmap(
+                    D2D_SIZE_U { width, height },
+                    Some(pixels.as_ptr().cast()),
+                    pitch,
+                    &bitmap_properties,
+                )?
+            };
+            let x = image.col as f32 * self.cell_dims.width;
+            let y = visible_row as f32 * self.cell_dims.height;
+            let destination = D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + image.pixel_width as f32,
+                bottom: y + image.pixel_height as f32,
+            };
+
+            unsafe {
+                base.DrawBitmap(
+                    &bitmap,
+                    Some(&destination),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                );
+            }
         }
 
         Ok(())

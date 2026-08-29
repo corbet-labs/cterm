@@ -2,7 +2,8 @@
 
 use crate::convert::{
     cell_to_proto, cursor_to_proto, event_to_proto, modes_to_proto, proto_to_key,
-    proto_to_modifiers, screen_to_proto, screen_to_text, visible_rows_to_proto,
+    proto_to_modifiers, screen_to_proto, screen_to_text, terminal_images_to_proto,
+    visible_rows_to_proto,
 };
 use crate::proto::terminal_service_server::TerminalService;
 use crate::proto::*;
@@ -789,6 +790,11 @@ impl TerminalService for TerminalServiceImpl {
         } else {
             None
         };
+        let mut cached_images: Vec<cterm_proto::proto::TerminalImage> = if incremental {
+            session_ref.with_terminal(|term| terminal_images_to_proto(term.screen()))
+        } else {
+            Vec::new()
+        };
         // After a lag event, force a full screen resync
         let mut needs_full_resync = false;
 
@@ -807,6 +813,7 @@ impl TerminalService for TerminalServiceImpl {
                             cached_rows = screen_data.visible_rows.clone();
                             cached_cursor = screen_data.cursor;
                             cached_modes = screen_data.modes.clone();
+                            cached_images = screen_data.images.clone();
                             needs_full_resync = false;
                         }
 
@@ -821,12 +828,13 @@ impl TerminalService for TerminalServiceImpl {
                         }))
                     } else {
                         // Incremental mode: diff current screen against cache
-                        let (dirty_rows, new_rows, cur_cursor, cur_modes) = session_ref
+                        let (dirty_rows, new_rows, cur_cursor, cur_modes, cur_images) = session_ref
                             .with_terminal(|term| {
                                 let screen = term.screen();
                                 let current_rows = visible_rows_to_proto(screen);
                                 let cursor = cursor_to_proto(screen);
                                 let modes = modes_to_proto(screen);
+                                let images = terminal_images_to_proto(screen);
 
                                 // Find rows that changed
                                 let mut dirty = Vec::new();
@@ -847,17 +855,22 @@ impl TerminalService for TerminalServiceImpl {
                                     }
                                 }
 
-                                (dirty, current_rows, cursor, modes)
+                                (dirty, current_rows, cursor, modes, images)
                             });
 
                         // Check cursor and modes changes
                         let cursor_changed = cached_cursor.as_ref() != Some(&cur_cursor);
                         let modes_changed = cached_modes.as_ref() != Some(&cur_modes);
+                        let images_changed = cached_images != cur_images;
 
                         // Update cache
                         cached_rows = new_rows;
 
-                        if dirty_rows.is_empty() && !cursor_changed && !modes_changed {
+                        if dirty_rows.is_empty()
+                            && !cursor_changed
+                            && !modes_changed
+                            && !images_changed
+                        {
                             // Nothing actually changed (e.g. selection-only update)
                             return None;
                         }
@@ -867,6 +880,7 @@ impl TerminalService for TerminalServiceImpl {
                         if dirty_rows.len() > height * 3 / 4 {
                             cached_cursor = Some(cur_cursor);
                             cached_modes = Some(cur_modes);
+                            cached_images = cur_images.clone();
                             let drcs_fonts = session_ref.with_terminal(|term| {
                                 cterm_proto::convert::screen::drcs_fonts_to_proto(term.screen())
                             });
@@ -884,6 +898,7 @@ impl TerminalService for TerminalServiceImpl {
                                     title: session_ref.title(),
                                     modes: cached_modes.clone(),
                                     drcs_fonts,
+                                    images: cur_images,
                                 }),
                             };
                             return Some(Ok(ScreenUpdate {
@@ -908,6 +923,12 @@ impl TerminalService for TerminalServiceImpl {
                         } else {
                             None
                         };
+                        let images_update = if images_changed {
+                            cached_images = cur_images.clone();
+                            Some(TerminalImages { images: cur_images })
+                        } else {
+                            None
+                        };
 
                         Some(Ok(ScreenUpdate {
                             session_id: session_id.clone(),
@@ -917,6 +938,7 @@ impl TerminalService for TerminalServiceImpl {
                                     rows: dirty_rows,
                                     cursor: cursor_update,
                                     modes: modes_update,
+                                    images: images_update,
                                 },
                             )),
                         }))

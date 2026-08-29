@@ -2080,6 +2080,10 @@ fn draw_terminal(
         }
     }
 
+    // Images replace the cells beneath them and must therefore be composited
+    // after the text grid but before the cursor and overlays.
+    draw_terminal_images(cr, screen, cell_width, cell_height);
+
     // Draw cursor
     if screen.modes.show_cursor && scroll_offset == 0 {
         let cursor = &screen.cursor;
@@ -2198,6 +2202,70 @@ fn draw_terminal(
         cr.close_path();
         cr.set_source_rgba(0.5, 0.5, 0.5, opacity);
         cr.fill().ok();
+    }
+}
+
+/// Draw the terminal's decoded inline images with Cairo.
+fn draw_terminal_images(
+    cr: &cairo::Context,
+    screen: &cterm_core::Screen,
+    cell_width: f64,
+    cell_height: f64,
+) {
+    for image in screen.visible_images() {
+        let Some(visible_row) = screen.image_visible_row(image) else {
+            continue;
+        };
+        let Ok(width) = i32::try_from(image.pixel_width) else {
+            log::warn!("Terminal image {} is too wide for Cairo", image.id);
+            continue;
+        };
+        let Ok(height) = i32::try_from(image.pixel_height) else {
+            log::warn!("Terminal image {} is too tall for Cairo", image.id);
+            continue;
+        };
+        let expected_len = image
+            .pixel_width
+            .checked_mul(image.pixel_height)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if expected_len != Some(image.data.len()) {
+            log::warn!("Terminal image {} has invalid RGBA data", image.id);
+            continue;
+        }
+
+        let Some(pixels) = cterm_ui::rgba_to_premultiplied_bgra(image.data.as_slice()) else {
+            log::warn!("Terminal image {} has invalid RGBA data", image.id);
+            continue;
+        };
+        let Ok(stride) = cairo::Format::ARgb32.stride_for_width(image.pixel_width as u32) else {
+            log::warn!("Terminal image {} has an invalid Cairo stride", image.id);
+            continue;
+        };
+        let Ok(surface) = cairo::ImageSurface::create_for_data(
+            pixels,
+            cairo::Format::ARgb32,
+            width,
+            height,
+            stride,
+        ) else {
+            log::warn!(
+                "Failed to create a Cairo surface for terminal image {}",
+                image.id
+            );
+            continue;
+        };
+
+        let x = image.col as f64 * cell_width;
+        let y = visible_row as f64 * cell_height;
+        if cr.save().is_err() {
+            continue;
+        }
+        cr.rectangle(x, y, image.pixel_width as f64, image.pixel_height as f64);
+        cr.clip();
+        if cr.set_source_surface(&surface, x, y).is_ok() {
+            let _ = cr.paint();
+        }
+        let _ = cr.restore();
     }
 }
 

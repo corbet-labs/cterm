@@ -345,7 +345,7 @@ impl Selection {
 }
 
 /// A terminal image (from Sixel or other protocols)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalImage {
     /// Unique image ID
     pub id: u64,
@@ -474,7 +474,9 @@ impl Screen {
             pending_color_queries: Vec::new(),
             selection: None,
             images: HashMap::new(),
-            next_image_id: 0,
+            // Zero is reserved as an invalid/sentinel identifier by native UI
+            // code, so real terminal images always start at one.
+            next_image_id: 1,
             pending_file_transfers: Vec::new(),
             next_file_transfer_id: 0,
             cell_height_hint: 16.0, // Default assumption
@@ -1412,31 +1414,62 @@ impl Screen {
         let first_visible_line = scrollback_len.saturating_sub(self.scroll_offset);
         let last_visible_line = first_visible_line + height;
 
-        self.images
+        let mut images: Vec<_> = self
+            .images
             .values()
             .filter(|img| {
                 // Image is visible if any part of it overlaps with the viewport
                 let img_top = img.line;
-                let img_rows = self.image_rows_for_height(img.pixel_height).max(1);
+                let img_rows = img.cell_height.max(1);
                 let img_bottom = img.line + img_rows;
 
                 img_bottom > first_visible_line && img_top < last_visible_line
             })
-            .collect()
+            .collect();
+
+        // HashMap iteration order is deliberately unspecified. Images are
+        // painted from oldest to newest so overlapping graphics are stable and
+        // a later image consistently appears on top on every backend.
+        images.sort_unstable_by_key(|image| image.id);
+        images
     }
 
     /// Calculate the visible row for an image (relative to current viewport)
     ///
     /// Returns None if the image is not in the visible area.
-    pub fn image_visible_row(&self, image: &TerminalImage) -> Option<usize> {
+    pub fn image_visible_row(&self, image: &TerminalImage) -> Option<isize> {
         let scrollback_len = self.scrollback.len();
         let first_visible_line = scrollback_len.saturating_sub(self.scroll_offset);
+        let last_visible_line = first_visible_line + self.height();
+        let image_bottom = image.line + image.cell_height.max(1);
 
-        if image.line >= first_visible_line && image.line < first_visible_line + self.height() {
-            Some(image.line - first_visible_line)
+        if image_bottom > first_visible_line && image.line < last_visible_line {
+            Some(image.line as isize - first_visible_line as isize)
         } else {
             None
         }
+    }
+
+    /// Get all stored images in deterministic paint order.
+    pub fn images(&self) -> Vec<&TerminalImage> {
+        let mut images: Vec<_> = self.images.values().collect();
+        images.sort_unstable_by_key(|image| image.id);
+        images
+    }
+
+    /// Replace the stored image set from a daemon or relaunch snapshot.
+    pub fn replace_images<I>(&mut self, images: I)
+    where
+        I: IntoIterator<Item = TerminalImage>,
+    {
+        self.images.clear();
+        let mut largest_id = 0;
+        for image in images {
+            largest_id = largest_id.max(image.id);
+            self.images.insert(image.id, image);
+        }
+        self.next_image_id = largest_id.saturating_add(1).max(1);
+        self.dirty = true;
     }
 
     /// Get the image at a given visible row and column position
@@ -2191,6 +2224,74 @@ mod tests {
         assert_eq!(screen.height(), 24);
         assert_eq!(screen.cursor.row, 0);
         assert_eq!(screen.cursor.col, 0);
+    }
+
+    #[test]
+    fn terminal_images_have_stable_nonzero_ids() {
+        let mut screen = Screen::new(10, 3, ScreenConfig::default());
+        let image = || SixelImage {
+            data: vec![255, 0, 0, 255],
+            width: 1,
+            height: 1,
+        };
+
+        screen.add_image_with_size(0, 0, 1, 1, image());
+        screen.add_image_with_size(1, 0, 1, 1, image());
+
+        let ids: Vec<_> = screen.images().iter().map(|image| image.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn partially_scrolled_image_remains_visible() {
+        let mut screen = Screen::new(10, 2, ScreenConfig::default());
+        screen.add_image_with_size(
+            0,
+            0,
+            1,
+            2,
+            SixelImage {
+                data: vec![255, 0, 0, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+
+        screen.cursor.row = 1;
+        screen.line_feed();
+
+        let image = screen.visible_images()[0];
+        assert_eq!(screen.image_visible_row(image), Some(-1));
+    }
+
+    #[test]
+    fn restored_image_ids_continue_without_collisions() {
+        let mut screen = Screen::new(10, 2, ScreenConfig::default());
+        screen.replace_images([TerminalImage {
+            id: 7,
+            col: 0,
+            line: 0,
+            cell_width: 1,
+            cell_height: 1,
+            data: Arc::new(vec![0, 255, 0, 255]),
+            pixel_width: 1,
+            pixel_height: 1,
+        }]);
+
+        screen.add_image_with_size(
+            1,
+            0,
+            1,
+            1,
+            SixelImage {
+                data: vec![255, 0, 0, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+
+        let ids: Vec<_> = screen.images().iter().map(|image| image.id).collect();
+        assert_eq!(ids, vec![7, 8]);
     }
 
     #[test]
