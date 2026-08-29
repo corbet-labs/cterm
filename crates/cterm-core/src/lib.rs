@@ -34,7 +34,7 @@ pub use parser::Parser;
 pub use pty::save_original_nofile_limit;
 pub use pty::{Pty, PtyConfig, PtyError, PtySize};
 pub use screen::{
-    ClipboardOperation, ClipboardSelection, ColorQuery, FileTransferOperation, Screen,
+    ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle, FileTransferOperation, Screen,
     SearchResult, Selection, SelectionMode, SelectionPoint, TerminalImage,
 };
 pub use sixel::{SixelDecoder, SixelImage};

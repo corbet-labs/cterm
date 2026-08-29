@@ -2012,6 +2012,30 @@ fn draw_terminal(
             // Determine if cell has INVERSE attribute (XOR with selection)
             let is_inverted =
                 cell.attrs.contains(CellAttrs::INVERSE) ^ is_selected ^ screen.modes.reverse_video;
+            let char_width = if cell.attrs.contains(CellAttrs::WIDE) {
+                cell_width * 2.0
+            } else {
+                cell_width
+            };
+
+            let fg_color = if is_inverted {
+                if cell.bg == Color::Default {
+                    *normal_background
+                } else {
+                    cell.bg.to_rgb(palette)
+                }
+            } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
+                Rgb::new(100, 149, 237)
+            } else if cell.fg == Color::Default {
+                palette.foreground
+            } else {
+                cell.fg.to_rgb(palette)
+            };
+            let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
+                Rgb::new(fg_color.r / 2, fg_color.g / 2, fg_color.b / 2)
+            } else {
+                fg_color
+            };
 
             // Draw background (always draw for selected cells to show highlight)
             let needs_bg = cell.bg != Color::Default
@@ -2036,45 +2060,12 @@ fn draw_terminal(
                 let (r, g, b) = bg_color.to_f64();
                 cr.set_source_rgb(r, g, b);
 
-                let char_width = if cell.attrs.contains(CellAttrs::WIDE) {
-                    cell_width * 2.0
-                } else {
-                    cell_width
-                };
-
                 cr.rectangle(x, y, char_width, cell_height);
                 cr.fill().ok();
             }
 
             // Draw character
             if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
-                let fg_color = if is_inverted {
-                    // Inverted: use background color as foreground
-                    if cell.bg == Color::Default {
-                        *normal_background
-                    } else {
-                        cell.bg.to_rgb(palette)
-                    }
-                } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
-                    // Cornflower blue for hyperlinks with default fg
-                    Rgb::new(100, 149, 237)
-                } else if cell.fg == Color::Default {
-                    palette.foreground
-                } else {
-                    cell.fg.to_rgb(palette)
-                };
-
-                // Apply dim
-                let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
-                    Rgb::new(
-                        (fg_color.r as f64 * 0.5) as u8,
-                        (fg_color.g as f64 * 0.5) as u8,
-                        (fg_color.b as f64 * 0.5) as u8,
-                    )
-                } else {
-                    fg_color
-                };
-
                 let sprite_width = cell_width.round().max(1.0) as u32;
                 let sprite_height = cell_height.round().max(1.0) as u32;
                 if let Some(sprite) = cell
@@ -2099,25 +2090,6 @@ fn draw_terminal(
                         attrs.insert(attr);
                     }
 
-                    if cell.attrs.contains(CellAttrs::UNDERLINE) || cell.hyperlink.is_some() {
-                        let attr = pango::AttrInt::new_underline(pango::Underline::Single);
-                        attrs.insert(attr);
-                        if cell.hyperlink.is_some() {
-                            // Cornflower blue for hyperlinks
-                            let attr = pango::AttrColor::new_underline_color(
-                                100 * 256,
-                                149 * 256,
-                                237 * 256,
-                            );
-                            attrs.insert(attr);
-                        }
-                    }
-
-                    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
-                        let attr = pango::AttrInt::new_strikethrough(true);
-                        attrs.insert(attr);
-                    }
-
                     layout.set_attributes(Some(&attrs));
                     layout.set_text(cell.text());
 
@@ -2127,6 +2099,17 @@ fn draw_terminal(
                     // Reset attributes
                     layout.set_attributes(None::<&pango::AttrList>);
                 }
+            }
+
+            if !cell.attrs.contains(CellAttrs::HIDDEN) {
+                draw_cell_decorations(
+                    cr,
+                    cell,
+                    (x, y),
+                    (char_width, cell_height),
+                    &fg_color,
+                    palette,
+                );
             }
         }
     }
@@ -2151,7 +2134,7 @@ fn draw_terminal(
 
                 // Draw character under cursor with inverted color
                 if let Some(cell) = screen.get_cell(cursor.row, cursor.col) {
-                    if cell.text() != " " {
+                    if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
                         let (r, g, b) = theme.cursor.text_color.to_f64();
                         cr.set_source_rgb(r, g, b);
                         layout.set_text(cell.text());
@@ -2253,6 +2236,80 @@ fn draw_terminal(
         cr.close_path();
         cr.set_source_rgba(0.5, 0.5, 0.5, opacity);
         cr.fill().ok();
+    }
+}
+
+fn draw_cell_decorations(
+    cr: &cairo::Context,
+    cell: &cterm_core::Cell,
+    origin: (f64, f64),
+    size: (f64, f64),
+    foreground: &Rgb,
+    palette: &cterm_core::color::ColorPalette,
+) {
+    let (x, y) = origin;
+    let (width, height) = size;
+    let has_hyperlink = cell.hyperlink.is_some();
+    if cell.attrs.has_underline() || has_hyperlink {
+        let color = if has_hyperlink {
+            Rgb::new(100, 149, 237)
+        } else if let Some(color) = cell.underline_color {
+            color.to_rgb(palette)
+        } else {
+            *foreground
+        };
+        let (red, green, blue) = color.to_f64();
+        let underline_y = y + height - 2.0;
+        cr.set_source_rgb(red, green, blue);
+        cr.set_line_width(1.0);
+
+        if cell.attrs.contains(CellAttrs::CURLY_UNDERLINE) {
+            let mut current_x = x;
+            let mut rising = true;
+            cr.move_to(current_x, underline_y + 1.0);
+            while current_x < x + width {
+                current_x = (current_x + 2.0).min(x + width);
+                cr.line_to(
+                    current_x,
+                    if rising {
+                        underline_y - 1.0
+                    } else {
+                        underline_y + 1.0
+                    },
+                );
+                rising = !rising;
+            }
+        } else {
+            if cell.attrs.contains(CellAttrs::DOTTED_UNDERLINE) {
+                cr.set_dash(&[1.0, 2.0], 0.0);
+            } else if cell.attrs.contains(CellAttrs::DASHED_UNDERLINE) {
+                cr.set_dash(&[4.0, 2.0], 0.0);
+            }
+            cr.move_to(x, underline_y);
+            cr.line_to(x + width, underline_y);
+        }
+        cr.stroke().ok();
+        cr.set_dash(&[], 0.0);
+
+        if cell.attrs.contains(CellAttrs::DOUBLE_UNDERLINE) {
+            cr.move_to(x, underline_y - 2.0);
+            cr.line_to(x + width, underline_y - 2.0);
+            cr.stroke().ok();
+        }
+    }
+
+    let (red, green, blue) = foreground.to_f64();
+    cr.set_source_rgb(red, green, blue);
+    cr.set_line_width(1.0);
+    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+        cr.move_to(x, y + height / 2.0);
+        cr.line_to(x + width, y + height / 2.0);
+        cr.stroke().ok();
+    }
+    if cell.attrs.contains(CellAttrs::OVERLINE) {
+        cr.move_to(x, y + 1.0);
+        cr.line_to(x + width, y + 1.0);
+        cr.stroke().ok();
     }
 }
 

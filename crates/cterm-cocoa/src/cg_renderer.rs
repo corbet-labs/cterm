@@ -12,8 +12,8 @@ use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 use cterm_core::cell::CellAttrs;
 use cterm_core::color::{Color, Rgb};
 use cterm_core::drcs::DrcsGlyph;
-use cterm_core::Terminal;
 use cterm_core::TerminalImage;
+use cterm_core::{CursorStyle, Terminal};
 use cterm_ui::theme::Theme;
 
 /// CoreGraphics renderer for terminal display
@@ -230,7 +230,10 @@ impl CGRenderer {
                     }
 
                     // Draw character
-                    if cell.text() != " " && cell.text() != "\0" {
+                    if cell.text() != " "
+                        && cell.text() != "\0"
+                        && !cell.attrs.contains(CellAttrs::HIDDEN)
+                    {
                         // DRCS is defined for individual character positions,
                         // while normal text may be a full grapheme cluster.
                         let drcs = cell.single_char().and_then(|c| screen.get_drcs_for_char(c));
@@ -243,7 +246,8 @@ impl CGRenderer {
 
                     // Draw underlines (regular underline attributes or hyperlinks)
                     let has_hyperlink = cell.hyperlink.is_some();
-                    if cell.attrs.has_underline() || has_hyperlink {
+                    let visible = !cell.attrs.contains(CellAttrs::HIDDEN);
+                    if visible && (cell.attrs.has_underline() || has_hyperlink) {
                         // Use hyperlink color (blue) for hyperlinks, otherwise use underline color or fg
                         let underline_color = if has_hyperlink {
                             Rgb {
@@ -268,12 +272,12 @@ impl CGRenderer {
                     }
 
                     // Draw strikethrough
-                    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+                    if visible && cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
                         self.draw_strikethrough(x, y, char_width, &fg_color);
                     }
 
                     // Draw overline
-                    if cell.attrs.contains(CellAttrs::OVERLINE) {
+                    if visible && cell.attrs.contains(CellAttrs::OVERLINE) {
                         self.draw_overline(x, y, char_width, &fg_color);
                     }
                 }
@@ -300,7 +304,7 @@ impl CGRenderer {
                 self.cell_width
             };
 
-            self.draw_cursor(cursor_x, cursor_y, cursor_width);
+            self.draw_cursor(cursor_x, cursor_y, cursor_width, cursor.style);
         }
 
         // Draw scrollbar overlay when there is scrollback content
@@ -666,9 +670,18 @@ impl CGRenderer {
         }
     }
 
-    fn draw_cursor(&self, x: f64, y: f64, width: f64) {
+    fn draw_cursor(&self, x: f64, y: f64, width: f64, style: CursorStyle) {
         let cursor_color = &self.theme.colors.cursor;
-        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height));
+        let rect = match style {
+            CursorStyle::Block => {
+                NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height))
+            }
+            CursorStyle::Underline => NSRect::new(
+                NSPoint::new(x, y + self.cell_height - 2.0),
+                NSSize::new(width, 2.0),
+            ),
+            CursorStyle::Bar => NSRect::new(NSPoint::new(x, y), NSSize::new(2.0, self.cell_height)),
+        };
         unsafe {
             let color = Self::ns_color_alpha(cursor_color.r, cursor_color.g, cursor_color.b, 0.7);
             let _: () = msg_send![&*color, setFill];
