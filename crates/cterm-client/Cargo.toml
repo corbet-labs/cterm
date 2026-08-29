@@ -15,9 +15,13 @@ tokio-stream = { workspace = true, features = ["sync", "net"] }
 log.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+getrandom.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 env_logger.workspace = true

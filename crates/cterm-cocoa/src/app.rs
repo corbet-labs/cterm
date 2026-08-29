@@ -47,6 +47,15 @@ pub fn get_args() -> &'static Args {
     APP_ARGS.get().expect("Args not initialized")
 }
 
+fn reject_managed_secondary_action(action: &str) -> bool {
+    if get_args().managed {
+        log::warn!("Ignoring {action} request in managed mode");
+        true
+    } else {
+        false
+    }
+}
+
 /// Application state stored in the delegate
 pub struct AppDelegateIvars {
     config: Config,
@@ -326,6 +335,9 @@ define_class!(
     impl AppDelegate {
         #[unsafe(method(showPreferences:))]
         fn action_show_preferences(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("preferences") {
+                return;
+            }
             let mtm = MainThreadMarker::from(self);
             let config = self.ivars().config.clone();
             crate::preferences::show_preferences(mtm, &config, |_new_config| {
@@ -336,6 +348,9 @@ define_class!(
 
         #[unsafe(method(showTabTemplates:))]
         fn action_show_tab_templates(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("tab templates") {
+                return;
+            }
             let mtm = MainThreadMarker::from(self);
             let templates = cterm_app::config::load_sticky_tabs().unwrap_or_default();
             let remote_names: Vec<String> = self
@@ -360,6 +375,9 @@ define_class!(
 
         #[unsafe(method(showQuickOpen:))]
         fn action_show_quick_open(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("quick open") {
+                return;
+            }
             let mtm = MainThreadMarker::from(self);
             let app = NSApplication::sharedApplication(mtm);
 
@@ -376,6 +394,9 @@ define_class!(
 
         #[unsafe(method(openTabTemplate:))]
         fn action_open_tab_template(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("tab template") {
+                return;
+            }
             use objc2_app_kit::NSMenuItem;
 
             if let Some(sender) = sender {
@@ -393,6 +414,9 @@ define_class!(
 
         #[unsafe(method(runToolShortcut:))]
         fn action_run_tool_shortcut(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("tool shortcut") {
+                return;
+            }
             use objc2_app_kit::NSMenuItem;
 
             if let Some(sender) = sender {
@@ -458,6 +482,9 @@ define_class!(
 
         #[unsafe(method(newWindow:))]
         fn action_new_window(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("new window") {
+                return;
+            }
             use objc2_app_kit::NSWindowTabbingMode;
 
             let mtm = MainThreadMarker::from(self);
@@ -590,6 +617,9 @@ define_class!(
         /// Open a new tab running in a Docker devcontainer
         #[unsafe(method(openInContainer:))]
         fn action_open_in_container(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("Docker terminal") {
+                return;
+            }
             // Check if Docker is available
             if let Err(e) = cterm_app::docker::check_docker_available() {
                 log::warn!("Docker not available: {}", e);
@@ -608,6 +638,9 @@ define_class!(
         /// Show session picker and attach to a daemon session
         #[unsafe(method(attachToSession:))]
         fn action_attach_to_session(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("session attach") {
+                return;
+            }
             let mtm = MainThreadMarker::from(self);
             let config = self.ivars().config.clone();
             let theme = self.ivars().theme.clone();
@@ -682,6 +715,9 @@ define_class!(
         /// Show SSH connection dialog
         #[unsafe(method(sshConnect:))]
         fn action_ssh_connect(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("SSH session") {
+                return;
+            }
             let mtm = MainThreadMarker::from(self);
             let remote_manager = self.ivars().remote_manager.clone();
             let config = self.ivars().config.clone();
@@ -850,6 +886,9 @@ define_class!(
         /// Show remotes management dialog
         #[unsafe(method(manageRemotes:))]
         fn action_manage_remotes(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("remote management") {
+                return;
+            }
             let mtm = MainThreadMarker::from(self);
             let config = self.ivars().config.clone();
             crate::remotes_dialog::show_remotes_dialog(mtm, config);
@@ -899,12 +938,20 @@ define_class!(
         #[cfg(unix)]
         #[unsafe(method(debugRelaunch:))]
         fn action_debug_relaunch(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if !get_args().updater_enabled() {
+                log::warn!("Ignoring debug relaunch request in managed mode");
+                return;
+            }
             self.perform_relaunch();
         }
 
         /// Debug menu: Relaunch ctermd daemon (exec-in-place, preserving PTY FDs)
         #[unsafe(method(debugRelaunchDaemon:))]
         fn action_debug_relaunch_daemon(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if !get_args().updater_enabled() {
+                log::warn!("Ignoring debug daemon relaunch request in managed mode");
+                return;
+            }
             log::info!("Debug: Requesting ctermd relaunch");
             // Send the relaunch request in a background thread
             std::thread::spawn(|| {
@@ -943,6 +990,10 @@ define_class!(
         /// Debug menu: Kill local ctermd daemon (force shutdown)
         #[unsafe(method(killLocalDaemon:))]
         fn action_kill_local_daemon(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if !get_args().updater_enabled() {
+                log::warn!("Ignoring debug daemon shutdown request in managed mode");
+                return;
+            }
             log::info!("Debug: Requesting ctermd force shutdown");
             std::thread::spawn(|| {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -1065,6 +1116,9 @@ impl AppDelegate {
 
     /// Open a tab from a template
     fn open_template(&self, template: &cterm_app::config::StickyTabConfig) {
+        if reject_managed_secondary_action("tab template") {
+            return;
+        }
         let mtm = MainThreadMarker::from(self);
 
         // If the template is unique, check if we already have a tab with this template
@@ -1387,7 +1441,7 @@ pub fn run_app_internal() {
     let mtm = MainThreadMarker::new().expect("Must be called on main thread");
 
     // Perform background git sync before loading config
-    if cterm_app::background_sync() {
+    if !get_args().managed && cterm_app::background_sync() {
         log::info!("Configuration was updated from git remote");
     }
 
@@ -1411,7 +1465,7 @@ pub fn run_app_internal() {
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     // Create the menu bar
-    let menu_bar = menu::create_menu_bar(mtm, get_args().updater_enabled());
+    let menu_bar = menu::create_menu_bar(mtm, get_args().updater_enabled(), get_args().managed);
     app.setMainMenu(Some(&menu_bar));
 
     log::info!("Starting main run loop");

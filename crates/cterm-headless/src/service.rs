@@ -29,6 +29,8 @@ pub struct TerminalServiceImpl {
     daemon_id: String,
     /// Stable logical identity configured for this daemon endpoint.
     daemon_identity: String,
+    /// Managed authentication key. Debug formatting is redacted by its type.
+    daemon_auth_secret: Option<cterm_proto::DaemonAuthSecret>,
     /// Time when the daemon was started
     start_time: Instant,
     /// Number of clients that have performed a handshake
@@ -49,6 +51,7 @@ impl TerminalServiceImpl {
             shutdown_notify,
             daemon_id: uuid::Uuid::new_v4().to_string(),
             daemon_identity: "cterm".to_string(),
+            daemon_auth_secret: None,
             start_time: Instant::now(),
             client_count: AtomicU32::new(0),
             active_streams: Arc::new(AtomicU32::new(0)),
@@ -62,10 +65,12 @@ impl TerminalServiceImpl {
         &mut self,
         socket_path: String,
         daemon_identity: String,
+        daemon_auth_secret: Option<cterm_proto::DaemonAuthSecret>,
         scrollback_lines: usize,
     ) {
         self.socket_path = socket_path;
         self.daemon_identity = daemon_identity;
+        self.daemon_auth_secret = daemon_auth_secret;
         self.scrollback_lines = scrollback_lines;
     }
 }
@@ -654,14 +659,26 @@ impl TerminalService for TerminalServiceImpl {
 
         let hostname = gethostname();
 
-        Ok(Response::new(HandshakeResponse {
+        let mut response = HandshakeResponse {
             daemon_id: self.daemon_id.clone(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             is_local: true,
             hostname,
             protocol_version: cterm_proto::PROTOCOL_VERSION,
             daemon_identity: self.daemon_identity.clone(),
-        }))
+            daemon_auth_proof: Vec::new(),
+        };
+        if let Some(secret) = &self.daemon_auth_secret {
+            if req.daemon_auth_challenge.len() != cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES {
+                return Err(Status::invalid_argument(
+                    "managed daemon handshake requires a fresh 32-byte challenge",
+                ));
+            }
+            response.daemon_auth_proof =
+                cterm_proto::managed_daemon_auth_proof(secret, &req, &response);
+        }
+
+        Ok(Response::new(response))
     }
 
     async fn attach_session(
@@ -995,6 +1012,12 @@ impl TerminalService for TerminalServiceImpl {
         &self,
         request: Request<RelaunchDaemonRequest>,
     ) -> Result<Response<RelaunchDaemonResponse>, Status> {
+        if self.daemon_auth_secret.is_some() {
+            return Err(Status::failed_precondition(
+                "daemon relaunch is disabled in managed mode",
+            ));
+        }
+
         #[cfg(not(unix))]
         {
             let _ = request;

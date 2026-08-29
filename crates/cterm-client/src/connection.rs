@@ -124,6 +124,8 @@ pub struct ManagedDaemonConfig {
     pub socket_path: PathBuf,
     pub executable: PathBuf,
     pub identity: String,
+    pub auth_file: PathBuf,
+    auth_secret: cterm_proto::DaemonAuthSecret,
 }
 
 impl ManagedDaemonConfig {
@@ -131,9 +133,13 @@ impl ManagedDaemonConfig {
         socket_path: PathBuf,
         executable: PathBuf,
         identity: String,
+        auth_file: PathBuf,
     ) -> std::result::Result<Self, String> {
         if socket_path.as_os_str().is_empty() {
             return Err("managed daemon socket cannot be empty".to_string());
+        }
+        if socket_path.to_str().is_none() {
+            return Err("managed daemon socket must be valid Unicode".to_string());
         }
         if !executable.is_absolute() {
             return Err("managed daemon executable must resolve to an absolute path".to_string());
@@ -163,11 +169,19 @@ impl ManagedDaemonConfig {
         if !socket_path.is_absolute() {
             return Err("managed daemon socket must be an absolute path".to_string());
         }
+        let auth_secret = cterm_proto::load_daemon_auth_secret(&auth_file).map_err(|error| {
+            format!(
+                "invalid managed daemon authentication file {}: {error}",
+                auth_file.display()
+            )
+        })?;
 
         Ok(Self {
             socket_path,
             executable,
             identity,
+            auth_file,
+            auth_secret,
         })
     }
 }
@@ -292,7 +306,8 @@ impl DaemonConnection {
             Err(e @ ClientError::DaemonUnresponsive(_))
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::ProtocolMismatch { .. })
-            | Err(e @ ClientError::DaemonIdentityMismatch { .. }) => Err(e),
+            | Err(e @ ClientError::DaemonIdentityMismatch { .. })
+            | Err(e @ ClientError::DaemonAuthenticationFailed) => Err(e),
             Err(_) if auto_start => {
                 // Try to start the daemon
                 Self::start_daemon(socket_path, managed)?;
@@ -303,7 +318,8 @@ impl DaemonConnection {
                         Ok(conn) => return Ok(conn),
                         Err(e @ ClientError::VersionMismatch { .. })
                         | Err(e @ ClientError::ProtocolMismatch { .. })
-                        | Err(e @ ClientError::DaemonIdentityMismatch { .. }) => return Err(e),
+                        | Err(e @ ClientError::DaemonIdentityMismatch { .. })
+                        | Err(e @ ClientError::DaemonAuthenticationFailed) => return Err(e),
                         Err(_) => {}
                     }
                 }
@@ -558,24 +574,32 @@ impl DaemonConnection {
         let mut client =
             TerminalServiceClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
 
-        let response = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            client.handshake(HandshakeRequest {
-                client_id: uuid::Uuid::new_v4().to_string(),
-                client_version: env!("CARGO_PKG_VERSION").to_string(),
-                protocol_version: cterm_proto::PROTOCOL_VERSION,
-            }),
-        )
-        .await
-        .map_err(|_| {
-            ClientError::DaemonUnresponsive(format!(
-                "handshake timed out after {}s",
-                HANDSHAKE_TIMEOUT.as_secs()
-            ))
-        })??;
+        let mut daemon_auth_challenge = Vec::new();
+        if managed.is_some() {
+            daemon_auth_challenge.resize(cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES, 0);
+            getrandom::fill(&mut daemon_auth_challenge).map_err(|error| {
+                ClientError::Connection(format!(
+                    "cannot generate managed daemon authentication challenge: {error}"
+                ))
+            })?;
+        }
+        let request = HandshakeRequest {
+            client_id: uuid::Uuid::new_v4().to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: cterm_proto::PROTOCOL_VERSION,
+            daemon_auth_challenge,
+        };
+        let response = tokio::time::timeout(HANDSHAKE_TIMEOUT, client.handshake(request.clone()))
+            .await
+            .map_err(|_| {
+                ClientError::DaemonUnresponsive(format!(
+                    "handshake timed out after {}s",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })??;
 
         let resp = response.into_inner();
-        Self::verify_handshake(&resp, managed)?;
+        Self::verify_handshake(&request, &resp, managed)?;
         let info = DaemonInfo {
             daemon_id: resp.daemon_id,
             daemon_version: resp.daemon_version,
@@ -600,6 +624,7 @@ impl DaemonConnection {
     }
 
     fn verify_handshake(
+        request: &HandshakeRequest,
         response: &HandshakeResponse,
         managed: Option<&ManagedDaemonConfig>,
     ) -> Result<()> {
@@ -624,6 +649,15 @@ impl DaemonConnection {
                     actual: response.daemon_identity.clone(),
                 });
             }
+            if request.daemon_auth_challenge.len() != cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES
+                || !cterm_proto::verify_managed_daemon_auth_proof(
+                    &config.auth_secret,
+                    request,
+                    response,
+                )
+            {
+                return Err(ClientError::DaemonAuthenticationFailed);
+            }
         }
 
         Ok(())
@@ -635,6 +669,16 @@ impl DaemonConnection {
         let ctermd = command.get_program().to_owned();
 
         log::info!("Starting ctermd: {}", Path::new(&ctermd).display());
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+
+            // cterm is a GUI-subsystem application on Windows. Without this
+            // flag, starting the console-subsystem daemon opens an unrelated
+            // console window alongside the managed terminal window.
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        }
 
         command
             .stdin(std::process::Stdio::null())
@@ -662,9 +706,10 @@ impl DaemonConnection {
         };
 
         let mut command = Command::new(&ctermd);
-        command.args(["--listen", &socket_path.to_string_lossy(), "--foreground"]);
+        command.arg("--listen").arg(socket_path).arg("--foreground");
         if let Some(config) = managed {
             command.args(["--identity", &config.identity]);
+            command.arg("--daemon-auth-file").arg(&config.auth_file);
         }
         Ok(command)
     }
@@ -1027,6 +1072,35 @@ impl tokio::io::AsyncWrite for SshChannelIo {
 mod tests {
     use super::*;
 
+    fn write_auth_file(directory: &Path, byte: u8) -> PathBuf {
+        let path = directory.join("daemon-auth");
+        let secret = format!("{byte:02x}").repeat(32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::write(&path, &secret).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::io::Write;
+            use std::os::windows::fs::OpenOptionsExt;
+
+            const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .access_mode(FILE_ALL_ACCESS)
+                .open(&path)
+                .unwrap();
+            cterm_proto::set_private_daemon_auth_file_acl(&file).unwrap();
+            file.write_all(secret.as_bytes()).unwrap();
+        }
+        path
+    }
+
     fn managed_config(identity: &str) -> (tempfile::TempDir, ManagedDaemonConfig) {
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join(if cfg!(windows) {
@@ -1040,20 +1114,39 @@ mod tests {
         } else {
             dir.path().join("ctermd.sock")
         };
-        let config = ManagedDaemonConfig::new(socket_path, executable, identity.to_string())
-            .expect("valid managed config");
+        let auth_file = write_auth_file(dir.path(), 0x42);
+        let config =
+            ManagedDaemonConfig::new(socket_path, executable, identity.to_string(), auth_file)
+                .expect("valid managed config");
         (dir, config)
     }
 
-    fn handshake(identity: &str) -> HandshakeResponse {
-        HandshakeResponse {
+    fn handshake_request(challenge: u8) -> HandshakeRequest {
+        HandshakeRequest {
+            client_id: "client".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: cterm_proto::PROTOCOL_VERSION,
+            daemon_auth_challenge: vec![challenge; cterm_proto::DAEMON_AUTH_CHALLENGE_BYTES],
+        }
+    }
+
+    fn handshake(
+        config: &ManagedDaemonConfig,
+        request: &HandshakeRequest,
+        identity: &str,
+    ) -> HandshakeResponse {
+        let mut response = HandshakeResponse {
             daemon_id: "instance".to_string(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             is_local: true,
             hostname: "localhost".to_string(),
             protocol_version: cterm_proto::PROTOCOL_VERSION,
             daemon_identity: identity.to_string(),
-        }
+            daemon_auth_proof: Vec::new(),
+        };
+        response.daemon_auth_proof =
+            cterm_proto::managed_daemon_auth_proof(&config.auth_secret, request, &response);
+        response
     }
 
     #[test]
@@ -1071,34 +1164,60 @@ mod tests {
                 "--foreground".into(),
                 "--identity".into(),
                 "product-alpha".into(),
+                "--daemon-auth-file".into(),
+                config.auth_file.as_os_str().to_owned(),
             ]
         );
+        let secret = "42".repeat(32);
+        assert!(!args.iter().any(|argument| argument == secret.as_str()));
     }
 
     #[test]
     fn managed_handshake_requires_exact_protocol_version_and_identity() {
         let (_dir, config) = managed_config("product-alpha");
-        assert!(
-            DaemonConnection::verify_handshake(&handshake("product-alpha"), Some(&config)).is_ok()
-        );
+        let request = handshake_request(1);
+        assert!(DaemonConnection::verify_handshake(
+            &request,
+            &handshake(&config, &request, "product-alpha"),
+            Some(&config),
+        )
+        .is_ok());
 
-        let mut wrong_protocol = handshake("product-alpha");
+        let mut wrong_protocol = handshake(&config, &request, "product-alpha");
         wrong_protocol.protocol_version += 1;
         assert!(matches!(
-            DaemonConnection::verify_handshake(&wrong_protocol, Some(&config)),
+            DaemonConnection::verify_handshake(&request, &wrong_protocol, Some(&config)),
             Err(ClientError::ProtocolMismatch { .. })
         ));
 
-        let mut wrong_version = handshake("product-alpha");
+        let mut wrong_version = handshake(&config, &request, "product-alpha");
         wrong_version.daemon_version = "0.0.0".to_string();
         assert!(matches!(
-            DaemonConnection::verify_handshake(&wrong_version, Some(&config)),
+            DaemonConnection::verify_handshake(&request, &wrong_version, Some(&config)),
             Err(ClientError::VersionMismatch { .. })
         ));
 
         assert!(matches!(
-            DaemonConnection::verify_handshake(&handshake("other-product"), Some(&config)),
+            DaemonConnection::verify_handshake(
+                &request,
+                &handshake(&config, &request, "other-product"),
+                Some(&config),
+            ),
             Err(ClientError::DaemonIdentityMismatch { .. })
+        ));
+
+        let replayed = handshake(&config, &request, "product-alpha");
+        let next_request = handshake_request(2);
+        assert!(matches!(
+            DaemonConnection::verify_handshake(&next_request, &replayed, Some(&config)),
+            Err(ClientError::DaemonAuthenticationFailed)
+        ));
+
+        let mut missing_proof = handshake(&config, &request, "product-alpha");
+        missing_proof.daemon_auth_proof.clear();
+        assert!(matches!(
+            DaemonConnection::verify_handshake(&request, &missing_proof, Some(&config)),
+            Err(ClientError::DaemonAuthenticationFailed)
         ));
     }
 
@@ -1110,13 +1229,15 @@ mod tests {
         assert!(ManagedDaemonConfig::new(
             config.socket_path.clone(),
             PathBuf::from("ctermd"),
-            "safe".to_string()
+            "safe".to_string(),
+            config.auth_file.clone(),
         )
         .is_err());
         assert!(ManagedDaemonConfig::new(
             config.socket_path,
             config.executable,
-            "contains spaces".to_string()
+            "contains spaces".to_string(),
+            config.auth_file,
         )
         .is_err());
     }

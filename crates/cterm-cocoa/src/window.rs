@@ -143,6 +143,10 @@ define_class!(
     impl CtermWindow {
         #[unsafe(method(newTab:))]
         fn action_new_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if crate::app::get_args().managed {
+                log::warn!("Ignoring new-tab request in managed mode");
+                return;
+            }
             self.create_new_tab();
         }
 
@@ -155,6 +159,10 @@ define_class!(
         /// Returns a new default window (not a template duplicate).
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) -> *mut NSWindow {
+            if crate::app::get_args().managed {
+                log::warn!("Ignoring native new-tab request in managed mode");
+                return std::ptr::null_mut();
+            }
             let mtm = MainThreadMarker::from(self);
 
             let active = self.ivars().active_terminal.borrow();
@@ -548,6 +556,10 @@ impl CtermWindow {
 
     /// Create a new tab (daemon-backed via ctermd)
     pub fn create_new_tab(&self) {
+        if crate::app::get_args().managed {
+            log::warn!("Ignoring new-tab request in managed mode");
+            return;
+        }
         let active = self.ivars().active_terminal.borrow();
 
         // Get the current working directory from the active terminal
@@ -717,6 +729,10 @@ impl CtermWindow {
 
     /// Show the Quick Open overlay for template selection and tab switching
     pub fn show_quick_open(&self) {
+        if crate::app::get_args().managed {
+            log::warn!("Ignoring quick-open request in managed mode");
+            return;
+        }
         let mtm = MainThreadMarker::from(self);
 
         // Load templates
@@ -809,6 +825,10 @@ impl CtermWindow {
 
     /// Open a new tab from a template (daemon-backed via ctermd)
     fn open_template_tab(&self, template: &cterm_app::config::StickyTabConfig) {
+        if crate::app::get_args().managed {
+            log::warn!("Ignoring tab-template request in managed mode");
+            return;
+        }
         // Prepare working directory (clone from git if needed)
         if let Some(ref working_dir) = template.working_directory {
             if let Err(e) =

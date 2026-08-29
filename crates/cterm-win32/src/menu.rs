@@ -146,35 +146,39 @@ fn to_wide_string(s: &str) -> Vec<u16> {
 }
 
 /// Create the main menu bar
-pub fn create_menu_bar(show_debug: bool, updates_enabled: bool) -> HMENU {
+pub fn create_menu_bar(show_debug: bool, updates_enabled: bool, managed: bool) -> HMENU {
     unsafe {
         let menu_bar = CreateMenu();
 
         // File menu
         let file_menu = CreatePopupMenu();
-        append_menu_item(file_menu, MenuAction::NewTab, "&New Tab\tCtrl+T");
-        append_menu_item(file_menu, MenuAction::NewWindow, "New &Window\tCtrl+N");
-        append_menu_item(file_menu, MenuAction::QuickOpen, "&Quick Open\tCtrl+G");
-        append_separator(file_menu);
+        if !managed {
+            append_menu_item(file_menu, MenuAction::NewTab, "&New Tab\tCtrl+T");
+            append_menu_item(file_menu, MenuAction::NewWindow, "New &Window\tCtrl+N");
+            append_menu_item(file_menu, MenuAction::QuickOpen, "&Quick Open\tCtrl+G");
+            append_separator(file_menu);
+        }
         append_menu_item(file_menu, MenuAction::CloseTab, "&Close Tab\tCtrl+W");
         append_menu_item(file_menu, MenuAction::CloseOtherTabs, "Close &Other Tabs");
-        append_separator(file_menu);
-        append_menu_item(file_menu, MenuAction::DockerPicker, "&Docker...");
+        if !managed {
+            append_separator(file_menu);
+            append_menu_item(file_menu, MenuAction::DockerPicker, "&Docker...");
 
-        // Sessions submenu
-        let sessions_menu = CreatePopupMenu();
-        append_menu_item(
-            sessions_menu,
-            MenuAction::AttachSession,
-            "&Attach to Session...",
-        );
-        append_menu_item(sessions_menu, MenuAction::SSHConnect, "&SSH Remote...");
-        append_menu_item(
-            sessions_menu,
-            MenuAction::ManageRemotes,
-            "&Manage Remotes...",
-        );
-        append_popup_menu(file_menu, sessions_menu, "S&essions");
+            // Sessions submenu
+            let sessions_menu = CreatePopupMenu();
+            append_menu_item(
+                sessions_menu,
+                MenuAction::AttachSession,
+                "&Attach to Session...",
+            );
+            append_menu_item(sessions_menu, MenuAction::SSHConnect, "&SSH Remote...");
+            append_menu_item(
+                sessions_menu,
+                MenuAction::ManageRemotes,
+                "&Manage Remotes...",
+            );
+            append_popup_menu(file_menu, sessions_menu, "S&essions");
+        }
 
         append_separator(file_menu);
         append_menu_item(file_menu, MenuAction::Quit, "&Quit\tAlt+F4");
@@ -259,18 +263,22 @@ pub fn create_menu_bar(show_debug: bool, updates_enabled: bool) -> HMENU {
 
         // Help menu
         let help_menu = CreatePopupMenu();
-        append_menu_item(help_menu, MenuAction::Preferences, "&Preferences...");
-        append_menu_item(help_menu, MenuAction::TabTemplates, "&Tab Templates...");
+        if !managed {
+            append_menu_item(help_menu, MenuAction::Preferences, "&Preferences...");
+            append_menu_item(help_menu, MenuAction::TabTemplates, "&Tab Templates...");
+        }
         if updates_enabled {
             append_separator(help_menu);
             append_menu_item(help_menu, MenuAction::CheckUpdates, "Check for &Updates...");
         }
-        append_separator(help_menu);
+        if !managed || updates_enabled {
+            append_separator(help_menu);
+        }
         append_menu_item(help_menu, MenuAction::About, "&About cterm");
         append_popup_menu(menu_bar, help_menu, "&Help");
 
         // Debug menu (only shown when Shift is held)
-        if show_debug {
+        if show_debug && !managed {
             let debug_menu = CreatePopupMenu();
             append_menu_item(debug_menu, MenuAction::ViewLogs, "&View Logs...");
             append_menu_item(debug_menu, MenuAction::DebugDumpState, "&Dump State");

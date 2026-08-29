@@ -42,6 +42,10 @@ pub struct Cli {
     #[arg(long, default_value = "cterm")]
     pub identity: String,
 
+    /// Absolute private file containing the managed daemon authentication key.
+    #[arg(long, value_name = "PATH")]
+    pub daemon_auth_file: Option<PathBuf>,
+
     /// Default scrollback lines for new sessions (0 = no scrollback)
     #[arg(long = "scrollback", default_value = "10000")]
     pub scrollback_lines: usize,
@@ -58,21 +62,46 @@ impl Cli {
     }
 
     /// Convert CLI arguments to ServerConfig
-    pub fn to_server_config(&self) -> ServerConfig {
+    pub fn to_server_config(&self) -> Result<ServerConfig, String> {
         let socket_path = self
             .socket_path
             .clone()
             .unwrap_or_else(|| default_socket_path().to_string_lossy().to_string());
 
-        ServerConfig {
+        if self.daemon_auth_file.is_some() && self.use_tcp {
+            return Err(
+                "--daemon-auth-file is restricted to the protected local socket/pipe transport"
+                    .to_string(),
+            );
+        }
+        if self.daemon_auth_file.is_some() && self.relaunch_state.is_some() {
+            return Err("daemon relaunch state is disabled with managed authentication".into());
+        }
+        #[cfg(unix)]
+        if self.daemon_auth_file.is_some() && !std::path::Path::new(&socket_path).is_absolute() {
+            return Err(
+                "an authenticated daemon requires an absolute local socket path".to_string(),
+            );
+        }
+
+        let auth_secret = self
+            .daemon_auth_file
+            .as_deref()
+            .map(cterm_proto::load_daemon_auth_secret)
+            .transpose()
+            .map_err(|error| format!("invalid daemon authentication file: {error}"))?;
+
+        Ok(ServerConfig {
             use_tcp: self.use_tcp,
             bind_addr: self.bind_addr.clone(),
             port: self.port,
             socket_path,
             identity: self.identity.clone(),
+            auth_file: self.daemon_auth_file.clone(),
+            auth_secret,
             scrollback_lines: self.scrollback_lines,
             foreground: self.foreground,
-        }
+        })
     }
 }
 
@@ -194,7 +223,30 @@ mod tests {
     fn test_custom_identity() {
         let cli = Cli::parse_from(["ctermd", "--identity", "managed-product"]);
         assert_eq!(cli.identity, "managed-product");
-        assert_eq!(cli.to_server_config().identity, "managed-product");
+        assert_eq!(cli.to_server_config().unwrap().identity, "managed-product");
+    }
+
+    #[test]
+    fn authenticated_tcp_transport_is_rejected_before_secret_loading() {
+        let cli = Cli::parse_from([
+            "ctermd",
+            "--tcp",
+            "--daemon-auth-file",
+            "/private/daemon-auth",
+        ]);
+        assert!(cli.to_server_config().is_err());
+    }
+
+    #[test]
+    fn authenticated_relaunch_state_is_rejected_before_secret_loading() {
+        let cli = Cli::parse_from([
+            "ctermd",
+            "--daemon-auth-file",
+            "/private/daemon-auth",
+            "--relaunch-state",
+            "/tmp/untrusted-state",
+        ]);
+        assert!(cli.to_server_config().is_err());
     }
 
     #[test]

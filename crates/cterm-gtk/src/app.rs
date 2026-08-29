@@ -10,8 +10,10 @@ use crate::window::CtermWindow;
 
 /// Build the main UI
 pub fn build_ui(app: &Application) {
+    let args = crate::get_args();
+
     // Perform background git sync before loading config
-    if cterm_app::background_sync() {
+    if !args.managed && cterm_app::background_sync() {
         log::info!("Configuration was updated from git remote");
     }
 
@@ -26,8 +28,6 @@ pub fn build_ui(app: &Application) {
 
     // Apply CSS styling
     apply_css(&theme);
-
-    let args = crate::get_args();
 
     // An explicit launch always creates the requested child. Reconnecting here
     // would silently ignore --execute, --directory, and --env.

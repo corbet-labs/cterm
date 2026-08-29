@@ -360,6 +360,11 @@ impl TabBar {
         *self.on_new_tab.borrow_mut() = Some(Box::new(callback));
     }
 
+    /// Hide the secondary-session affordance for a managed product window.
+    pub fn set_new_tab_visible(&self, visible: bool) {
+        self.new_tab_button.set_visible(visible);
+    }
+
     /// Set callback for tab close
     pub fn set_on_close<F: Fn() + 'static>(&self, id: u64, callback: F) {
         self.on_close_callbacks

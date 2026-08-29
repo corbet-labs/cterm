@@ -66,7 +66,9 @@ pub struct Args {
             "config_dir",
             "daemon_socket",
             "daemon_identity",
-            "daemon_executable"
+            "daemon_executable",
+            "daemon_auth_file",
+            "command"
         ],
         conflicts_with = "upgrade_state"
     )]
@@ -87,6 +89,10 @@ pub struct Args {
     /// Daemon path relative to the UI executable (managed mode only).
     #[arg(long, value_name = "RELATIVE_PATH", requires = "managed")]
     pub daemon_executable: Option<PathBuf>,
+
+    /// Absolute private file containing the managed daemon authentication key.
+    #[arg(long, value_name = "PATH", requires = "managed")]
+    pub daemon_auth_file: Option<PathBuf>,
 
     /// Execute a command instead of the default shell.
     #[arg(short = 'e', long = "execute", value_name = "COMMAND")]
@@ -167,7 +173,16 @@ impl Args {
         let executable_dir = ui_executable
             .parent()
             .ok_or_else(|| "UI executable has no package directory".to_string())?;
-        let daemon_executable = executable_dir.join(relative_daemon);
+        let package_dir = executable_dir
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve UI package directory: {error}"))?;
+        let daemon_executable = executable_dir
+            .join(relative_daemon)
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve managed daemon executable: {error}"))?;
+        if !daemon_executable.starts_with(&package_dir) {
+            return Err("--daemon-executable must resolve inside the UI package directory".into());
+        }
 
         let daemon = cterm_client::ManagedDaemonConfig::new(
             self.daemon_socket
@@ -177,6 +192,9 @@ impl Args {
             self.daemon_identity
                 .clone()
                 .ok_or_else(|| "--managed requires --daemon-identity".to_string())?,
+            self.daemon_auth_file
+                .clone()
+                .ok_or_else(|| "--managed requires --daemon-auth-file".to_string())?,
         )?;
 
         Ok(Some(ManagedRuntime { config_dir, daemon }))
@@ -307,6 +325,35 @@ pub struct ManagedRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_auth_file(directory: &std::path::Path) -> PathBuf {
+        let path = directory.join("daemon-auth");
+        let secret = "42".repeat(32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::write(&path, &secret).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::io::Write;
+            use std::os::windows::fs::OpenOptionsExt;
+
+            const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .access_mode(FILE_ALL_ACCESS)
+                .open(&path)
+                .unwrap();
+            cterm_proto::set_private_daemon_auth_file_acl(&file).unwrap();
+            file.write_all(secret.as_bytes()).unwrap();
+        }
+        path
+    }
 
     #[test]
     fn parses_command_argv_without_shell_joining() {
@@ -439,6 +486,7 @@ mod tests {
         };
         let daemon = dir.path().join(daemon_name);
         std::fs::write(&daemon, b"daemon").unwrap();
+        let auth_file = write_auth_file(dir.path());
         let config_dir = dir.path().join("isolated-config");
         let socket = if cfg!(windows) {
             PathBuf::from(r"\\.\pipe\cterm-managed-test")
@@ -457,6 +505,8 @@ mod tests {
             "product-alpha".into(),
             "--daemon-executable".into(),
             daemon_name.into(),
+            "--daemon-auth-file".into(),
+            auth_file.as_os_str().to_owned(),
             "--execute".into(),
             "tool".into(),
             "--".into(),
@@ -468,12 +518,23 @@ mod tests {
         let runtime = args.managed_runtime(&ui).unwrap().unwrap();
         assert_eq!(runtime.config_dir, config_dir);
         assert_eq!(runtime.daemon.socket_path, socket);
-        assert_eq!(runtime.daemon.executable, daemon);
+        assert_eq!(runtime.daemon.executable, daemon.canonicalize().unwrap());
         assert_eq!(runtime.daemon.identity, "product-alpha");
         assert_eq!(args.command_args, ["two words", "--literal"]);
         assert!(args.requests_fresh_session());
         assert!(args.requires_non_unique_instance());
         assert!(!args.updater_enabled());
+
+        #[cfg(unix)]
+        {
+            let mut args = args;
+            let outside = tempfile::tempdir().unwrap();
+            let outside_daemon = outside.path().join("ctermd");
+            std::fs::write(&outside_daemon, b"daemon").unwrap();
+            std::os::unix::fs::symlink(&outside_daemon, dir.path().join("escaped-ctermd")).unwrap();
+            args.daemon_executable = Some("escaped-ctermd".into());
+            assert!(args.managed_runtime(&ui).is_err());
+        }
     }
 
     #[test]
@@ -483,22 +544,27 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let ui = dir.path().join("cterm");
+        let auth_file = write_auth_file(dir.path());
         let socket = if cfg!(windows) {
             r"\\.\pipe\cterm-managed-test"
         } else {
             "/tmp/cterm-managed-test.sock"
         };
-        let args = Args::try_parse_from([
-            "cterm",
-            "--managed",
-            "--config-dir",
-            "/tmp/config",
-            "--daemon-socket",
-            socket,
-            "--daemon-identity",
-            "product-alpha",
-            "--daemon-executable",
-            "../ctermd",
+        let args = Args::try_parse_from(vec![
+            std::ffi::OsString::from("cterm"),
+            "--managed".into(),
+            "--config-dir".into(),
+            dir.path().join("config").into_os_string(),
+            "--daemon-socket".into(),
+            socket.into(),
+            "--daemon-identity".into(),
+            "product-alpha".into(),
+            "--daemon-executable".into(),
+            "../ctermd".into(),
+            "--daemon-auth-file".into(),
+            auth_file.into_os_string(),
+            "--execute".into(),
+            "product-command".into(),
         ])
         .unwrap();
         assert!(args.managed_runtime(&ui).is_err());

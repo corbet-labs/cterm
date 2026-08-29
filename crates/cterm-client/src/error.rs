@@ -33,6 +33,9 @@ pub enum ClientError {
 
     #[error("Daemon identity mismatch: expected={expected}, actual={actual}")]
     DaemonIdentityMismatch { expected: String, actual: String },
+
+    #[error("Managed daemon authentication failed")]
+    DaemonAuthenticationFailed,
 }
 
 impl From<tonic::Status> for ClientError {

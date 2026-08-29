@@ -18,36 +18,42 @@ fn menu_item(label: &str, action: &str, accel: Option<&str>) -> gio::MenuItem {
 ///
 /// If `show_debug` is true, includes a Debug submenu in the Help menu
 /// with developer/testing options.
-pub fn create_menu_model_with_options(show_debug: bool, updates_enabled: bool) -> gio::Menu {
+pub fn create_menu_model_with_options(
+    show_debug: bool,
+    updates_enabled: bool,
+    managed: bool,
+) -> gio::Menu {
     let menu = gio::Menu::new();
 
     // File menu
     let file_menu = gio::Menu::new();
-    file_menu.append_item(&menu_item("New Tab", "win.new-tab", Some("<Ctrl><Shift>t")));
-    file_menu.append_item(&menu_item(
-        "New Window",
-        "win.new-window",
-        Some("<Ctrl><Shift>n"),
-    ));
-    file_menu.append_item(&menu_item(
-        "Quick Open Template...",
-        "win.quick-open",
-        Some("<Ctrl><Shift>o"),
-    ));
+    if !managed {
+        file_menu.append_item(&menu_item("New Tab", "win.new-tab", Some("<Ctrl><Shift>t")));
+        file_menu.append_item(&menu_item(
+            "New Window",
+            "win.new-window",
+            Some("<Ctrl><Shift>n"),
+        ));
+        file_menu.append_item(&menu_item(
+            "Quick Open Template...",
+            "win.quick-open",
+            Some("<Ctrl><Shift>o"),
+        ));
 
-    // Docker submenu
-    let docker_menu = gio::Menu::new();
-    docker_menu.append(Some("Docker Terminal..."), Some("win.docker-picker"));
-    file_menu.append_submenu(Some("Docker"), &docker_menu);
+        // Docker submenu
+        let docker_menu = gio::Menu::new();
+        docker_menu.append(Some("Docker Terminal..."), Some("win.docker-picker"));
+        file_menu.append_submenu(Some("Docker"), &docker_menu);
 
-    // Session submenu (daemon)
-    let session_menu = gio::Menu::new();
-    session_menu.append(Some("Attach to Session..."), Some("win.attach-session"));
-    session_menu.append(Some("SSH Remote..."), Some("win.ssh-connect"));
-    session_menu.append(Some("Manage Remotes..."), Some("win.manage-remotes"));
-    file_menu.append_submenu(Some("Sessions"), &session_menu);
+        // Session submenu (daemon)
+        let session_menu = gio::Menu::new();
+        session_menu.append(Some("Attach to Session..."), Some("win.attach-session"));
+        session_menu.append(Some("SSH Remote..."), Some("win.ssh-connect"));
+        session_menu.append(Some("Manage Remotes..."), Some("win.manage-remotes"));
+        file_menu.append_submenu(Some("Sessions"), &session_menu);
 
-    file_menu.append(Some("Tab Templates..."), Some("win.tab-templates"));
+        file_menu.append(Some("Tab Templates..."), Some("win.tab-templates"));
+    }
     file_menu.append_item(&menu_item(
         "Close Tab",
         "win.close-tab",
@@ -98,8 +104,10 @@ pub fn create_menu_model_with_options(show_debug: bool, updates_enabled: bool) -
     menu.append_submenu(Some("Terminal"), &terminal_menu);
 
     // Tools menu
-    let tools_menu = create_tools_submenu();
-    menu.append_submenu(Some("Tools"), &tools_menu);
+    if !managed {
+        let tools_menu = create_tools_submenu();
+        menu.append_submenu(Some("Tools"), &tools_menu);
+    }
 
     // Tabs menu - will be populated dynamically
     let tabs_menu = gio::Menu::new();
@@ -115,19 +123,23 @@ pub fn create_menu_model_with_options(show_debug: bool, updates_enabled: bool) -
 
     // Help menu
     let help_menu = gio::Menu::new();
-    help_menu.append(Some("Preferences..."), Some("win.preferences"));
+    if !managed {
+        help_menu.append(Some("Preferences..."), Some("win.preferences"));
+    }
     if updates_enabled {
         help_menu.append(Some("Check for Updates..."), Some("win.check-updates"));
     }
     help_menu.append(Some("About"), Some("win.about"));
 
     // Debug submenu (hidden unless Shift is held when opening menu)
-    if show_debug {
+    if show_debug && !managed {
         let debug_menu = gio::Menu::new();
         debug_menu.append(Some("View Logs"), Some("win.view-logs"));
-        debug_menu.append(Some("Re-launch cterm"), Some("win.debug-relaunch"));
-        debug_menu.append(Some("Re-launch ctermd"), Some("win.debug-relaunch-daemon"));
-        debug_menu.append(Some("Kill Local ctermd"), Some("win.debug-kill-daemon"));
+        if updates_enabled {
+            debug_menu.append(Some("Re-launch cterm"), Some("win.debug-relaunch"));
+            debug_menu.append(Some("Re-launch ctermd"), Some("win.debug-relaunch-daemon"));
+            debug_menu.append(Some("Kill Local ctermd"), Some("win.debug-kill-daemon"));
+        }
         debug_menu.append(Some("Dump State"), Some("win.debug-dump-state"));
         help_menu.append_submenu(Some("Debug"), &debug_menu);
     }
@@ -152,7 +164,12 @@ fn create_tools_submenu() -> gio::Menu {
 /// Rebuild the Tools menu in the menu bar (called after preferences save).
 /// Rebuilds the entire menu model and replaces it on the PopoverMenuBar.
 #[allow(dead_code)]
-pub fn rebuild_menu_bar(menu_bar: &gtk4::PopoverMenuBar, show_debug: bool, updates_enabled: bool) {
-    let menu = create_menu_model_with_options(show_debug, updates_enabled);
+pub fn rebuild_menu_bar(
+    menu_bar: &gtk4::PopoverMenuBar,
+    show_debug: bool,
+    updates_enabled: bool,
+    managed: bool,
+) {
+    let menu = create_menu_model_with_options(show_debug, updates_enabled, managed);
     menu_bar.set_menu_model(Some(&menu));
 }

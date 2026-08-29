@@ -200,7 +200,11 @@ impl WindowState {
         notification_bar.set_dpi(dpi);
 
         // Create menu
-        let menu_handle = menu::create_menu_bar(false, crate::get_args().updater_enabled());
+        let menu_handle = menu::create_menu_bar(
+            false,
+            crate::get_args().updater_enabled(),
+            crate::get_args().managed,
+        );
         menu::set_window_menu(hwnd.0 as *mut _, menu_handle);
 
         Self {
@@ -241,6 +245,12 @@ impl WindowState {
 
     /// Create a new tab
     pub fn new_tab(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
+        if crate::get_args().managed {
+            log::warn!("Ignoring new-tab request in managed mode");
+            return Err(
+                std::io::Error::other("secondary sessions are disabled in managed mode").into(),
+            );
+        }
         let shell = self
             .config
             .general
@@ -340,6 +350,12 @@ impl WindowState {
         &mut self,
         template: &cterm_app::config::StickyTabConfig,
     ) -> Result<u64, Box<dyn std::error::Error>> {
+        if crate::get_args().managed {
+            log::warn!("Ignoring tab-template request in managed mode");
+            return Err(
+                std::io::Error::other("secondary sessions are disabled in managed mode").into(),
+            );
+        }
         // If the template specifies a remote, use a daemon-backed tab
         if let Some(ref remote_name) = template.remote {
             let remote_cfg = self
@@ -530,6 +546,12 @@ impl WindowState {
         &mut self,
         selection: crate::docker_dialog::DockerSelection,
     ) -> Result<u64, Box<dyn std::error::Error>> {
+        if crate::get_args().managed {
+            log::warn!("Ignoring Docker-terminal request in managed mode");
+            return Err(
+                std::io::Error::other("secondary sessions are disabled in managed mode").into(),
+            );
+        }
         let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
         let (cols, rows) = self.terminal_size();
 
@@ -1303,6 +1325,23 @@ impl WindowState {
     /// Handle menu command
     pub fn on_menu_command(&mut self, cmd: u16) {
         if let Some(action) = MenuAction::from_id(cmd) {
+            if crate::get_args().managed
+                && matches!(
+                    action,
+                    MenuAction::NewTab
+                        | MenuAction::NewWindow
+                        | MenuAction::QuickOpen
+                        | MenuAction::DockerPicker
+                        | MenuAction::Preferences
+                        | MenuAction::TabTemplates
+                        | MenuAction::AttachSession
+                        | MenuAction::SSHConnect
+                        | MenuAction::ManageRemotes
+                )
+            {
+                log::warn!("Ignoring secondary-session action in managed mode");
+                return;
+            }
             match action {
                 MenuAction::NewTab => {
                     self.new_tab().ok();
@@ -1434,6 +1473,10 @@ impl WindowState {
                     crate::dialogs::show_about_dialog(self.hwnd.0 as *mut _);
                 }
                 MenuAction::DebugRelaunch => {
+                    if !crate::get_args().updater_enabled() {
+                        log::warn!("Ignoring debug relaunch request in managed mode");
+                        return;
+                    }
                     // Re-launch the application (for testing upgrade)
                     if let Ok(exe) = std::env::current_exe() {
                         std::process::Command::new(exe).spawn().ok();
@@ -1455,6 +1498,10 @@ impl WindowState {
                     log::info!("========================");
                 }
                 MenuAction::DebugRelaunchDaemon => {
+                    if !crate::get_args().updater_enabled() {
+                        log::warn!("Ignoring debug daemon relaunch request in managed mode");
+                        return;
+                    }
                     log::info!("Debug: Requesting ctermd relaunch");
                     std::thread::spawn(|| {
                         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1489,6 +1536,10 @@ impl WindowState {
                     });
                 }
                 MenuAction::KillDaemon => {
+                    if !crate::get_args().updater_enabled() {
+                        log::warn!("Ignoring debug daemon shutdown request in managed mode");
+                        return;
+                    }
                     log::info!("Debug: Requesting ctermd force shutdown");
                     std::thread::spawn(|| {
                         let rt = tokio::runtime::Builder::new_current_thread()

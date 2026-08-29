@@ -68,6 +68,8 @@ message HandshakeRequest {
   string client_version = 2;
   // Protocol version for compatibility negotiation
   uint32 protocol_version = 3;
+  // Fresh client challenge used only for managed daemon authentication.
+  bytes daemon_auth_challenge = 4;
 }
 
 message HandshakeResponse {
@@ -81,9 +83,13 @@ message HandshakeResponse {
   string hostname = 4;
   // Protocol version the daemon supports
   uint32 protocol_version = 5;
-  // Stable logical identity configured for this daemon. This is distinct
-  // from daemon_id, which identifies one running process instance.
+  // Public logical identity configured for this daemon. This is distinct
+  // from daemon_id, which identifies one running process instance, and is
+  // never the managed authentication secret.
   string daemon_identity = 6;
+  // HMAC-SHA256 proof over the request challenge and complete handshake
+  // context. Empty for an ordinary, non-managed daemon.
+  bytes daemon_auth_proof = 7;
 }
 
 // ============================================================================

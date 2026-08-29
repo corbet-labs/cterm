@@ -43,14 +43,18 @@ pub fn is_debug_menu_visible() -> bool {
 }
 
 /// Create the main menu bar
-pub fn create_menu_bar(mtm: MainThreadMarker, updates_enabled: bool) -> Retained<NSMenu> {
+pub fn create_menu_bar(
+    mtm: MainThreadMarker,
+    updates_enabled: bool,
+    managed: bool,
+) -> Retained<NSMenu> {
     let menu_bar = NSMenu::new(mtm);
 
     // Application menu (cterm)
-    menu_bar.addItem(&create_app_menu(mtm));
+    menu_bar.addItem(&create_app_menu(mtm, managed));
 
     // File menu
-    menu_bar.addItem(&create_file_menu(mtm));
+    menu_bar.addItem(&create_file_menu(mtm, managed));
 
     // Edit menu
     menu_bar.addItem(&create_edit_menu(mtm));
@@ -62,18 +66,20 @@ pub fn create_menu_bar(mtm: MainThreadMarker, updates_enabled: bool) -> Retained
     menu_bar.addItem(&create_terminal_menu(mtm));
 
     // Tools menu
-    menu_bar.addItem(&create_tools_menu(mtm));
+    if !managed {
+        menu_bar.addItem(&create_tools_menu(mtm));
+    }
 
     // Window menu
     menu_bar.addItem(&create_window_menu(mtm));
 
     // Help menu
-    menu_bar.addItem(&create_help_menu(mtm, updates_enabled));
+    menu_bar.addItem(&create_help_menu(mtm, updates_enabled, managed));
 
     menu_bar
 }
 
-fn create_app_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+fn create_app_menu(mtm: MainThreadMarker, managed: bool) -> Retained<NSMenuItem> {
     let menu = NSMenu::new(mtm);
     menu.setTitle(&NSString::from_str("cterm"));
 
@@ -85,16 +91,18 @@ fn create_app_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
         "",
     ));
 
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    if !managed {
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    // Preferences
-    menu.addItem(&create_menu_item_with_key(
-        mtm,
-        "Preferences...",
-        Some(sel!(showPreferences:)),
-        ",",
-        NSEventModifierFlags::Command,
-    ));
+        // Preferences
+        menu.addItem(&create_menu_item_with_key(
+            mtm,
+            "Preferences...",
+            Some(sel!(showPreferences:)),
+            ",",
+            NSEventModifierFlags::Command,
+        ));
+    }
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
@@ -147,122 +155,126 @@ fn create_app_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     menu_item
 }
 
-fn create_file_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+fn create_file_menu(mtm: MainThreadMarker, managed: bool) -> Retained<NSMenuItem> {
     let menu = NSMenu::new(mtm);
     menu.setTitle(&NSString::from_str("File"));
 
-    // New Tab
-    menu.addItem(&create_menu_item_with_key(
-        mtm,
-        "New Tab",
-        Some(sel!(newTab:)),
-        "t",
-        NSEventModifierFlags::Command,
-    ));
+    if !managed {
+        // New Tab
+        menu.addItem(&create_menu_item_with_key(
+            mtm,
+            "New Tab",
+            Some(sel!(newTab:)),
+            "t",
+            NSEventModifierFlags::Command,
+        ));
 
-    // New Window
-    menu.addItem(&create_menu_item_with_key(
-        mtm,
-        "New Window",
-        Some(sel!(newWindow:)),
-        "n",
-        NSEventModifierFlags::Command,
-    ));
+        // New Window
+        menu.addItem(&create_menu_item_with_key(
+            mtm,
+            "New Window",
+            Some(sel!(newWindow:)),
+            "n",
+            NSEventModifierFlags::Command,
+        ));
 
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    // Quick Open Template
-    menu.addItem(&create_menu_item_with_key(
-        mtm,
-        "Quick Open Template...",
-        Some(sel!(showQuickOpen:)),
-        "g",
-        NSEventModifierFlags::Command,
-    ));
+        // Quick Open Template
+        menu.addItem(&create_menu_item_with_key(
+            mtm,
+            "Quick Open Template...",
+            Some(sel!(showQuickOpen:)),
+            "g",
+            NSEventModifierFlags::Command,
+        ));
 
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    // Tab Templates submenu
-    let templates_submenu = NSMenu::new(mtm);
-    templates_submenu.setTitle(&NSString::from_str("Tab Templates"));
+        // Tab Templates submenu
+        let templates_submenu = NSMenu::new(mtm);
+        templates_submenu.setTitle(&NSString::from_str("Tab Templates"));
 
-    // Load templates to populate submenu
-    if let Ok(templates) = cterm_app::config::load_sticky_tabs() {
-        for (i, template) in templates.iter().enumerate() {
-            let item = NSMenuItem::new(mtm);
-            item.setTitle(&NSString::from_str(&template.name));
-            unsafe { item.setAction(Some(sel!(openTabTemplate:))) };
-            item.setTag(i as isize);
+        // Load templates to populate submenu
+        if let Ok(templates) = cterm_app::config::load_sticky_tabs() {
+            for (i, template) in templates.iter().enumerate() {
+                let item = NSMenuItem::new(mtm);
+                item.setTitle(&NSString::from_str(&template.name));
+                unsafe { item.setAction(Some(sel!(openTabTemplate:))) };
+                item.setTag(i as isize);
 
-            // Add keyboard shortcut for first 9 templates (Cmd+1 through Cmd+9)
-            if i < 9 {
-                item.setKeyEquivalent(&NSString::from_str(&format!("{}", i + 1)));
-                item.setKeyEquivalentModifierMask(
-                    NSEventModifierFlags::Command.union(NSEventModifierFlags::Option),
-                );
+                // Add keyboard shortcut for first 9 templates (Cmd+1 through Cmd+9)
+                if i < 9 {
+                    item.setKeyEquivalent(&NSString::from_str(&format!("{}", i + 1)));
+                    item.setKeyEquivalentModifierMask(
+                        NSEventModifierFlags::Command.union(NSEventModifierFlags::Option),
+                    );
+                }
+
+                templates_submenu.addItem(&item);
             }
 
-            templates_submenu.addItem(&item);
+            if !templates.is_empty() {
+                templates_submenu.addItem(&NSMenuItem::separatorItem(mtm));
+            }
         }
 
-        if !templates.is_empty() {
-            templates_submenu.addItem(&NSMenuItem::separatorItem(mtm));
-        }
+        // Manage Templates...
+        templates_submenu.addItem(&create_menu_item(
+            mtm,
+            "Manage Templates...",
+            Some(sel!(showTabTemplates:)),
+            "",
+        ));
+
+        let templates_item = NSMenuItem::new(mtm);
+        templates_item.setTitle(&NSString::from_str("Tab Templates"));
+        templates_item.setSubmenu(Some(&templates_submenu));
+        menu.addItem(&templates_item);
+
+        // Open in Container (Docker devcontainer)
+        menu.addItem(&create_menu_item_with_key(
+            mtm,
+            "Open in Container",
+            Some(sel!(openInContainer:)),
+            "d",
+            NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
+        ));
+
+        // Sessions submenu (daemon)
+        let sessions_submenu = NSMenu::new(mtm);
+        sessions_submenu.setTitle(&NSString::from_str("Sessions"));
+
+        sessions_submenu.addItem(&create_menu_item(
+            mtm,
+            "Attach to Session...",
+            Some(sel!(attachToSession:)),
+            "",
+        ));
+
+        sessions_submenu.addItem(&create_menu_item(
+            mtm,
+            "SSH Remote...",
+            Some(sel!(sshConnect:)),
+            "",
+        ));
+
+        sessions_submenu.addItem(&create_menu_item(
+            mtm,
+            "Manage Remotes...",
+            Some(sel!(manageRemotes:)),
+            "",
+        ));
+
+        let sessions_item = NSMenuItem::new(mtm);
+        sessions_item.setTitle(&NSString::from_str("Sessions"));
+        sessions_item.setSubmenu(Some(&sessions_submenu));
+        menu.addItem(&sessions_item);
     }
 
-    // Manage Templates...
-    templates_submenu.addItem(&create_menu_item(
-        mtm,
-        "Manage Templates...",
-        Some(sel!(showTabTemplates:)),
-        "",
-    ));
-
-    let templates_item = NSMenuItem::new(mtm);
-    templates_item.setTitle(&NSString::from_str("Tab Templates"));
-    templates_item.setSubmenu(Some(&templates_submenu));
-    menu.addItem(&templates_item);
-
-    // Open in Container (Docker devcontainer)
-    menu.addItem(&create_menu_item_with_key(
-        mtm,
-        "Open in Container",
-        Some(sel!(openInContainer:)),
-        "d",
-        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
-    ));
-
-    // Sessions submenu (daemon)
-    let sessions_submenu = NSMenu::new(mtm);
-    sessions_submenu.setTitle(&NSString::from_str("Sessions"));
-
-    sessions_submenu.addItem(&create_menu_item(
-        mtm,
-        "Attach to Session...",
-        Some(sel!(attachToSession:)),
-        "",
-    ));
-
-    sessions_submenu.addItem(&create_menu_item(
-        mtm,
-        "SSH Remote...",
-        Some(sel!(sshConnect:)),
-        "",
-    ));
-
-    sessions_submenu.addItem(&create_menu_item(
-        mtm,
-        "Manage Remotes...",
-        Some(sel!(manageRemotes:)),
-        "",
-    ));
-
-    let sessions_item = NSMenuItem::new(mtm);
-    sessions_item.setTitle(&NSString::from_str("Sessions"));
-    sessions_item.setSubmenu(Some(&sessions_submenu));
-    menu.addItem(&sessions_item);
-
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    if !managed {
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+    }
 
     // Close Tab
     menu.addItem(&create_menu_item_with_key(
@@ -729,7 +741,11 @@ fn create_window_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     menu_item
 }
 
-fn create_help_menu(mtm: MainThreadMarker, updates_enabled: bool) -> Retained<NSMenuItem> {
+fn create_help_menu(
+    mtm: MainThreadMarker,
+    updates_enabled: bool,
+    managed: bool,
+) -> Retained<NSMenuItem> {
     let menu = NSMenu::new(mtm);
     menu.setTitle(&NSString::from_str("Help"));
 
@@ -753,32 +769,42 @@ fn create_help_menu(mtm: MainThreadMarker, updates_enabled: bool) -> Retained<NS
         ));
     }
 
+    // Managed product windows disable upstream updates and must not expose
+    // cterm's hidden debug/recovery surface, including its deliberate crash.
+    if managed {
+        let menu_item = NSMenuItem::new(mtm);
+        menu_item.setSubmenu(Some(&menu));
+        return menu_item;
+    }
+
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // Debug submenu (hidden by default, shown when Shift is held)
     let debug_menu = NSMenu::new(mtm);
     debug_menu.setTitle(&NSString::from_str("Debug"));
 
-    debug_menu.addItem(&create_menu_item(
-        mtm,
-        "Re-launch cterm",
-        Some(sel!(debugRelaunch:)),
-        "",
-    ));
+    if updates_enabled {
+        debug_menu.addItem(&create_menu_item(
+            mtm,
+            "Re-launch cterm",
+            Some(sel!(debugRelaunch:)),
+            "",
+        ));
 
-    debug_menu.addItem(&create_menu_item(
-        mtm,
-        "Re-launch ctermd",
-        Some(sel!(debugRelaunchDaemon:)),
-        "",
-    ));
+        debug_menu.addItem(&create_menu_item(
+            mtm,
+            "Re-launch ctermd",
+            Some(sel!(debugRelaunchDaemon:)),
+            "",
+        ));
 
-    debug_menu.addItem(&create_menu_item(
-        mtm,
-        "Kill Local ctermd",
-        Some(sel!(killLocalDaemon:)),
-        "",
-    ));
+        debug_menu.addItem(&create_menu_item(
+            mtm,
+            "Kill Local ctermd",
+            Some(sel!(killLocalDaemon:)),
+            "",
+        ));
+    }
 
     debug_menu.addItem(&create_menu_item(
         mtm,

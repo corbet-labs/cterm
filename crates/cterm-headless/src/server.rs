@@ -21,6 +21,10 @@ pub struct ServerConfig {
     pub socket_path: String,
     /// Stable logical identity reported to clients during the handshake.
     pub identity: String,
+    /// Path to the private managed authentication key loaded at startup.
+    pub auth_file: Option<std::path::PathBuf>,
+    /// Managed authentication key loaded before the transport is opened.
+    pub auth_secret: Option<cterm_proto::DaemonAuthSecret>,
     /// Default scrollback lines for new sessions
     pub scrollback_lines: usize,
     /// Run in foreground (don't daemonize)
@@ -37,6 +41,8 @@ impl Default for ServerConfig {
                 .to_string_lossy()
                 .to_string(),
             identity: "cterm".to_string(),
+            auth_file: None,
+            auth_secret: None,
             scrollback_lines: 10000,
             foreground: false,
         }
@@ -48,6 +54,34 @@ pub async fn run_server(
     config: ServerConfig,
     relaunch_state_path: Option<String>,
 ) -> anyhow::Result<()> {
+    if config.auth_file.is_some() != config.auth_secret.is_some() {
+        return Err(anyhow::anyhow!(
+            "managed daemon authentication requires both an auth file and its loaded secret"
+        ));
+    }
+    if config.use_tcp && config.auth_secret.is_some() {
+        return Err(anyhow::anyhow!(
+            "managed daemon authentication is restricted to the protected local transport"
+        ));
+    }
+    if config.auth_secret.is_some() && relaunch_state_path.is_some() {
+        return Err(anyhow::anyhow!(
+            "daemon relaunch state is disabled with managed authentication"
+        ));
+    }
+
+    // Authenticated Unix startup must not create or write into an endpoint
+    // parent supplied by argv. The launcher creates that directory privately;
+    // validate the existing object by handle before even writing the PID file.
+    #[cfg(unix)]
+    if !config.use_tcp && config.auth_secret.is_some() {
+        let socket_path = Path::new(&config.socket_path);
+        let parent = socket_path.parent().ok_or_else(|| {
+            anyhow::anyhow!("authenticated daemon socket has no private parent directory")
+        })?;
+        cterm_proto::validate_private_daemon_directory(parent)?;
+    }
+
     // Write PID file
     #[cfg(unix)]
     let pid_path = {
@@ -135,6 +169,7 @@ pub async fn run_server(
     service.set_server_config(
         config.socket_path.clone(),
         config.identity.clone(),
+        config.auth_secret.clone(),
         config.scrollback_lines,
     );
 
@@ -234,6 +269,22 @@ async fn run_unix_socket_server(
     use tokio_stream::wrappers::UnixListenerStream;
 
     let socket_path = Path::new(&config.socket_path);
+    let authenticated = config.auth_secret.is_some();
+
+    // The local transport is the client-authorization boundary. In managed
+    // mode, validate its already-created parent by handle before inspecting or
+    // replacing anything at the endpoint path.
+    if let Some(parent) = socket_path.parent() {
+        if authenticated {
+            cterm_proto::validate_private_daemon_directory(parent)?;
+        } else {
+            std::fs::create_dir_all(parent)?;
+        }
+    } else if authenticated {
+        return Err(anyhow::anyhow!(
+            "authenticated daemon socket has no private parent directory"
+        ));
+    }
 
     // Remove stale socket if present
     if socket_path.exists() {
@@ -248,18 +299,19 @@ async fn run_unix_socket_server(
         }
     }
 
-    // Ensure parent directory exists
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     let listener = UnixListener::bind(socket_path)?;
 
     // Set socket permissions to user-only
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o700)).ok();
+    use std::os::unix::fs::PermissionsExt;
+    let permission_result =
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o700));
+    if authenticated {
+        let validation = permission_result
+            .and_then(|()| cterm_proto::validate_private_daemon_socket(socket_path));
+        if let Err(error) = validation {
+            let _ = std::fs::remove_file(socket_path);
+            return Err(error.into());
+        }
     }
 
     log::info!("Starting ctermd on Unix socket {}", config.socket_path);
@@ -414,11 +466,155 @@ fn create_windows_pipe_instance(
     pipe_name: &str,
     first_instance: bool,
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
     let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
     options
         .first_pipe_instance(first_instance)
         .reject_remote_clients(true);
-    options.create(pipe_name)
+    let descriptor = current_account_pipe_security_descriptor()?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `attributes` and its owned descriptor remain alive until
+    // CreateNamedPipeW returns. Windows copies the security descriptor into
+    // the new kernel object; Tokio does not retain this pointer.
+    unsafe {
+        options.create_with_security_attributes_raw(
+            pipe_name,
+            (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+        )
+    }
+}
+
+/// LocalAlloc-backed security descriptor freed after CreateNamedPipeW.
+#[cfg(windows)]
+struct LocalSecurityDescriptor(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the pointer was allocated by
+            // ConvertStringSecurityDescriptorToSecurityDescriptorW.
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.0);
+            }
+        }
+    }
+}
+
+/// Build a protected DACL granting full access only to LocalSystem and the
+/// current account SID. The persisted managed secret is scoped to this same
+/// account, so the pipe and HMAC use one explicit security boundary.
+#[cfg(windows)]
+fn current_account_pipe_security_descriptor() -> std::io::Result<LocalSecurityDescriptor> {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+
+    let user_sid = current_user_sid_string()?;
+    let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})");
+    let encoded: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: `encoded` is NUL-terminated and `descriptor` is a valid out
+    // pointer. The returned allocation is owned by LocalSecurityDescriptor.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            encoded.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(LocalSecurityDescriptor(descriptor))
+}
+
+#[cfg(windows)]
+fn current_user_sid_string() -> std::io::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct TokenHandle(HANDLE);
+    impl Drop for TokenHandle {
+        fn drop(&mut self) {
+            // SAFETY: OpenProcessToken returned this owned handle.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut raw_token = std::ptr::null_mut();
+    // SAFETY: raw_token is a valid out pointer and GetCurrentProcess returns a
+    // process pseudo-handle valid for this call.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = TokenHandle(raw_token);
+
+    let mut required = 0_u32;
+    // The first call intentionally obtains the required buffer length.
+    unsafe {
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut required);
+    }
+    if required < std::mem::size_of::<TOKEN_USER>() as u32 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut storage = vec![0_usize; words];
+    // SAFETY: usize storage is suitably aligned and has `required` writable
+    // bytes. TokenUser returns a TOKEN_USER containing the account SID.
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            storage.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetTokenInformation initialized a TOKEN_USER in aligned storage.
+    let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
+    if user.User.Sid.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "current process token has no user SID",
+        ));
+    }
+
+    let mut sid_text = std::ptr::null_mut();
+    // SAFETY: the SID pointer remains owned by `storage`; sid_text is a valid
+    // out pointer and is released with LocalFree below.
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut length = 0_usize;
+    // SID strings are short and the API guarantees NUL termination.
+    while unsafe { *sid_text.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: sid_text points to `length` initialized UTF-16 code units.
+    let result = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, length) })
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "user SID is not UTF-16")
+        });
+    // SAFETY: ConvertSidToStringSidW allocated sid_text with LocalAlloc.
+    unsafe {
+        LocalFree(sid_text.cast());
+    }
+    result
 }
 
 /// Check if a socket file is stale (no process using it)
@@ -492,5 +688,25 @@ mod tests {
         assert!(!pid_path.exists());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authenticated_server_never_creates_its_endpoint_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("launcher-must-create-this");
+        let socket_path = parent.join("ctermd.sock");
+        let auth_path = root.path().join("auth");
+        let config = ServerConfig {
+            socket_path: socket_path.to_string_lossy().into_owned(),
+            auth_file: Some(auth_path),
+            auth_secret: Some(cterm_proto::DaemonAuthSecret::from_bytes([0x42; 32])),
+            foreground: true,
+            ..ServerConfig::default()
+        };
+
+        run_server(config, None).await.unwrap_err();
+        assert!(!parent.exists());
+        assert!(!socket_path.with_extension("pid").exists());
     }
 }
