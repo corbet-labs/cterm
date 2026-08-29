@@ -1521,6 +1521,7 @@ impl TerminalView {
         let (cell_width, cell_height) = renderer.cell_size();
 
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.set_base_palette(theme.colors.clone());
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
@@ -1584,6 +1585,7 @@ impl TerminalView {
         let (cell_width, cell_height) = renderer.cell_size();
 
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.set_base_palette(theme.colors.clone());
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
@@ -2050,6 +2052,11 @@ impl TerminalView {
         if let Some(ref mut renderer) = *self.ivars().renderer.borrow_mut() {
             renderer.set_background_override(color);
         }
+        let mut palette = self.ivars().color_palette.clone();
+        if let Some(background) = color.and_then(cterm_core::Rgb::from_hex) {
+            palette.background = background;
+        }
+        self.ivars().terminal.lock().set_base_palette(palette);
     }
 
     /// Check if the title is locked (user-set or template-set)

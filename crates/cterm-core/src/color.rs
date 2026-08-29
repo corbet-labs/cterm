@@ -32,9 +32,64 @@ impl Rgb {
         Some(Self { r, g, b })
     }
 
+    /// Parse the RGB forms accepted by XParseColor and foot.
+    ///
+    /// Supported forms are `rgb:r/g/b` and legacy `#rgb`, with one to four
+    /// hexadecimal digits per component. Components wider than eight bits use
+    /// their most significant byte; a single nibble is duplicated.
+    pub fn from_xparse_color(spec: &str) -> Option<Self> {
+        fn component_with_width(value: &str) -> Option<u8> {
+            if !(1..=4).contains(&value.len())
+                || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            let parsed = u16::from_str_radix(value, 16).ok()?;
+            Some(match value.len() {
+                1 => (parsed as u8) * 0x11,
+                2 => parsed as u8,
+                3 => (parsed >> 4) as u8,
+                4 => (parsed >> 8) as u8,
+                _ => unreachable!(),
+            })
+        }
+
+        let components: [&str; 3] = if let Some(rgb) = spec.strip_prefix("rgb:") {
+            let mut parts = rgb.split('/');
+            let result = [parts.next()?, parts.next()?, parts.next()?];
+            if parts.next().is_some() {
+                return None;
+            }
+            result
+        } else {
+            let hex = spec.strip_prefix('#')?;
+            if !matches!(hex.len(), 3 | 6 | 9 | 12)
+                || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            let width = hex.len() / 3;
+            [&hex[..width], &hex[width..width * 2], &hex[width * 2..]]
+        };
+
+        Some(Self::new(
+            component_with_width(components[0])?,
+            component_with_width(components[1])?,
+            component_with_width(components[2])?,
+        ))
+    }
+
     /// Convert to hex string
     pub fn to_hex(&self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+
+    /// Format an xterm/foot OSC color response using 16-bit components.
+    pub fn to_osc_spec(&self) -> String {
+        format!(
+            "rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}",
+            self.r, self.g, self.b
+        )
     }
 
     /// Convert to normalized float values (0.0-1.0)
@@ -277,6 +332,30 @@ mod tests {
         assert_eq!(Rgb::from_hex("#ff0000"), Some(Rgb::new(255, 0, 0)));
         assert_eq!(Rgb::from_hex("00ff00"), Some(Rgb::new(0, 255, 0)));
         assert_eq!(Rgb::from_hex("#invalid"), None);
+    }
+
+    #[test]
+    fn test_rgb_from_xparse_color() {
+        assert_eq!(
+            Rgb::from_xparse_color("rgb:f/80/1234"),
+            Some(Rgb::new(255, 128, 18))
+        );
+        assert_eq!(Rgb::from_xparse_color("#f80"), Some(Rgb::new(255, 136, 0)));
+        assert_eq!(
+            Rgb::from_xparse_color("#ffff80001234"),
+            Some(Rgb::new(255, 128, 18))
+        );
+        assert_eq!(Rgb::from_xparse_color("rgb:ff/00"), None);
+        assert_eq!(Rgb::from_xparse_color("#12345"), None);
+        assert_eq!(Rgb::from_xparse_color("red"), None);
+    }
+
+    #[test]
+    fn test_rgb_to_osc_spec() {
+        assert_eq!(
+            Rgb::new(0x12, 0x80, 0xff).to_osc_spec(),
+            "rgb:1212/8080/ffff"
+        );
     }
 
     #[test]

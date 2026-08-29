@@ -6,8 +6,10 @@ use cterm_core::screen::{
 };
 use cterm_core::term::TerminalEvent as CoreEvent;
 
-/// Convert cterm_core TerminalEvent to proto TerminalEvent
-pub fn event_to_proto(event: &CoreEvent) -> proto::TerminalEvent {
+/// Convert a wire-visible cterm_core event to its protocol representation.
+/// Theme color queries are answered by the frontend that sees the raw PTY
+/// stream and therefore are intentionally not broadcast by ctermd.
+pub fn event_to_proto(event: &CoreEvent) -> Option<proto::TerminalEvent> {
     use proto::terminal_event::Event;
 
     let event = match event {
@@ -38,9 +40,10 @@ pub fn event_to_proto(event: &CoreEvent) -> proto::TerminalEvent {
                 data,
             })
         }
+        CoreEvent::ColorQuery { .. } => return None,
     };
 
-    proto::TerminalEvent { event: Some(event) }
+    Some(proto::TerminalEvent { event: Some(event) })
 }
 
 /// Convert clipboard selection to proto
@@ -59,7 +62,7 @@ mod tests {
     #[test]
     fn test_title_changed_event() {
         let event = CoreEvent::TitleChanged("test".to_string());
-        let proto = event_to_proto(&event);
+        let proto = event_to_proto(&event).unwrap();
         match proto.event {
             Some(proto::terminal_event::Event::TitleChanged(e)) => {
                 assert_eq!(e.title, "test");
@@ -71,7 +74,7 @@ mod tests {
     #[test]
     fn test_bell_event() {
         let event = CoreEvent::Bell;
-        let proto = event_to_proto(&event);
+        let proto = event_to_proto(&event).unwrap();
         assert!(matches!(
             proto.event,
             Some(proto::terminal_event::Event::Bell(_))
@@ -81,12 +84,21 @@ mod tests {
     #[test]
     fn test_process_exited_event() {
         let event = CoreEvent::ProcessExited(42);
-        let proto = event_to_proto(&event);
+        let proto = event_to_proto(&event).unwrap();
         match proto.event {
             Some(proto::terminal_event::Event::ProcessExited(e)) => {
                 assert_eq!(e.exit_code, 42);
             }
             _ => panic!("Expected ProcessExited event"),
         }
+    }
+
+    #[test]
+    fn color_queries_are_frontend_local() {
+        assert!(event_to_proto(&CoreEvent::ColorQuery {
+            target: cterm_core::ColorQuery::Foreground,
+            dynamic_color: None,
+        })
+        .is_none());
     }
 }

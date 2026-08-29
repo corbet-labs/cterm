@@ -313,6 +313,8 @@ impl TerminalRenderer {
             return Ok(());
         }
 
+        let palette = self.resolved_palette(screen);
+
         // Begin drawing
         unsafe {
             let rt = self.render_target.as_ref().unwrap();
@@ -320,13 +322,11 @@ impl TerminalRenderer {
 
             // Clear with background color (use override if set)
             let bg = if screen.modes.reverse_video {
-                &self.theme.colors.foreground
+                palette.foreground
             } else {
-                self.background_override
-                    .as_ref()
-                    .unwrap_or(&self.theme.colors.background)
+                palette.background
             };
-            let bg_color = rgb_to_d2d_color(*bg);
+            let bg_color = rgb_to_d2d_color(bg);
             rt.Clear(Some(&bg_color));
         }
 
@@ -454,7 +454,8 @@ impl TerminalRenderer {
 
         let attrs = cell.attrs;
         let is_selected = screen.is_selected(absolute_line, col);
-        let (fg, bg) = self.resolve_colors(cell, screen.modes.reverse_video, is_selected);
+        let (fg, bg) = self.resolve_colors(cell, screen, screen.modes.reverse_video, is_selected);
+        let palette = self.resolved_palette(screen);
         let cell_width = if cell.is_wide() {
             self.cell_dims.width * 2.0
         } else {
@@ -463,10 +464,9 @@ impl TerminalRenderer {
 
         // Get brushes first (this mutably borrows self temporarily)
         let canvas_background = if screen.modes.reverse_video {
-            self.theme.colors.foreground
+            palette.foreground
         } else {
-            self.background_override
-                .unwrap_or(self.theme.colors.background)
+            palette.background
         };
         let bg_brush = if bg != canvas_background || is_selected {
             Some(self.get_brush(bg)?)
@@ -490,7 +490,7 @@ impl TerminalRenderer {
             let color = if has_hyperlink {
                 Rgb::new(100, 149, 237)
             } else if let Some(color) = cell.underline_color {
-                color.to_rgb(&self.theme.colors)
+                color.to_rgb(&palette)
             } else {
                 fg
             };
@@ -598,17 +598,21 @@ impl TerminalRenderer {
     }
 
     /// Resolve foreground and background colors from a cell
-    fn resolve_colors(&self, cell: &Cell, reverse_video: bool, selected: bool) -> (Rgb, Rgb) {
-        let palette = &self.theme.colors;
-        let normal_background = self
-            .background_override
-            .unwrap_or(self.theme.colors.background);
+    fn resolve_colors(
+        &self,
+        cell: &Cell,
+        screen: &Screen,
+        reverse_video: bool,
+        selected: bool,
+    ) -> (Rgb, Rgb) {
+        let palette = self.resolved_palette(screen);
+        let normal_background = palette.background;
 
-        let mut fg = cell.fg.to_rgb(palette);
+        let mut fg = cell.fg.to_rgb(&palette);
         let mut bg = if cell.bg == Color::Default {
             normal_background
         } else {
-            cell.bg.to_rgb(palette)
+            cell.bg.to_rgb(&palette)
         };
 
         // Handle inverse
@@ -694,7 +698,7 @@ impl TerminalRenderer {
         let x = cursor.col as f32 * self.cell_dims.width;
         let y = cursor.row as f32 * self.cell_dims.height;
 
-        let cursor_color = self.theme.cursor.color;
+        let cursor_color = self.resolved_palette(screen).cursor;
         let brush = self.get_brush(cursor_color)?;
 
         let rect = match cursor.style {
@@ -760,6 +764,14 @@ impl TerminalRenderer {
         }
 
         Ok(())
+    }
+
+    fn resolved_palette(&self, screen: &Screen) -> cterm_core::ColorPalette {
+        let mut base = self.theme.colors.clone();
+        if let Some(background) = self.background_override {
+            base.background = background;
+        }
+        screen.resolved_palette(&base)
     }
 
     /// Update the theme

@@ -10,7 +10,7 @@ use objc2_app_kit::{NSFont, NSFontManager, NSFontTraitMask, NSGraphicsContext};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use cterm_core::cell::CellAttrs;
-use cterm_core::color::{Color, Rgb};
+use cterm_core::color::{Color, ColorPalette, Rgb};
 use cterm_core::drcs::DrcsGlyph;
 use cterm_core::TerminalImage;
 use cterm_core::{CursorStyle, Terminal};
@@ -130,13 +130,15 @@ impl CGRenderer {
         let screen = terminal.screen();
         let cols = screen.width();
         let rows = screen.height();
-        let normal_background = self
-            .background_override
-            .as_ref()
-            .unwrap_or(&self.theme.colors.background);
+        let mut base_palette = self.theme.colors.clone();
+        if let Some(background) = self.background_override {
+            base_palette.background = background;
+        }
+        let palette = screen.resolved_palette(&base_palette);
+        let normal_background = &palette.background;
 
         // Draw background
-        self.draw_background(bounds, screen.modes.reverse_video);
+        self.draw_background(bounds, screen.modes.reverse_video, &palette);
 
         // Draw cells
         for row in 0..rows {
@@ -178,21 +180,21 @@ impl CGRenderer {
                         let fg_rgb = if cell.bg.is_default() {
                             *normal_background
                         } else {
-                            self.color_to_rgb(&cell.bg)
+                            Self::color_to_rgb(&cell.bg, &palette)
                         };
                         let bg_rgb = if fg.is_default() {
-                            self.theme.colors.foreground
+                            palette.foreground
                         } else {
-                            self.color_to_rgb(&fg)
+                            Self::color_to_rgb(&fg, &palette)
                         };
                         (fg_rgb, bg_rgb)
                     } else {
                         let bg = if cell.bg.is_default() {
                             *normal_background
                         } else {
-                            self.color_to_rgb(&cell.bg)
+                            Self::color_to_rgb(&cell.bg, &palette)
                         };
-                        (self.color_to_rgb(&fg), bg)
+                        (Self::color_to_rgb(&fg, &palette), bg)
                     };
 
                     // Apply dim (SGR 2) — halve foreground brightness
@@ -256,7 +258,7 @@ impl CGRenderer {
                                 b: 237,
                             } // Cornflower blue for hyperlinks
                         } else if let Some(ref uc) = cell.underline_color {
-                            self.color_to_rgb(uc)
+                            Self::color_to_rgb(uc, &palette)
                         } else {
                             fg_color
                         };
@@ -304,7 +306,13 @@ impl CGRenderer {
                 self.cell_width
             };
 
-            self.draw_cursor(cursor_x, cursor_y, cursor_width, cursor.style);
+            self.draw_cursor(
+                cursor_x,
+                cursor_y,
+                cursor_width,
+                cursor.style,
+                &palette.cursor,
+            );
         }
 
         // Draw scrollbar overlay when there is scrollback content
@@ -570,29 +578,17 @@ impl CGRenderer {
         }
     }
 
-    fn draw_background(&self, bounds: NSRect, reverse_video: bool) {
-        // Use background override if set, otherwise use theme background
+    fn draw_background(&self, bounds: NSRect, reverse_video: bool, palette: &ColorPalette) {
         let bg = if reverse_video {
-            &self.theme.colors.foreground
+            &palette.foreground
         } else {
-            self.background_override
-                .as_ref()
-                .unwrap_or(&self.theme.colors.background)
+            &palette.background
         };
         unsafe {
             let color = Self::ns_color(bg.r, bg.g, bg.b);
             let _: () = msg_send![&*color, setFill];
             let _: () = msg_send![class!(NSBezierPath), fillRect: bounds];
         }
-    }
-
-    fn draw_cell_background(&self, x: f64, y: f64, color: &Color) {
-        let rgb = self.color_to_rgb(color);
-        self.draw_cell_background_rgb(x, y, &rgb);
-    }
-
-    fn draw_cell_background_rgb(&self, x: f64, y: f64, rgb: &Rgb) {
-        self.draw_cell_background_sized(x, y, self.cell_width, rgb);
     }
 
     fn draw_cell_background_sized(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
@@ -670,8 +666,7 @@ impl CGRenderer {
         }
     }
 
-    fn draw_cursor(&self, x: f64, y: f64, width: f64, style: CursorStyle) {
-        let cursor_color = &self.theme.colors.cursor;
+    fn draw_cursor(&self, x: f64, y: f64, width: f64, style: CursorStyle, cursor_color: &Rgb) {
         let rect = match style {
             CursorStyle::Block => {
                 NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height))
@@ -813,33 +808,8 @@ impl CGRenderer {
         }
     }
 
-    fn color_to_rgb(&self, color: &Color) -> Rgb {
-        match color {
-            Color::Default => self.theme.colors.foreground,
-            Color::Rgb(rgb) => *rgb,
-            Color::Ansi(ansi) => self.theme.colors.ansi[*ansi as usize],
-            Color::Indexed(idx) => self.index_to_rgb(*idx),
-        }
-    }
-
-    fn index_to_rgb(&self, idx: u8) -> Rgb {
-        match idx {
-            // First 16 are ANSI colors
-            0..=15 => self.theme.colors.ansi[idx as usize],
-            // 16-231 are a 6x6x6 color cube
-            16..=231 => {
-                let n = idx - 16;
-                let b = (n % 6) * 51;
-                let g = ((n / 6) % 6) * 51;
-                let r = (n / 36) * 51;
-                Rgb::new(r, g, b)
-            }
-            // 232-255 are grayscale
-            232..=255 => {
-                let gray = (idx - 232) * 10 + 8;
-                Rgb::new(gray, gray, gray)
-            }
-        }
+    fn color_to_rgb(color: &Color, palette: &ColorPalette) -> Rgb {
+        color.to_rgb(palette)
     }
 
     /// Update theme colors

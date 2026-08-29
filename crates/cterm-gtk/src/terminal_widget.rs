@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 
 use cterm_app::config::Config;
 use cterm_core::cell::CellAttrs;
-use cterm_core::color::{Color, Rgb};
+use cterm_core::color::{Color, ColorPalette, Rgb};
 use cterm_core::mouse::{encode_mouse_event, MouseButton, MouseModifiers};
 use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
@@ -183,6 +183,9 @@ impl TerminalWidget {
             }
         });
         *self.background_override.borrow_mut() = rgb;
+        self.terminal
+            .lock()
+            .set_base_palette(frontend_palette(&self.theme, rgb));
         // Trigger redraw to apply new background
         self.drawing_area.queue_draw();
     }
@@ -1356,6 +1359,7 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY — write callback forwards via channel
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.set_base_palette(frontend_palette(theme, None));
         terminal.screen_mut().set_cell_width_hint(cell_dims.width);
         terminal.screen_mut().set_cell_height_hint(cell_dims.height);
         let write_tx = cmd_tx.clone();
@@ -1421,6 +1425,7 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        terminal.set_base_palette(frontend_palette(theme, None));
         terminal.screen_mut().set_cell_width_hint(cell_dims.width);
         terminal.screen_mut().set_cell_height_hint(cell_dims.height);
 
@@ -1793,6 +1798,9 @@ impl TerminalWidget {
                                 }
                                 TerminalEvent::ContentChanged => content_changed = true,
                                 TerminalEvent::ProcessExited(_) => {}
+                                // process_mirror already answered this through
+                                // the daemon write callback.
+                                TerminalEvent::ColorQuery { .. } => {}
                             }
                         }
 
@@ -1952,13 +1960,12 @@ fn draw_terminal(
 ) {
     let term = terminal.lock();
     let screen = term.screen();
-    let palette = &theme.colors;
+    let palette = frontend_palette(theme, config.background_override);
+    let palette = screen.resolved_palette(&palette);
+    let palette = &palette;
 
-    // Draw background (use override if set, otherwise use theme)
-    let normal_background = config
-        .background_override
-        .as_ref()
-        .unwrap_or(&palette.background);
+    // Dynamic OSC colors override the configured theme/template palette.
+    let normal_background = &palette.background;
     let bg = if screen.modes.reverse_video {
         &palette.foreground
     } else {
@@ -2124,7 +2131,7 @@ fn draw_terminal(
         let x = cursor.col as f64 * cell_width;
         let y = cursor.row as f64 * cell_height;
 
-        let (r, g, b) = theme.cursor.color.to_f64();
+        let (r, g, b) = palette.cursor.to_f64();
         cr.set_source_rgb(r, g, b);
 
         match cursor.style {
@@ -2237,6 +2244,15 @@ fn draw_terminal(
         cr.set_source_rgba(0.5, 0.5, 0.5, opacity);
         cr.fill().ok();
     }
+}
+
+fn frontend_palette(theme: &Theme, background: Option<Rgb>) -> ColorPalette {
+    let mut palette = theme.colors.clone();
+    palette.cursor = theme.cursor.color;
+    if let Some(background) = background {
+        palette.background = background;
+    }
+    palette
 }
 
 fn draw_cell_decorations(

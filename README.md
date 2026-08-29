@@ -25,7 +25,7 @@ A high-performance, customizable terminal emulator built in Rust. cterm uses nat
 ### Terminal Features
 - **Hyperlinks**: Clickable URLs with OSC 8 support
 - **Clipboard**: OSC 52 clipboard integration for remote copy/paste
-- **Color Queries**: OSC 10/11 color query support for theme-aware applications
+- **Dynamic Colors**: Theme-aware OSC 10/11/12 query, set, and reset support
 - **Alternate Screen**: Full alternate screen buffer support (for vim, less, etc.)
 - **Sixel Graphics**: Inline image display with DEC Sixel protocol support
 - **iTerm2 Graphics**: Inline images via OSC 1337 protocol (PNG, JPEG, GIF)
@@ -344,6 +344,9 @@ identity_file = "~/.ssh/prod_key"
 | 11 | Query/set background color |
 | 12 | Query/set cursor color |
 | 52 | Clipboard operations |
+| 110 | Reset foreground color |
+| 111 | Reset background color |
+| 112 | Reset cursor color |
 | 1337 | iTerm2 inline images and file transfer |
 
 ### Sixel Graphics

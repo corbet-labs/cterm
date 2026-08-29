@@ -4,6 +4,7 @@
 //! and scroll operations.
 
 use crate::cell::{Cell, CellAttrs, CellStyle, MAX_GRAPHEME_BYTES};
+use crate::color::{ColorPalette, Rgb};
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
@@ -191,6 +192,25 @@ pub enum ColorQuery {
     Background,
     /// Query cursor color (OSC 12)
     Cursor,
+}
+
+impl ColorQuery {
+    pub const fn from_osc_code(code: u32) -> Option<Self> {
+        match code {
+            10 => Some(Self::Foreground),
+            11 => Some(Self::Background),
+            12 => Some(Self::Cursor),
+            _ => None,
+        }
+    }
+
+    pub const fn osc_code(self) -> u8 {
+        match self {
+            Self::Foreground => 10,
+            Self::Background => 11,
+            Self::Cursor => 12,
+        }
+    }
 }
 
 /// File transfer operation for iTerm2 OSC 1337 protocol
@@ -436,7 +456,15 @@ pub struct Screen {
     /// Pending clipboard operations from OSC 52
     pending_clipboard_ops: Vec<ClipboardOperation>,
     /// Pending color queries (OSC 10-12)
-    pending_color_queries: Vec<ColorQuery>,
+    pending_color_queries: Vec<(ColorQuery, Option<Rgb>)>,
+    /// UI theme used when replying to color queries. The headless daemon does
+    /// not set this; the attached frontend is authoritative for theme colors.
+    base_palette: ColorPalette,
+    base_palette_configured: bool,
+    /// Application-provided overrides from OSC 10-12.
+    dynamic_foreground: Option<Rgb>,
+    dynamic_background: Option<Rgb>,
+    dynamic_cursor: Option<Rgb>,
     /// Current text selection (if any)
     pub selection: Option<Selection>,
     /// Terminal images (Sixel, etc.)
@@ -628,6 +656,11 @@ impl Screen {
             pending_responses: Vec::new(),
             pending_clipboard_ops: Vec::new(),
             pending_color_queries: Vec::new(),
+            base_palette: ColorPalette::default(),
+            base_palette_configured: false,
+            dynamic_foreground: None,
+            dynamic_background: None,
+            dynamic_cursor: None,
             selection: None,
             images: HashMap::new(),
             // Zero is reserved as an invalid/sentinel identifier by native UI
@@ -740,17 +773,73 @@ impl Screen {
             12 => ColorQuery::Cursor,
             _ => return,
         };
-        self.pending_color_queries.push(query);
+        let dynamic_color = self.dynamic_color(query);
+        self.pending_color_queries.push((query, dynamic_color));
     }
 
     /// Take all pending color queries (drains the queue)
-    pub fn take_color_queries(&mut self) -> Vec<ColorQuery> {
+    pub fn take_color_queries(&mut self) -> Vec<(ColorQuery, Option<Rgb>)> {
         std::mem::take(&mut self.pending_color_queries)
     }
 
     /// Check if there are pending color queries
     pub fn has_color_queries(&self) -> bool {
         !self.pending_color_queries.is_empty()
+    }
+
+    /// Set the frontend's configured palette for OSC query replies.
+    pub fn set_base_palette(&mut self, palette: ColorPalette) {
+        self.base_palette = palette;
+        self.base_palette_configured = true;
+    }
+
+    /// Whether this terminal mirror has a frontend palette and may answer OSC
+    /// color queries. The daemon intentionally leaves this false.
+    pub fn has_base_palette(&self) -> bool {
+        self.base_palette_configured
+    }
+
+    /// Set or reset an application-provided default color.
+    pub fn set_dynamic_color(&mut self, target: ColorQuery, color: Option<Rgb>) {
+        match target {
+            ColorQuery::Foreground => self.dynamic_foreground = color,
+            ColorQuery::Background => self.dynamic_background = color,
+            ColorQuery::Cursor => self.dynamic_cursor = color,
+        }
+        self.dirty = true;
+    }
+
+    /// Return an application-provided default color override.
+    pub fn dynamic_color(&self, target: ColorQuery) -> Option<Rgb> {
+        match target {
+            ColorQuery::Foreground => self.dynamic_foreground,
+            ColorQuery::Background => self.dynamic_background,
+            ColorQuery::Cursor => self.dynamic_cursor,
+        }
+    }
+
+    /// Resolve dynamic terminal defaults over a frontend theme palette.
+    pub fn resolved_palette(&self, base: &ColorPalette) -> ColorPalette {
+        let mut palette = base.clone();
+        if let Some(color) = self.dynamic_foreground {
+            palette.foreground = color;
+        }
+        if let Some(color) = self.dynamic_background {
+            palette.background = color;
+        }
+        if let Some(color) = self.dynamic_cursor {
+            palette.cursor = color;
+        }
+        palette
+    }
+
+    /// Return one queried color from the frontend's configured palette.
+    pub fn base_query_color(&self, target: ColorQuery) -> Rgb {
+        match target {
+            ColorQuery::Foreground => self.base_palette.foreground,
+            ColorQuery::Background => self.base_palette.background,
+            ColorQuery::Cursor => self.base_palette.cursor,
+        }
     }
 
     /// Queue a file transfer operation (from OSC 1337 with inline=0)
@@ -1616,6 +1705,9 @@ impl Screen {
         self.dirty = true;
         self.scroll_offset = 0;
         self.images.clear();
+        self.dynamic_foreground = None;
+        self.dynamic_background = None;
+        self.dynamic_cursor = None;
         self.drcs_fonts.clear();
         self.keyboard_main_stack.clear();
         self.keyboard_alt_stack.clear();

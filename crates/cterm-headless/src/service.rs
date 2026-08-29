@@ -595,7 +595,7 @@ impl TerminalService for TerminalServiceImpl {
         let rx = session.subscribe_events();
         let session_id = req.session_id.clone();
         let events = BroadcastStream::new(rx).filter_map(move |result| match result {
-            Ok(event) => Some(Ok(event_to_proto(&event))),
+            Ok(event) => event_to_proto(&event).map(Ok),
             Err(BroadcastStreamRecvError::Lagged(count)) => {
                 log::warn!(
                     "stream_events: client lagged, dropped {} events for session {}",

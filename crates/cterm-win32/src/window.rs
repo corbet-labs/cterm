@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_core::color::Rgb;
+use cterm_core::color::{ColorPalette, Rgb};
 use cterm_core::mouse::{encode_mouse_event, MouseButton as ReportButton, MouseModifiers};
 use cterm_core::pty::{PtyConfig, PtySize};
 use cterm_core::screen::{FileTransferOperation, MouseMode, ScreenConfig};
@@ -332,7 +332,8 @@ impl WindowState {
             term: opts.term,
         };
 
-        let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        terminal.set_base_palette(terminal_palette(&self.theme, None));
         let terminal = Arc::new(Mutex::new(terminal));
 
         // Start PTY reader thread
@@ -513,7 +514,11 @@ impl WindowState {
             term: self.config.general.term.clone(),
         };
 
-        let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        terminal.set_base_palette(terminal_palette(
+            &self.theme,
+            template.background_color.as_deref(),
+        ));
         let terminal = Arc::new(Mutex::new(terminal));
 
         // Start PTY reader thread
@@ -640,7 +645,8 @@ impl WindowState {
             term: self.config.general.term.clone(),
         };
 
-        let terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        terminal.set_base_palette(terminal_palette(&self.theme, None));
         let terminal = Arc::new(Mutex::new(terminal));
 
         let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
@@ -702,6 +708,7 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.set_base_palette(terminal_palette(&self.theme, background_color.as_deref()));
         terminal.resize_with_pixels(
             cols,
             rows,
@@ -788,6 +795,7 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.set_base_palette(terminal_palette(&self.theme, None));
 
         // Apply screen snapshot if available
         if let Some(ref screen_data) = screen_snapshot {
@@ -3336,6 +3344,15 @@ fn parse_hex_color(hex: &str) -> Option<Rgb> {
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
 
     Some(Rgb::new(r, g, b))
+}
+
+fn terminal_palette(theme: &Theme, background: Option<&str>) -> ColorPalette {
+    let mut palette = theme.colors.clone();
+    palette.cursor = theme.cursor.color;
+    if let Some(background) = background.and_then(Rgb::from_hex) {
+        palette.background = background;
+    }
+    palette
 }
 
 #[cfg(test)]

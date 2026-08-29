@@ -9,6 +9,12 @@ is omitted for readability.
 
 ## [Unreleased]
 
+### Fixed
+- OSC 10/11/12 color queries now receive theme-accurate replies from the
+  attached frontend. Dynamic foreground, background, and cursor colors support
+  foot-compatible XParseColor forms, reset through OSC 110/111/112, render on
+  every desktop backend, and survive daemon reconnection.
+
 ## [0.0.19] - 2026-07-09
 
 ### Added

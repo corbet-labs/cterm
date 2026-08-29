@@ -23,7 +23,7 @@ pub mod streaming_file;
 pub mod term;
 
 pub use cell::{Cell, CellAttrs};
-pub use color::{AnsiColor, Color, Rgb};
+pub use color::{AnsiColor, Color, ColorPalette, Rgb};
 pub use drcs::{DecdldDecoder, DrcsFont, DrcsGlyph};
 pub use grid::Grid;
 pub use image_decode::{decode_image, DecodedImage, ImageDecodeError};

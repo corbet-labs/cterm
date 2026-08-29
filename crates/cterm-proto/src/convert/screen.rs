@@ -5,7 +5,7 @@ use crate::proto;
 use cterm_core::cell::Hyperlink;
 use cterm_core::drcs::{DrcsFont, DrcsGlyph};
 use cterm_core::term::Terminal;
-use cterm_core::{Cell, CellAttrs, Color, Screen, TerminalImage};
+use cterm_core::{Cell, CellAttrs, Color, ColorQuery, Screen, TerminalImage};
 use std::sync::Arc;
 
 /// Convert cell attributes to proto
@@ -288,6 +288,17 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
         reverse_video: screen.modes.reverse_video,
         reverse_wrap: screen.modes.reverse_wrap,
         modify_other_keys: u32::from(screen.modes.modify_other_keys),
+        dynamic_colors: Some(proto::DynamicColors {
+            foreground: screen
+                .dynamic_color(ColorQuery::Foreground)
+                .map(|color| color_to_proto(&Color::Rgb(color))),
+            background: screen
+                .dynamic_color(ColorQuery::Background)
+                .map(|color| color_to_proto(&Color::Rgb(color))),
+            cursor: screen
+                .dynamic_color(ColorQuery::Cursor)
+                .map(|color| color_to_proto(&Color::Rgb(color))),
+        }),
     }
 }
 
@@ -386,6 +397,28 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.modes.modify_other_keys = u8::try_from(modes.modify_other_keys)
             .unwrap_or(1)
             .clamp(1, 2);
+        let dynamic_rgb = |color: Option<&proto::Color>| {
+            color.map(proto_to_color).and_then(|color| {
+                if let Color::Rgb(rgb) = color {
+                    Some(rgb)
+                } else {
+                    None
+                }
+            })
+        };
+        let dynamic_colors = modes.dynamic_colors.as_ref();
+        screen.set_dynamic_color(
+            ColorQuery::Foreground,
+            dynamic_rgb(dynamic_colors.and_then(|colors| colors.foreground.as_ref())),
+        );
+        screen.set_dynamic_color(
+            ColorQuery::Background,
+            dynamic_rgb(dynamic_colors.and_then(|colors| colors.background.as_ref())),
+        );
+        screen.set_dynamic_color(
+            ColorQuery::Cursor,
+            dynamic_rgb(dynamic_colors.and_then(|colors| colors.cursor.as_ref())),
+        );
         screen.set_keyboard_enhancement_flags(
             cterm_core::KeyboardEnhancementFlags::from_bits_retain(
                 modes.keyboard_enhancement_flags as u8,
@@ -484,6 +517,15 @@ mod tests {
         source.screen_mut().modes.reverse_video = true;
         source.screen_mut().modes.reverse_wrap = false;
         source.screen_mut().modes.modify_other_keys = 2;
+        source
+            .screen_mut()
+            .set_dynamic_color(ColorQuery::Foreground, Some(cterm_core::Rgb::new(4, 5, 6)));
+        source
+            .screen_mut()
+            .set_dynamic_color(ColorQuery::Background, Some(cterm_core::Rgb::new(7, 8, 9)));
+        source
+            .screen_mut()
+            .set_dynamic_color(ColorQuery::Cursor, Some(cterm_core::Rgb::new(10, 11, 12)));
 
         let snapshot = screen_to_proto(source.screen(), true);
         let mut restored = Terminal::new(1, 1, ScreenConfig::default());
@@ -497,6 +539,35 @@ mod tests {
         assert!(restored.screen().modes.reverse_video);
         assert!(!restored.screen().modes.reverse_wrap);
         assert_eq!(restored.screen().modes.modify_other_keys, 2);
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Foreground),
+            Some(cterm_core::Rgb::new(4, 5, 6))
+        );
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Background),
+            Some(cterm_core::Rgb::new(7, 8, 9))
+        );
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Cursor),
+            Some(cterm_core::Rgb::new(10, 11, 12))
+        );
+    }
+
+    #[test]
+    fn screen_snapshot_clears_absent_dynamic_colors() {
+        let source = Terminal::new(80, 24, ScreenConfig::default());
+        let snapshot = screen_to_proto(source.screen(), true);
+        let mut restored = Terminal::new(80, 24, ScreenConfig::default());
+        restored
+            .screen_mut()
+            .set_dynamic_color(ColorQuery::Foreground, Some(cterm_core::Rgb::new(1, 2, 3)));
+
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Foreground),
+            None
+        );
     }
 
     #[test]
