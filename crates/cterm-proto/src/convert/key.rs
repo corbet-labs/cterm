@@ -28,6 +28,22 @@ pub fn proto_to_key(key: &proto::Key) -> Option<Key> {
                 SpecialKey::PageDown => Some(Key::PageDown),
                 SpecialKey::Insert => Some(Key::Insert),
                 SpecialKey::Delete => Some(Key::Delete),
+                SpecialKey::Numpad0 => Some(Key::NumpadDigit(0)),
+                SpecialKey::Numpad1 => Some(Key::NumpadDigit(1)),
+                SpecialKey::Numpad2 => Some(Key::NumpadDigit(2)),
+                SpecialKey::Numpad3 => Some(Key::NumpadDigit(3)),
+                SpecialKey::Numpad4 => Some(Key::NumpadDigit(4)),
+                SpecialKey::Numpad5 => Some(Key::NumpadDigit(5)),
+                SpecialKey::Numpad6 => Some(Key::NumpadDigit(6)),
+                SpecialKey::Numpad7 => Some(Key::NumpadDigit(7)),
+                SpecialKey::Numpad8 => Some(Key::NumpadDigit(8)),
+                SpecialKey::Numpad9 => Some(Key::NumpadDigit(9)),
+                SpecialKey::NumpadDecimal => Some(Key::NumpadDecimal),
+                SpecialKey::NumpadDivide => Some(Key::NumpadDivide),
+                SpecialKey::NumpadMultiply => Some(Key::NumpadMultiply),
+                SpecialKey::NumpadSubtract => Some(Key::NumpadSubtract),
+                SpecialKey::NumpadAdd => Some(Key::NumpadAdd),
+                SpecialKey::NumpadEnter => Some(Key::NumpadEnter),
             }
         }
         Some(KeyType::Function(n)) => {
@@ -81,6 +97,28 @@ pub fn key_to_proto(key: Key) -> proto::Key {
         Key::Insert => Some(KeyType::Special(SpecialKey::Insert as i32)),
         Key::Delete => Some(KeyType::Special(SpecialKey::Delete as i32)),
         Key::F(n) => Some(KeyType::Function(n as u32)),
+        Key::NumpadDigit(digit) => {
+            let special = match digit {
+                0 => SpecialKey::Numpad0,
+                1 => SpecialKey::Numpad1,
+                2 => SpecialKey::Numpad2,
+                3 => SpecialKey::Numpad3,
+                4 => SpecialKey::Numpad4,
+                5 => SpecialKey::Numpad5,
+                6 => SpecialKey::Numpad6,
+                7 => SpecialKey::Numpad7,
+                8 => SpecialKey::Numpad8,
+                9 => SpecialKey::Numpad9,
+                _ => SpecialKey::Unspecified,
+            };
+            Some(KeyType::Special(special as i32))
+        }
+        Key::NumpadDecimal => Some(KeyType::Special(SpecialKey::NumpadDecimal as i32)),
+        Key::NumpadDivide => Some(KeyType::Special(SpecialKey::NumpadDivide as i32)),
+        Key::NumpadMultiply => Some(KeyType::Special(SpecialKey::NumpadMultiply as i32)),
+        Key::NumpadSubtract => Some(KeyType::Special(SpecialKey::NumpadSubtract as i32)),
+        Key::NumpadAdd => Some(KeyType::Special(SpecialKey::NumpadAdd as i32)),
+        Key::NumpadEnter => Some(KeyType::Special(SpecialKey::NumpadEnter as i32)),
     };
 
     proto::Key { key_type }
@@ -114,6 +152,23 @@ mod tests {
         let proto = key_to_proto(key);
         let back = proto_to_key(&proto);
         assert_eq!(back, Some(key));
+    }
+
+    #[test]
+    fn test_numeric_keypad_roundtrip() {
+        for key in [
+            Key::NumpadDigit(0),
+            Key::NumpadDigit(9),
+            Key::NumpadDecimal,
+            Key::NumpadDivide,
+            Key::NumpadMultiply,
+            Key::NumpadSubtract,
+            Key::NumpadAdd,
+            Key::NumpadEnter,
+        ] {
+            let proto = key_to_proto(key);
+            assert_eq!(proto_to_key(&proto), Some(key));
+        }
     }
 
     #[test]
