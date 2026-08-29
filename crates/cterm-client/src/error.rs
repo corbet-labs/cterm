@@ -27,6 +27,12 @@ pub enum ClientError {
 
     #[error("Version mismatch: daemon={daemon}, client={client}")]
     VersionMismatch { daemon: String, client: String },
+
+    #[error("Protocol mismatch: daemon={daemon}, client={client}")]
+    ProtocolMismatch { daemon: u32, client: u32 },
+
+    #[error("Daemon identity mismatch: expected={expected}, actual={actual}")]
+    DaemonIdentityMismatch { expected: String, actual: String },
 }
 
 impl From<tonic::Status> for ClientError {

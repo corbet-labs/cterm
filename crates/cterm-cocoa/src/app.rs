@@ -350,6 +350,10 @@ define_class!(
 
         #[unsafe(method(checkForUpdates:))]
         fn action_check_for_updates(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            if !get_args().updater_enabled() {
+                log::warn!("Ignoring upstream update request in managed mode");
+                return;
+            }
             let mtm = MainThreadMarker::from(self);
             crate::update_dialog::check_for_updates_sync(mtm);
         }
@@ -1295,9 +1299,24 @@ fn get_theme(config: &Config) -> Theme {
 pub fn run() {
     // Parse command-line arguments first
     let args = Args::parse();
+    if args.managed {
+        let executable = std::env::current_exe().unwrap_or_else(|error| {
+            eprintln!("cterm: managed mode could not resolve the UI executable: {error}");
+            std::process::exit(2);
+        });
+        if let Err(error) = args.initialize_runtime(&executable) {
+            eprintln!("cterm: invalid managed runtime: {error}");
+            std::process::exit(2);
+        }
+    }
 
     // Initialize logging with capture buffer for in-app log viewing
     crate::log_capture::init();
+    if let Err(error) = args.preflight_managed_daemon() {
+        log::error!("{error}");
+        eprintln!("cterm: {error}");
+        std::process::exit(1);
+    }
 
     // Save the original FD limit before raising it, so child processes can restore it
     #[cfg(unix)]
@@ -1392,7 +1411,7 @@ pub fn run_app_internal() {
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     // Create the menu bar
-    let menu_bar = menu::create_menu_bar(mtm);
+    let menu_bar = menu::create_menu_bar(mtm, get_args().updater_enabled());
     app.setMainMenu(Some(&menu_bar));
 
     log::info!("Starting main run loop");

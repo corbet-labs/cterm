@@ -27,6 +27,8 @@ pub struct TerminalServiceImpl {
     shutdown_notify: Arc<Notify>,
     /// Unique identifier for this daemon instance
     daemon_id: String,
+    /// Stable logical identity configured for this daemon endpoint.
+    daemon_identity: String,
     /// Time when the daemon was started
     start_time: Instant,
     /// Number of clients that have performed a handshake
@@ -46,6 +48,7 @@ impl TerminalServiceImpl {
             session_manager,
             shutdown_notify,
             daemon_id: uuid::Uuid::new_v4().to_string(),
+            daemon_identity: "cterm".to_string(),
             start_time: Instant::now(),
             client_count: AtomicU32::new(0),
             active_streams: Arc::new(AtomicU32::new(0)),
@@ -54,9 +57,15 @@ impl TerminalServiceImpl {
         }
     }
 
-    /// Set the socket path and scrollback lines (needed for relaunch)
-    pub fn set_server_config(&mut self, socket_path: String, scrollback_lines: usize) {
+    /// Set daemon endpoint details needed for handshakes and relaunch.
+    pub fn set_server_config(
+        &mut self,
+        socket_path: String,
+        daemon_identity: String,
+        scrollback_lines: usize,
+    ) {
         self.socket_path = socket_path;
+        self.daemon_identity = daemon_identity;
         self.scrollback_lines = scrollback_lines;
     }
 }
@@ -650,7 +659,8 @@ impl TerminalService for TerminalServiceImpl {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             is_local: true,
             hostname,
-            protocol_version: 1,
+            protocol_version: cterm_proto::PROTOCOL_VERSION,
+            daemon_identity: self.daemon_identity.clone(),
         }))
     }
 
@@ -1012,6 +1022,7 @@ impl TerminalService for TerminalServiceImpl {
             match crate::relaunch::perform_relaunch(
                 &self.session_manager,
                 &self.socket_path,
+                &self.daemon_identity,
                 self.scrollback_lines,
                 binary_path,
             ) {

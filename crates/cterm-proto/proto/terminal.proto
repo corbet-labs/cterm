@@ -81,6 +81,9 @@ message HandshakeResponse {
   string hostname = 4;
   // Protocol version the daemon supports
   uint32 protocol_version = 5;
+  // Stable logical identity configured for this daemon. This is distinct
+  // from daemon_id, which identifies one running process instance.
+  string daemon_identity = 6;
 }
 
 // ============================================================================

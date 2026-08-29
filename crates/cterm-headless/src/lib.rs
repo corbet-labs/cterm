@@ -2,13 +2,13 @@
 //!
 //! This crate provides a headless terminal daemon (`ctermd`) that exposes
 //! terminal functionality via gRPC. It supports multiple terminal sessions,
-//! both Unix socket (default) and TCP transports.
+//! Unix sockets, Windows named pipes, and explicit TCP transports.
 //!
 //! # Features
 //!
 //! - Multi-session terminal management
 //! - gRPC API for session control, input/output, and screen state
-//! - Unix socket (default) and TCP transport options
+//! - Unix socket / Windows named-pipe defaults and explicit TCP transport
 //! - Streaming output and event notifications
 //!
 //! # Usage

@@ -196,6 +196,7 @@ fn clear_cloexec(fd: i32) -> std::io::Result<()> {
 pub fn perform_relaunch(
     session_manager: &Arc<SessionManager>,
     socket_path: &str,
+    daemon_identity: &str,
     scrollback_lines: usize,
     binary_path: Option<&str>,
 ) -> Result<(), String> {
@@ -246,10 +247,12 @@ pub fn perform_relaunch(
     // Remove the socket file so the new process can bind to it
     let _ = std::fs::remove_file(socket_path);
 
-    // Also remove the PID file
-    let _ = std::fs::remove_file(crate::cli::pid_file_path());
+    // Also remove the PID file belonging to this exact socket.
+    let mut pid_path = PathBuf::from(socket_path);
+    pid_path.set_extension("pid");
+    let _ = std::fs::remove_file(pid_path);
 
-    // Build argv: binary --foreground --relaunch-state <dir> --listen <socket_path>
+    // Build argv: preserve the exact endpoint identity across exec.
     let binary_cstr = std::ffi::CString::new(binary.to_string_lossy().as_bytes())
         .map_err(|e| format!("Invalid binary path: {}", e))?;
     let state_dir_str = state_dir.to_string_lossy().to_string();
@@ -260,6 +263,9 @@ pub fn perform_relaunch(
         std::ffi::CString::new(state_dir_str.as_bytes()).unwrap(),
         std::ffi::CString::new("--listen").unwrap(),
         std::ffi::CString::new(socket_path.as_bytes()).unwrap(),
+        std::ffi::CString::new("--identity").unwrap(),
+        std::ffi::CString::new(daemon_identity.as_bytes())
+            .map_err(|e| format!("Invalid daemon identity: {}", e))?,
         std::ffi::CString::new("--scrollback").unwrap(),
         std::ffi::CString::new(scrollback_lines.to_string().as_bytes()).unwrap(),
     ];

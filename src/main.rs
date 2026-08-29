@@ -3,6 +3,10 @@
 //! This is the main entry point that selects the appropriate UI backend
 //! based on the target platform.
 
+// The native Windows backend is a GUI application. Diagnostics still flow to
+// cterm's capture/logger instead of opening a second console window.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 fn main() {
     #[cfg(target_os = "macos")]
     {

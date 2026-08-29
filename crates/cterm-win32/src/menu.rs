@@ -146,7 +146,7 @@ fn to_wide_string(s: &str) -> Vec<u16> {
 }
 
 /// Create the main menu bar
-pub fn create_menu_bar(show_debug: bool) -> HMENU {
+pub fn create_menu_bar(show_debug: bool, updates_enabled: bool) -> HMENU {
     unsafe {
         let menu_bar = CreateMenu();
 
@@ -261,8 +261,10 @@ pub fn create_menu_bar(show_debug: bool) -> HMENU {
         let help_menu = CreatePopupMenu();
         append_menu_item(help_menu, MenuAction::Preferences, "&Preferences...");
         append_menu_item(help_menu, MenuAction::TabTemplates, "&Tab Templates...");
-        append_separator(help_menu);
-        append_menu_item(help_menu, MenuAction::CheckUpdates, "Check for &Updates...");
+        if updates_enabled {
+            append_separator(help_menu);
+            append_menu_item(help_menu, MenuAction::CheckUpdates, "Check for &Updates...");
+        }
         append_separator(help_menu);
         append_menu_item(help_menu, MenuAction::About, "&About cterm");
         append_popup_menu(menu_bar, help_menu, "&Help");

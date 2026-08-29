@@ -200,7 +200,7 @@ impl WindowState {
         notification_bar.set_dpi(dpi);
 
         // Create menu
-        let menu_handle = menu::create_menu_bar(false);
+        let menu_handle = menu::create_menu_bar(false, crate::get_args().updater_enabled());
         menu::set_window_menu(hwnd.0 as *mut _, menu_handle);
 
         Self {
@@ -1424,7 +1424,11 @@ impl WindowState {
                     }
                 }
                 MenuAction::CheckUpdates => {
-                    crate::dialogs::show_check_updates_dialog(self.hwnd.0 as *mut _);
+                    if crate::get_args().updater_enabled() {
+                        crate::dialogs::show_check_updates_dialog(self.hwnd.0 as *mut _);
+                    } else {
+                        log::warn!("Ignoring upstream update request in managed mode");
+                    }
                 }
                 MenuAction::About => {
                     crate::dialogs::show_about_dialog(self.hwnd.0 as *mut _);
@@ -2451,12 +2455,16 @@ pub fn create_window(config: &Config, theme: &Theme) -> windows::core::Result<HW
     state.init_renderer()?;
     let args = crate::get_args();
     let opts = args.initial_session_options(config, 0, 0);
-    state
-        .new_tab_with_options(opts, args.initial_title(config), args.title.is_some())
-        .map_err(|e| {
-            log::error!("Failed to create initial tab: {}", e);
-            windows::core::Error::from_win32()
-        })?;
+    if args.managed {
+        state.spawn_daemon_tab(opts, args.initial_title(config), None, None, false, None);
+    } else {
+        state
+            .new_tab_with_options(opts, args.initial_title(config), args.title.is_some())
+            .map_err(|e| {
+                log::error!("Failed to create initial tab: {}", e);
+                windows::core::Error::from_win32()
+            })?;
+    }
 
     if let Some(ref title) = args.title {
         let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();

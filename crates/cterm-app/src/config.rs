@@ -11,6 +11,8 @@ use thiserror::Error;
 
 use cterm_ui::theme::{FontConfig, Theme};
 
+static CONFIG_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// Configuration errors
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -875,7 +877,29 @@ fn expand_sticky_tab_paths(tab: &mut StickyTabConfig) {
 
 /// Get the config directory path
 pub fn config_dir() -> Option<PathBuf> {
+    if let Some(path) = CONFIG_DIR_OVERRIDE.get() {
+        return Some(path.clone());
+    }
     ProjectDirs::from("com", "cterm", "cterm").map(|p| p.config_dir().to_path_buf())
+}
+
+/// Override the process-wide configuration directory before loading any files.
+/// Repeating the same value is harmless; changing it after initialization is
+/// rejected so one process cannot mix two products' configuration.
+pub fn set_config_dir_override(path: PathBuf) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("configuration directory must be an absolute path".to_string());
+    }
+    if let Some(existing) = CONFIG_DIR_OVERRIDE.get() {
+        return if existing == &path {
+            Ok(())
+        } else {
+            Err("configuration directory was already configured differently".to_string())
+        };
+    }
+    CONFIG_DIR_OVERRIDE
+        .set(path)
+        .map_err(|_| "configuration directory was already configured".to_string())
 }
 
 /// Get the config file path

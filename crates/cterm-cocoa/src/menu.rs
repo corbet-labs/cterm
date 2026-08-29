@@ -43,7 +43,7 @@ pub fn is_debug_menu_visible() -> bool {
 }
 
 /// Create the main menu bar
-pub fn create_menu_bar(mtm: MainThreadMarker) -> Retained<NSMenu> {
+pub fn create_menu_bar(mtm: MainThreadMarker, updates_enabled: bool) -> Retained<NSMenu> {
     let menu_bar = NSMenu::new(mtm);
 
     // Application menu (cterm)
@@ -68,7 +68,7 @@ pub fn create_menu_bar(mtm: MainThreadMarker) -> Retained<NSMenu> {
     menu_bar.addItem(&create_window_menu(mtm));
 
     // Help menu
-    menu_bar.addItem(&create_help_menu(mtm));
+    menu_bar.addItem(&create_help_menu(mtm, updates_enabled));
 
     menu_bar
 }
@@ -729,7 +729,7 @@ fn create_window_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     menu_item
 }
 
-fn create_help_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+fn create_help_menu(mtm: MainThreadMarker, updates_enabled: bool) -> Retained<NSMenuItem> {
     let menu = NSMenu::new(mtm);
     menu.setTitle(&NSString::from_str("Help"));
 
@@ -741,15 +741,17 @@ fn create_help_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
         "",
     ));
 
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    if updates_enabled {
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    // Check for Updates
-    menu.addItem(&create_menu_item(
-        mtm,
-        "Check for Updates...",
-        Some(sel!(checkForUpdates:)),
-        "",
-    ));
+        // Check for Updates
+        menu.addItem(&create_menu_item(
+            mtm,
+            "Check for Updates...",
+            Some(sel!(checkForUpdates:)),
+            "",
+        ));
+    }
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 

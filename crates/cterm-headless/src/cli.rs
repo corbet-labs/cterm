@@ -38,6 +38,10 @@ pub struct Cli {
     #[arg(long = "print-socket-path")]
     pub print_socket_path: bool,
 
+    /// Stable logical identity reported during the client handshake.
+    #[arg(long, default_value = "cterm")]
+    pub identity: String,
+
     /// Default scrollback lines for new sessions (0 = no scrollback)
     #[arg(long = "scrollback", default_value = "10000")]
     pub scrollback_lines: usize,
@@ -65,6 +69,7 @@ impl Cli {
             bind_addr: self.bind_addr.clone(),
             port: self.port,
             socket_path,
+            identity: self.identity.clone(),
             scrollback_lines: self.scrollback_lines,
             foreground: self.foreground,
         }
@@ -143,7 +148,8 @@ pub fn default_socket_path() -> PathBuf {
 
     #[cfg(not(unix))]
     {
-        PathBuf::from("/tmp/ctermd.sock")
+        let username = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
+        PathBuf::from(format!(r"\\.\pipe\ctermd-{}", username))
     }
 }
 
@@ -166,6 +172,7 @@ mod tests {
         assert_eq!(cli.port, 50051);
         assert_eq!(cli.bind_addr, "127.0.0.1");
         assert_eq!(cli.log_level, "info");
+        assert_eq!(cli.identity, "cterm");
         assert!(!cli.foreground);
         assert_eq!(cli.scrollback_lines, 10000);
     }
@@ -181,6 +188,13 @@ mod tests {
     fn test_custom_socket() {
         let cli = Cli::parse_from(["ctermd", "-l", "/var/run/ctermd.sock"]);
         assert_eq!(cli.socket_path, Some("/var/run/ctermd.sock".to_string()));
+    }
+
+    #[test]
+    fn test_custom_identity() {
+        let cli = Cli::parse_from(["ctermd", "--identity", "managed-product"]);
+        assert_eq!(cli.identity, "managed-product");
+        assert_eq!(cli.to_server_config().identity, "managed-product");
     }
 
     #[test]

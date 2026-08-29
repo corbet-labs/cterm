@@ -100,7 +100,8 @@ The binary will be at `target/release/cterm`.
 
 `--execute` starts an executable directly. Arguments after the command are
 passed as a trailing argument vector; cterm does not join them into a shell
-command line.
+command line. The command contract is UTF-8; each accepted value remains a
+distinct argv element.
 
 ```bash
 cterm --execute my-tui -- --profile "Jane Doe" --literal-flag
@@ -113,6 +114,28 @@ values, and the last repeated name wins. An explicit command, directory,
 environment value, or title creates a fresh session instead of reconnecting to
 an unrelated existing daemon session. `--maximized` and `--fullscreen` control
 the initial native window.
+
+### Managed product mode
+
+Embedding packages can opt into a fail-closed, isolated runtime contract:
+
+```bash
+cterm --managed \
+  --config-dir /absolute/product/config \
+  --daemon-socket /absolute/product/run/ctermd.sock \
+  --daemon-identity product-alpha \
+  --daemon-executable ctermd \
+  --execute product-tui -- --profile default
+```
+
+`--daemon-executable` is resolved relative to the cterm UI executable and must
+stay inside that directory tree. Managed mode never searches `PATH`, requires
+the daemon identity, protocol, and package version to match exactly, always
+creates a fresh session, and removes cterm's upstream update actions. On
+Windows, `--daemon-socket` is an exact named-pipe path such as
+`\\.\pipe\product-ctermd-user`; ctermd rejects remote pipe clients. A per-user
+pipe name prevents accidental collisions but is not an authorization secret;
+Windows still applies the launching process token's default pipe DACL.
 
 ## Configuration
 

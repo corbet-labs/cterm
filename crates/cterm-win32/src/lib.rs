@@ -43,13 +43,33 @@ pub fn get_args() -> &'static Args {
     APP_ARGS.get().expect("Args not initialized")
 }
 
+fn fatal_startup_error(message: &str, exit_code: i32) -> ! {
+    dialogs::show_error(std::ptr::null_mut(), "cterm startup error", message);
+    std::process::exit(exit_code);
+}
+
 /// Run the Windows application
 pub fn run() {
     // Parse command-line arguments
     let args = Args::parse();
+    if args.managed {
+        let executable = std::env::current_exe().unwrap_or_else(|error| {
+            fatal_startup_error(
+                &format!("Managed mode could not resolve the UI executable: {error}"),
+                2,
+            )
+        });
+        if let Err(error) = args.initialize_runtime(&executable) {
+            fatal_startup_error(&format!("Invalid managed runtime: {error}"), 2);
+        }
+    }
 
     // Initialize logging
     cterm_app::log_capture::init();
+    if let Err(error) = args.preflight_managed_daemon() {
+        log::error!("{error}");
+        fatal_startup_error(&error, 1);
+    }
 
     log::info!("Starting cterm (Windows native UI)");
 

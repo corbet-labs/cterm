@@ -16,6 +16,7 @@ prost.workspace = true
 prost-types.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, features = ["sync"] }
+futures.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 log.workspace = true
@@ -32,3 +33,4 @@ libc.workspace = true
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+cterm-client.workspace = true

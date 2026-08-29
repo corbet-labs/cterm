@@ -9,6 +9,37 @@ use cterm_headless::proto::terminal_service_client::TerminalServiceClient;
 use cterm_headless::proto::*;
 use tonic::transport::Channel;
 
+fn ctermd_path() -> std::path::PathBuf {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+
+    let debug_path = if cfg!(windows) {
+        workspace_root.join("target/debug/ctermd.exe")
+    } else {
+        workspace_root.join("target/debug/ctermd")
+    };
+    let release_path = if cfg!(windows) {
+        workspace_root.join("target/release/ctermd.exe")
+    } else {
+        workspace_root.join("target/release/ctermd")
+    };
+
+    if debug_path.exists() {
+        debug_path
+    } else if release_path.exists() {
+        release_path
+    } else {
+        panic!(
+            "ctermd binary not found. Tried:\n  {}\n  {}\nPlease build with: cargo build -p cterm-headless",
+            debug_path.display(),
+            release_path.display()
+        );
+    }
+}
+
 /// Helper to find an available port
 fn find_available_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -23,41 +54,24 @@ struct CtermdServer {
 
 impl CtermdServer {
     fn spawn() -> Self {
+        Self::spawn_with_identity("cterm")
+    }
+
+    fn spawn_with_identity(identity: &str) -> Self {
         let port = find_available_port();
 
-        // Find the ctermd binary - workspace root is 2 levels up from this crate
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-
-        let debug_path = if cfg!(windows) {
-            workspace_root.join("target/debug/ctermd.exe")
-        } else {
-            workspace_root.join("target/debug/ctermd")
-        };
-
-        let release_path = if cfg!(windows) {
-            workspace_root.join("target/release/ctermd.exe")
-        } else {
-            workspace_root.join("target/release/ctermd")
-        };
-
-        let ctermd_path = if debug_path.exists() {
-            debug_path
-        } else if release_path.exists() {
-            release_path
-        } else {
-            panic!(
-                "ctermd binary not found. Tried:\n  {}\n  {}\nPlease build with: cargo build -p cterm-headless",
-                debug_path.display(),
-                release_path.display()
-            );
-        };
+        let ctermd_path = ctermd_path();
 
         let child = Command::new(&ctermd_path)
-            .args(["--tcp", "--port", &port.to_string(), "--bind", "127.0.0.1"])
+            .args([
+                "--tcp",
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--identity",
+                identity,
+            ])
             .spawn()
             .unwrap_or_else(|e| {
                 panic!("Failed to spawn ctermd at {}: {}", ctermd_path.display(), e)
@@ -72,6 +86,56 @@ impl CtermdServer {
     fn address(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
+}
+
+#[tokio::test]
+async fn test_handshake_reports_exact_protocol_version_and_daemon_identity() {
+    let server = CtermdServer::spawn_with_identity("managed-integration");
+    let mut client = connect(&server.address()).await;
+    let response = client
+        .handshake(HandshakeRequest {
+            client_id: "integration-test".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: cterm_proto::PROTOCOL_VERSION,
+        })
+        .await
+        .expect("handshake failed")
+        .into_inner();
+
+    assert_eq!(response.daemon_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(response.protocol_version, cterm_proto::PROTOCOL_VERSION);
+    assert_eq!(response.daemon_identity, "managed-integration");
+}
+
+#[tokio::test]
+async fn test_managed_daemon_launches_on_the_exact_local_transport() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = if cfg!(windows) {
+        std::path::PathBuf::from(format!(
+            r"\\.\pipe\cterm-managed-integration-{}",
+            uuid::Uuid::new_v4()
+        ))
+    } else {
+        temp.path().join("managed.sock")
+    };
+    let config = cterm_client::ManagedDaemonConfig::new(
+        socket_path.clone(),
+        ctermd_path(),
+        "managed-integration".to_string(),
+    )
+    .unwrap();
+
+    let connection = cterm_client::DaemonConnection::connect_managed(&config)
+        .await
+        .expect("managed daemon connection failed");
+    assert_eq!(connection.info().socket_path.as_ref(), Some(&socket_path));
+    assert_eq!(connection.info().daemon_identity, "managed-integration");
+    assert_eq!(
+        connection.info().protocol_version,
+        cterm_proto::PROTOCOL_VERSION
+    );
+    assert_eq!(connection.info().daemon_version, env!("CARGO_PKG_VERSION"));
+    connection.shutdown(false).await.unwrap();
 }
 
 impl Drop for CtermdServer {

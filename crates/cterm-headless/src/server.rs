@@ -19,6 +19,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// Unix socket path
     pub socket_path: String,
+    /// Stable logical identity reported to clients during the handshake.
+    pub identity: String,
     /// Default scrollback lines for new sessions
     pub scrollback_lines: usize,
     /// Run in foreground (don't daemonize)
@@ -34,6 +36,7 @@ impl Default for ServerConfig {
             socket_path: crate::cli::default_socket_path()
                 .to_string_lossy()
                 .to_string(),
+            identity: "cterm".to_string(),
             scrollback_lines: 10000,
             foreground: false,
         }
@@ -46,11 +49,16 @@ pub async fn run_server(
     relaunch_state_path: Option<String>,
 ) -> anyhow::Result<()> {
     // Write PID file
-    let pid_path = crate::cli::pid_file_path();
-    let pid = std::process::id();
-    if let Err(e) = std::fs::write(&pid_path, pid.to_string()) {
-        log::warn!("Failed to write PID file {}: {}", pid_path.display(), e);
-    }
+    #[cfg(unix)]
+    let pid_path = {
+        let mut path = std::path::PathBuf::from(&config.socket_path);
+        path.set_extension("pid");
+        let pid = std::process::id();
+        if let Err(e) = std::fs::write(&path, pid.to_string()) {
+            log::warn!("Failed to write PID file {}: {}", path.display(), e);
+        }
+        path
+    };
 
     let session_manager = Arc::new(SessionManager::with_scrollback(config.scrollback_lines));
 
@@ -124,7 +132,11 @@ pub async fn run_server(
     let shutdown_notify = Arc::new(Notify::new());
     let mut service =
         TerminalServiceImpl::new(session_manager.clone(), Arc::clone(&shutdown_notify));
-    service.set_server_config(config.socket_path.clone(), config.scrollback_lines);
+    service.set_server_config(
+        config.socket_path.clone(),
+        config.identity.clone(),
+        config.scrollback_lines,
+    );
 
     // Spawn periodic dead session cleanup task
     {
@@ -154,14 +166,14 @@ pub async fn run_server(
         {
             run_unix_socket_server(config, service, shutdown_notify).await
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            log::warn!("Unix sockets not supported on this platform, falling back to TCP");
-            run_tcp_server(config, service, shutdown_notify).await
+            run_windows_named_pipe_server(config, service, shutdown_notify).await
         }
     };
 
     // Clean up PID file on exit
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&pid_path);
 
     result
@@ -281,6 +293,134 @@ async fn run_unix_socket_server(
     Ok(())
 }
 
+/// Tonic transport wrapper for an accepted Windows named-pipe instance.
+#[cfg(windows)]
+struct NamedPipeIo(tokio::net::windows::named_pipe::NamedPipeServer);
+
+#[cfg(windows)]
+impl tokio::io::AsyncRead for NamedPipeIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.0), cx, buf)
+    }
+}
+
+#[cfg(windows)]
+impl tokio::io::AsyncWrite for NamedPipeIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.0), cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.0), cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.0), cx)
+    }
+}
+
+#[cfg(windows)]
+impl tonic::transport::server::Connected for NamedPipeIo {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+/// Serve gRPC over the exact named-pipe endpoint passed through `--listen`.
+///
+/// A new pipe instance is created before each accept. Marking the first one as
+/// the first pipe instance fails closed when another daemon already owns the
+/// configured identity endpoint.
+#[cfg(windows)]
+async fn run_windows_named_pipe_server(
+    config: ServerConfig,
+    service: TerminalServiceImpl,
+    shutdown_notify: Arc<Notify>,
+) -> anyhow::Result<()> {
+    use futures::stream;
+
+    validate_windows_named_pipe_endpoint(&config.socket_path)?;
+
+    let pipe_name = config.socket_path.clone();
+    log::info!("Starting ctermd on Windows named pipe {}", pipe_name);
+
+    // Acquire the first-instance ownership synchronously before handing an
+    // incoming stream to tonic. Tonic logs incoming errors and keeps polling;
+    // making this acquisition here ensures an already-owned product endpoint
+    // is a fatal startup error and can never fall through to a non-first pipe.
+    let first_server = create_windows_pipe_instance(&pipe_name, true)?;
+
+    let incoming = stream::unfold(Some(first_server), move |pending| {
+        let pipe_name = pipe_name.clone();
+        async move {
+            let accepted = async {
+                let server = match pending {
+                    Some(server) => server,
+                    None => create_windows_pipe_instance(&pipe_name, false)?,
+                };
+                server.connect().await?;
+                Ok::<_, std::io::Error>(NamedPipeIo(server))
+            }
+            .await;
+            Some((accepted, None))
+        }
+    });
+
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => log::info!("Received Ctrl+C"),
+            _ = shutdown_notify.notified() => log::info!("Shutdown requested via RPC"),
+        }
+        log::info!("Shutting down...");
+    };
+
+    Server::builder()
+        .add_service(
+            TerminalServiceServer::new(service).max_encoding_message_size(64 * 1024 * 1024),
+        )
+        .serve_with_incoming_shutdown(incoming, shutdown)
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_named_pipe_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    if !endpoint.starts_with(r"\\.\pipe\") || endpoint.len() == r"\\.\pipe\".len() {
+        return Err(anyhow::anyhow!(
+            "Windows daemon endpoint must be an absolute named pipe (\\\\.\\pipe\\...): {}",
+            endpoint
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_windows_pipe_instance(
+    pipe_name: &str,
+    first_instance: bool,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
+    options
+        .first_pipe_instance(first_instance)
+        .reject_remote_clients(true);
+    options.create(pipe_name)
+}
+
 /// Check if a socket file is stale (no process using it)
 #[cfg(unix)]
 fn is_socket_stale(socket_path: &Path) -> bool {
@@ -313,8 +453,18 @@ mod tests {
         assert_eq!(config.bind_addr, "127.0.0.1");
         assert_eq!(config.port, 50051);
         assert!(config.socket_path.contains("ctermd"));
+        assert_eq!(config.identity, "cterm");
         assert_eq!(config.scrollback_lines, 10000);
         assert!(!config.foreground);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_windows_endpoint_validation_is_fail_closed() {
+        assert!(validate_windows_named_pipe_endpoint(r"\\.\pipe\product-user").is_ok());
+        assert!(validate_windows_named_pipe_endpoint(r"\\.\pipe\").is_err());
+        assert!(validate_windows_named_pipe_endpoint("127.0.0.1:50051").is_err());
+        assert!(validate_windows_named_pipe_endpoint("relative-pipe").is_err());
     }
 
     #[cfg(unix)]

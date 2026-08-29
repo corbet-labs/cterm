@@ -11,7 +11,9 @@ mod socket;
 
 #[cfg(unix)]
 pub use connection::SshTunnelHandle;
-pub use connection::{CreateSessionOpts, DaemonConnection};
+pub use connection::{
+    configure_managed_daemon, CreateSessionOpts, DaemonConnection, ManagedDaemonConfig,
+};
 /// SSH session parameters (re-exported proto type) for [`CreateSessionOpts::ssh`].
 pub use cterm_proto::proto::SshParams;
 pub use error::ClientError;

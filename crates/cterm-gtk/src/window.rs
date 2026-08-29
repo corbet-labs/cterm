@@ -97,7 +97,10 @@ impl CtermWindow {
         let main_box = GtkBox::new(Orientation::Vertical, 0);
 
         // Create menu bar
-        let menu_model = menu::create_menu_model_with_options(config.general.show_debug_menu);
+        let menu_model = menu::create_menu_model_with_options(
+            config.general.show_debug_menu,
+            crate::get_args().updater_enabled(),
+        );
         let menu_bar = PopoverMenuBar::from_model(Some(&menu_model));
         main_box.append(&menu_bar);
 
@@ -206,7 +209,10 @@ impl CtermWindow {
 
         let main_box = GtkBox::new(Orientation::Vertical, 0);
 
-        let menu_model = menu::create_menu_model_with_options(config.general.show_debug_menu);
+        let menu_model = menu::create_menu_model_with_options(
+            config.general.show_debug_menu,
+            crate::get_args().updater_enabled(),
+        );
         let menu_bar = PopoverMenuBar::from_model(Some(&menu_model));
         main_box.append(&menu_bar);
 
@@ -1024,7 +1030,11 @@ impl CtermWindow {
                         log::info!("Configuration saved to disk");
                     }
                     // Rebuild menu bar to reflect debug menu preference
-                    menu::rebuild_menu_bar(&menu_bar, new_config.general.show_debug_menu);
+                    menu::rebuild_menu_bar(
+                        &menu_bar,
+                        new_config.general.show_debug_menu,
+                        crate::get_args().updater_enabled(),
+                    );
                     // Update internal config state
                     *config_for_save.borrow_mut() = new_config;
                 });
@@ -1033,7 +1043,7 @@ impl CtermWindow {
         }
 
         // Check for updates action
-        {
+        if crate::get_args().updater_enabled() {
             let window_clone = window.clone();
             let action = gio::SimpleAction::new("check-updates", None);
             action.connect_activate(move |_, _| {
@@ -1043,7 +1053,7 @@ impl CtermWindow {
         }
 
         // Execute upgrade action (called from update dialog)
-        {
+        if crate::get_args().updater_enabled() {
             let tabs = Rc::clone(&tabs);
             let window_clone = window.clone();
             let notebook_upgrade = notebook.clone();

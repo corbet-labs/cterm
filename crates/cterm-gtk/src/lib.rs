@@ -52,9 +52,24 @@ pub fn run() {
 
     // Parse command-line arguments first (before GTK consumes them)
     let args = Args::parse();
+    if args.managed {
+        let Some(executable) = EXE_PATH.get() else {
+            eprintln!("cterm: managed mode could not resolve the UI executable path");
+            std::process::exit(2);
+        };
+        if let Err(error) = args.initialize_runtime(executable) {
+            eprintln!("cterm: invalid managed runtime: {error}");
+            std::process::exit(2);
+        }
+    }
 
     // Initialize logging with capture for in-app viewing
     cterm_app::log_capture::init();
+    if let Err(error) = args.preflight_managed_daemon() {
+        log::error!("{error}");
+        eprintln!("cterm: {error}");
+        std::process::exit(1);
+    }
 
     // Save the original FD limit before raising it, so child processes can restore it
     #[cfg(unix)]

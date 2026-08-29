@@ -18,7 +18,7 @@ fn menu_item(label: &str, action: &str, accel: Option<&str>) -> gio::MenuItem {
 ///
 /// If `show_debug` is true, includes a Debug submenu in the Help menu
 /// with developer/testing options.
-pub fn create_menu_model_with_options(show_debug: bool) -> gio::Menu {
+pub fn create_menu_model_with_options(show_debug: bool, updates_enabled: bool) -> gio::Menu {
     let menu = gio::Menu::new();
 
     // File menu
@@ -116,7 +116,9 @@ pub fn create_menu_model_with_options(show_debug: bool) -> gio::Menu {
     // Help menu
     let help_menu = gio::Menu::new();
     help_menu.append(Some("Preferences..."), Some("win.preferences"));
-    help_menu.append(Some("Check for Updates..."), Some("win.check-updates"));
+    if updates_enabled {
+        help_menu.append(Some("Check for Updates..."), Some("win.check-updates"));
+    }
     help_menu.append(Some("About"), Some("win.about"));
 
     // Debug submenu (hidden unless Shift is held when opening menu)
@@ -150,7 +152,7 @@ fn create_tools_submenu() -> gio::Menu {
 /// Rebuild the Tools menu in the menu bar (called after preferences save).
 /// Rebuilds the entire menu model and replaces it on the PopoverMenuBar.
 #[allow(dead_code)]
-pub fn rebuild_menu_bar(menu_bar: &gtk4::PopoverMenuBar, show_debug: bool) {
-    let menu = create_menu_model_with_options(show_debug);
+pub fn rebuild_menu_bar(menu_bar: &gtk4::PopoverMenuBar, show_debug: bool, updates_enabled: bool) {
+    let menu = create_menu_model_with_options(show_debug, updates_enabled);
     menu_bar.set_menu_model(Some(&menu));
 }
