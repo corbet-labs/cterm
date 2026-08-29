@@ -11,12 +11,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
   format:
     name: Check formatting
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,7 +34,7 @@ jobs:
     name: Clippy (Linux)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -58,7 +62,7 @@ jobs:
     name: Clippy (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install protobuf
         run: brew install protobuf
@@ -78,7 +82,7 @@ jobs:
     name: Clippy (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install protobuf
         run: choco install protoc -y
@@ -99,7 +103,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [format, lint-linux]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -111,9 +115,8 @@ jobs:
             libcairo2-dev \
             libglib2.0-dev \
             protobuf-compiler \
-            xvfb \
-            xdotool \
-            imagemagick
+            wayland-utils \
+            weston
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -133,30 +136,62 @@ jobs:
       - name: Build cterm for UI tests
         run: cargo build -p cterm
 
-      - name: Run UI automation test
+      - name: Run Wayland startup smoke test
         run: |
-          export DISPLAY=:99
-          Xvfb :99 -screen 0 1280x1024x24 &
-          sleep 2
           OUTPUT_DIR="${{ runner.temp }}/cterm_ui_test"
+          mkdir -p "$OUTPUT_DIR"
           chmod +x scripts/linux_ui_test.sh
-          ./scripts/linux_ui_test.sh target/debug/cterm "$OUTPUT_DIR" || true
+          export XDG_RUNTIME_DIR="${{ runner.temp }}/cterm-xdg-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          unset DISPLAY
+          weston \
+            --backend=headless-backend.so \
+            --renderer=pixman \
+            --socket=cterm-ci \
+            --idle-time=0 \
+            --log="$OUTPUT_DIR/weston.log" &
+          WESTON_PID=$!
+          trap 'kill "$WESTON_PID" 2>/dev/null || true' EXIT
+          export WAYLAND_DISPLAY=cterm-ci
+          export GDK_BACKEND=wayland
+          export GSK_RENDERER=cairo
+          ./scripts/linux_ui_test.sh target/debug/cterm "$OUTPUT_DIR"
         timeout-minutes: 5
 
       - name: Upload UI test artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: linux-ui-test-results
           path: ${{ runner.temp }}/cterm_ui_test/
           if-no-files-found: ignore
 
+  test-freebsd:
+    name: Test core (FreeBSD 14.4)
+    runs-on: ubuntu-24.04
+    needs: format
+    steps:
+      - uses: actions/checkout@v7
+
+      # FreeBSD is a headless/core portability target for now; cterm's Linux
+      # desktop backend intentionally targets Wayland rather than X11.
+      - name: Run tests in FreeBSD VM
+        uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
+        with:
+          release: 14.4
+          usesh: true
+          prepare: pkg install -y rust protobuf
+          run: |
+            cargo test -p cterm-core -p cterm-ui --lib
+            cargo check -p cterm-headless
+
   test-macos:
     name: Test (macOS)
     runs-on: macos-latest
     needs: [format, lint-macos]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install protobuf
         run: brew install protobuf
@@ -183,12 +218,11 @@ jobs:
         run: |
           OUTPUT_DIR="${{ runner.temp }}/cterm_ui_test"
           chmod +x scripts/macos_ui_test.sh
-          ./scripts/macos_ui_test.sh target/debug/cterm "$OUTPUT_DIR" || true
+          ./scripts/macos_ui_test.sh target/debug/cterm "$OUTPUT_DIR"
         timeout-minutes: 5
-        continue-on-error: true
 
       - name: Upload UI test artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: macos-ui-test-results
@@ -200,7 +234,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: test-linux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -264,13 +298,13 @@ jobs:
           cd release && tar -czvf ctermd-linux-x86_64.tar.gz ctermd-linux-x86_64
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cterm-linux-x86_64
           path: release/cterm-linux-x86_64.tar.gz
 
       - name: Upload ctermd artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ctermd-linux-x86_64
           path: release/ctermd-linux-x86_64.tar.gz
@@ -280,7 +314,7 @@ jobs:
     runs-on: ubuntu-22.04-arm
     needs: test-linux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -344,13 +378,13 @@ jobs:
           cd release && tar -czvf ctermd-linux-arm64.tar.gz ctermd-linux-arm64
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cterm-linux-arm64
           path: release/cterm-linux-arm64.tar.gz
 
       - name: Upload ctermd artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ctermd-linux-arm64
           path: release/ctermd-linux-arm64.tar.gz
@@ -360,7 +394,7 @@ jobs:
     runs-on: windows-latest
     needs: [format, lint-windows]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install protobuf
         run: choco install protoc -y
@@ -389,10 +423,9 @@ jobs:
           $OutputDir = "${{ runner.temp }}\cterm_ui_test"
           .\scripts\windows_ui_test.ps1 -CtermPath "target\debug\cterm.exe" -OutputDir $OutputDir
         timeout-minutes: 5
-        continue-on-error: true
 
       - name: Upload UI test artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: windows-ui-test-results
@@ -404,7 +437,7 @@ jobs:
     runs-on: windows-latest
     needs: test-windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install protobuf
         run: choco install protoc -y
@@ -499,19 +532,19 @@ jobs:
           Compress-Archive -Path release/ctermd-windows-x86_64 -DestinationPath release/ctermd-windows-x86_64.zip
 
       - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cterm-windows-installer
           path: release/cterm-windows-x86_64-setup.exe
 
       - name: Upload zip artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cterm-windows-x86_64
           path: release/cterm-windows-x86_64.zip
 
       - name: Upload ctermd zip artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ctermd-windows-x86_64
           path: release/ctermd-windows-x86_64.zip
@@ -521,7 +554,7 @@ jobs:
     runs-on: macos-15-intel
     needs: test-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -543,13 +576,13 @@ jobs:
         run: ls -la target/release/cterm* || true
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cterm-macos-x86_64-binary
           path: target/release/cterm
 
       - name: Upload ctermd binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ctermd-macos-x86_64-binary
           path: target/release/ctermd
@@ -559,7 +592,7 @@ jobs:
     runs-on: macos-latest
     needs: build-macos-intel
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -581,13 +614,13 @@ jobs:
         run: ls -la target/release/cterm* || true
 
       - name: Download Intel binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cterm-macos-x86_64-binary
           path: intel-binary
 
       - name: Download Intel ctermd binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ctermd-macos-x86_64-binary
           path: intel-binary-ctermd
@@ -841,19 +874,19 @@ jobs:
           cd release && tar -czvf ctermd-macos-universal.tar.gz ctermd-macos-universal
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cterm-macos-dmg
           path: release/cterm-macos-universal.dmg
 
       - name: Upload tar.gz artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cterm-macos-universal
           path: release/cterm-macos-universal.tar.gz
 
       - name: Upload ctermd tar.gz artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ctermd-macos-universal
           path: release/ctermd-macos-universal.tar.gz
@@ -867,7 +900,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
