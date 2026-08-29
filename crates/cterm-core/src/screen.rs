@@ -457,12 +457,136 @@ pub struct Screen {
     keyboard_alt_stack: Vec<KeyboardEnhancementFlags>,
     /// DRCS fonts (soft fonts) keyed by designator
     drcs_fonts: HashMap<String, DrcsFont>,
-    /// Total number of lines ever pushed to scrollback (monotonically increasing).
-    /// Used to compute correct absolute line numbers for image pruning.
-    scrollback_total_pushed: usize,
     /// Incremented whenever an application starts (or restarts) a synchronized
     /// update, allowing Terminal to re-arm its fail-safe deadline.
     sync_update_generation: u64,
+}
+
+/// Reflowed physical rows plus a mapping from old cell coordinates to their
+/// new location. The mapping is shared by the cursor, selection, viewport and
+/// image anchors so resize cannot silently detach metadata from its text.
+struct ReflowedRows {
+    rows: Vec<Row>,
+    old_row_origins: Vec<(usize, usize)>,
+    logical_boundaries: Vec<Vec<(usize, usize)>>,
+    new_width: usize,
+}
+
+impl ReflowedRows {
+    fn map_position(&self, row: usize, col: usize) -> (usize, usize) {
+        let Some(&(logical_line, row_offset)) = self
+            .old_row_origins
+            .get(row.min(self.old_row_origins.len().saturating_sub(1)))
+        else {
+            return (0, 0);
+        };
+        let boundaries = &self.logical_boundaries[logical_line];
+        let offset = row_offset.saturating_add(col);
+
+        if let Some(&position) = boundaries.get(offset) {
+            return position;
+        }
+
+        // A cursor or selection may sit in the unoccupied tail of a row. The
+        // tail is not stored as text, so extend from the final mapped boundary.
+        let &(row, col) = boundaries.last().unwrap_or(&(0, 0));
+        let extra = offset.saturating_sub(boundaries.len().saturating_sub(1));
+        let columns = col.saturating_add(extra);
+        (row + columns / self.new_width, columns % self.new_width)
+    }
+}
+
+fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows {
+    let new_width = new_width.max(1);
+    let mut output = Vec::new();
+    let mut old_row_origins = vec![(0, 0); rows.len()];
+    let mut logical_boundaries = Vec::new();
+    let mut group_start = 0;
+
+    while group_start < rows.len() {
+        let logical_line = logical_boundaries.len();
+        let mut group_end = group_start;
+        while group_end + 1 < rows.len() && rows[group_end + 1].wrapped {
+            group_end += 1;
+        }
+
+        let mut cells = Vec::new();
+        for row_index in group_start..=group_end {
+            old_row_origins[row_index] = (logical_line, (row_index - group_start) * old_width);
+            let continues = row_index < group_end;
+            let used = if continues {
+                rows[row_index].len()
+            } else {
+                rows[row_index]
+                    .iter()
+                    .rposition(|cell| !cell.is_empty())
+                    .map_or(0, |index| index + 1)
+            };
+
+            cells.extend(
+                rows[row_index]
+                    .iter()
+                    .take(used)
+                    .filter(|cell| !cell.is_wide_spacer())
+                    .cloned(),
+            );
+        }
+
+        let first_row_index = output.len();
+        let mut row = Row::new(new_width);
+        row.wrapped = rows[group_start].wrapped;
+        let mut col = 0;
+        let mut boundaries = vec![(first_row_index, 0)];
+
+        for mut cell in cells {
+            let cell_width = if cell.is_wide() && new_width > 1 {
+                2
+            } else {
+                1
+            };
+
+            if col > 0 && col + cell_width > new_width || col == new_width {
+                output.push(row);
+                row = Row::new(new_width);
+                row.wrapped = true;
+                col = 0;
+                if let Some(boundary) = boundaries.last_mut() {
+                    *boundary = (output.len(), 0);
+                }
+            }
+
+            cell.attrs.remove(CellAttrs::WIDE_SPACER);
+            row[col] = cell.clone();
+
+            if cell_width == 2 {
+                let mut spacer = cell;
+                spacer.set_char(' ');
+                spacer.attrs.remove(CellAttrs::WIDE);
+                spacer.attrs.insert(CellAttrs::WIDE_SPACER);
+                row[col + 1] = spacer;
+            }
+
+            for step in 1..=cell_width {
+                boundaries.push((output.len(), col + step));
+            }
+            col += cell_width;
+        }
+
+        output.push(row);
+        logical_boundaries.push(boundaries);
+        group_start = group_end + 1;
+    }
+
+    if output.is_empty() {
+        output.push(Row::new(new_width));
+    }
+
+    ReflowedRows {
+        rows: output,
+        old_row_origins,
+        logical_boundaries,
+        new_width,
+    }
 }
 
 impl Screen {
@@ -516,7 +640,6 @@ impl Screen {
             keyboard_main_stack: Vec::new(),
             keyboard_alt_stack: Vec::new(),
             drcs_fonts: HashMap::new(),
-            scrollback_total_pushed: 0,
             sync_update_generation: 0,
         }
     }
@@ -809,6 +932,8 @@ impl Screen {
 
     /// Resize the screen
     pub fn resize(&mut self, width: usize, height: usize) {
+        let width = width.max(1);
+        let height = height.max(1);
         if width == self.width() && height == self.height() {
             return;
         }
@@ -818,10 +943,31 @@ impl Screen {
         let old_scroll_bottom = self.scroll_region.bottom;
         let old_width = self.width();
 
-        self.grid.resize(width, height);
+        if self.modes.alternate_screen {
+            // Alternate-screen applications own their layout and generally
+            // repaint after SIGWINCH. Keep their active coordinates stable,
+            // but reflow the hidden primary buffer immediately so returning
+            // from the application cannot reveal truncated history.
+            let primary = self
+                .alternate_grid
+                .take()
+                .unwrap_or_else(|| Grid::new(old_width, old_height));
+            let alt_grid = std::mem::replace(&mut self.grid, primary);
+            let primary_cursor = self.alt_saved_cursor.take().unwrap_or_default();
+            let alt_cursor = std::mem::replace(&mut self.cursor, primary_cursor);
 
-        if let Some(ref mut alt) = self.alternate_grid {
-            alt.resize(width, height);
+            self.resize_primary_grid(old_width, width, height);
+
+            let resized_primary = std::mem::replace(&mut self.grid, alt_grid);
+            let resized_primary_cursor = std::mem::replace(&mut self.cursor, alt_cursor);
+            self.alternate_grid = Some(resized_primary);
+            self.alt_saved_cursor = Some(resized_primary_cursor);
+
+            self.grid.resize(width, height);
+            self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
+            self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
+        } else {
+            self.resize_primary_grid(old_width, width, height);
         }
 
         // Update scroll region
@@ -833,10 +979,6 @@ impl Screen {
         }
         self.scroll_region.top = self.scroll_region.top.min(height.saturating_sub(1));
 
-        // Clamp cursor position
-        self.cursor.col = self.cursor.col.min(width.saturating_sub(1));
-        self.cursor.row = self.cursor.row.min(height.saturating_sub(1));
-
         // Resize tab stops array to match new width
         self.tab_stops.resize(width, false);
         // Set default tab stops (every 8 columns) for new columns
@@ -845,6 +987,100 @@ impl Screen {
         }
 
         self.dirty = true;
+    }
+
+    fn resize_primary_grid(&mut self, old_width: usize, width: usize, height: usize) {
+        let old_scrollback_len = self.scrollback.len();
+        let old_scroll_offset = self.scroll_offset;
+        let old_visible_top = old_scrollback_len.saturating_sub(old_scroll_offset);
+        let old_rows: Vec<Row> = self
+            .scrollback
+            .iter()
+            .chain(self.grid.iter())
+            .cloned()
+            .collect();
+        let mut reflowed = reflow_rows(&old_rows, old_width, width);
+
+        let old_cursor_line = old_scrollback_len + self.cursor.row;
+        let (cursor_line, cursor_col) = reflowed.map_position(old_cursor_line, self.cursor.col);
+        let viewport_start = cursor_line.saturating_sub(height.saturating_sub(1));
+        let viewport_end = viewport_start + height;
+        if reflowed.rows.len() < viewport_end {
+            reflowed.rows.resize_with(viewport_end, || Row::new(width));
+        }
+
+        let front_drop = viewport_start.saturating_sub(self.config.scrollback_lines);
+        let new_scrollback_len = viewport_start - front_drop;
+
+        let remap_point = |point: SelectionPoint| -> Option<SelectionPoint> {
+            let source_col = if point.col == COL_END_OF_ROW {
+                old_width.saturating_sub(1)
+            } else {
+                point.col.min(old_width)
+            };
+            let (line, col) = reflowed.map_position(point.line, source_col);
+            if line < front_drop || line >= viewport_end {
+                return None;
+            }
+            Some(SelectionPoint::new(
+                line - front_drop,
+                if point.col == COL_END_OF_ROW {
+                    COL_END_OF_ROW
+                } else {
+                    col.min(width.saturating_sub(1))
+                },
+            ))
+        };
+
+        self.selection = self.selection.take().and_then(|selection| {
+            Some(Selection {
+                anchor: remap_point(selection.anchor)?,
+                end: remap_point(selection.end)?,
+                mode: selection.mode,
+                anchor_end: selection.anchor_end.and_then(remap_point),
+            })
+        });
+
+        self.images.retain(|_, image| {
+            let (line, col) = reflowed.map_position(image.line, image.col);
+            if line < front_drop || line >= viewport_end {
+                return false;
+            }
+            image.line = line - front_drop;
+            image.col = col.min(width.saturating_sub(1));
+            true
+        });
+
+        if let Some(saved) = self.saved_cursor.as_mut() {
+            let (line, col) = reflowed.map_position(old_scrollback_len + saved.row, saved.col);
+            saved.row = line.saturating_sub(viewport_start).min(height - 1);
+            saved.col = col.min(width - 1);
+        }
+
+        let mapped_visible_top = reflowed.map_position(old_visible_top, 0).0;
+        self.scroll_offset = if old_scroll_offset == 0 {
+            0
+        } else {
+            let relative_top = mapped_visible_top.saturating_sub(front_drop);
+            new_scrollback_len.saturating_sub(relative_top.min(new_scrollback_len))
+        };
+
+        self.scrollback = reflowed.rows[front_drop..viewport_start]
+            .iter()
+            .cloned()
+            .collect();
+        let mut grid = Grid::new(width, height);
+        for (index, row) in reflowed.rows[viewport_start..viewport_end]
+            .iter()
+            .cloned()
+            .enumerate()
+        {
+            grid[index] = row;
+        }
+        self.grid = grid;
+
+        self.cursor.row = cursor_line.saturating_sub(viewport_start).min(height - 1);
+        self.cursor.col = cursor_col.min(width - 1);
     }
 
     /// Get a cell at the given position
@@ -1074,8 +1310,11 @@ impl Screen {
                     self.scrollback.pop_front();
                     lines_removed += 1;
                 }
-                self.scrollback.push_back(row);
-                self.scrollback_total_pushed += 1;
+                if self.config.scrollback_lines > 0 {
+                    self.scrollback.push_back(row);
+                } else {
+                    lines_removed += 1;
+                }
             }
 
             // If user is viewing scrollback (not at bottom), adjust scroll_offset
@@ -1108,10 +1347,19 @@ impl Screen {
                         }
                     }
                 }
-            }
 
-            // Prune images that have scrolled off the top of the scrollback buffer
-            self.prune_old_images();
+                // Image anchors use the same buffer-relative line coordinates
+                // as selections. Drop images whose anchor was evicted and
+                // shift the surviving anchors with the text.
+                self.images.retain(|_, image| {
+                    if image.line < lines_removed {
+                        false
+                    } else {
+                        image.line -= lines_removed;
+                        true
+                    }
+                });
+            }
         }
 
         self.dirty = true;
@@ -1539,9 +1787,6 @@ impl Screen {
 
         self.images.insert(id, image);
         self.dirty = true;
-
-        // Prune old images that have scrolled too far
-        self.prune_old_images();
     }
 
     /// Clear grid cells that will be covered by an image
@@ -1661,23 +1906,6 @@ impl Screen {
     /// Get an image by its ID
     pub fn image_by_id(&self, id: u64) -> Option<&TerminalImage> {
         self.images.get(&id)
-    }
-
-    /// Prune images that have scrolled off the top of the scrollback buffer
-    fn prune_old_images(&mut self) {
-        if self.images.is_empty() {
-            return;
-        }
-
-        // Image line numbers are absolute (scrollback.len() + row at creation time),
-        // so they grow monotonically. When scrollback is at capacity, old lines are
-        // discarded from the front. The minimum valid line is the total lines ever
-        // pushed minus the max scrollback capacity.
-        let min_valid_line = self
-            .scrollback_total_pushed
-            .saturating_sub(self.config.scrollback_lines);
-
-        self.images.retain(|_, img| img.line >= min_valid_line);
     }
 
     /// Clear all images (called on screen clear)
@@ -2162,10 +2390,13 @@ impl Screen {
                 }
             }
 
-            // Add newline between lines
-            // For block selection: always add newlines between lines
-            // For normal selection: skip newline after wrapped lines
-            if line_idx < end_line && (is_block || !row.wrapped) {
+            // A row marks itself as wrapped when it continues the preceding
+            // row, so the following row decides whether this boundary emits
+            // a newline. Block selection always preserves physical rows.
+            let next_is_wrapped = self
+                .get_row_by_absolute_line(line_idx + 1)
+                .is_some_and(|next| next.wrapped);
+            if line_idx < end_line && (is_block || !next_is_wrapped) {
                 result.push('\n');
             }
         }
@@ -2361,8 +2592,10 @@ impl Screen {
                 last_attrs = None;
             }
 
-            // Add newline between lines
-            if line_idx < end_line && (is_block || !row.wrapped) {
+            let next_is_wrapped = self
+                .get_row_by_absolute_line(line_idx + 1)
+                .is_some_and(|next| next.wrapped);
+            if line_idx < end_line && (is_block || !next_is_wrapped) {
                 result.push('\n');
             }
         }
@@ -2562,6 +2795,139 @@ mod tests {
         assert!(screen.grid().row(1).unwrap().wrapped);
         assert_eq!(screen.cursor.row, 1);
         assert_eq!(screen.cursor.col, 2);
+    }
+
+    #[test]
+    fn resize_reflows_wrapped_graphemes_and_cursor() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abcdefgh".chars() {
+            screen.put_char(c);
+        }
+
+        screen.resize(3, 3);
+        assert_eq!(screen.grid()[0].text(), "abc");
+        assert_eq!(screen.grid()[1].text(), "def");
+        assert_eq!(screen.grid()[2].text(), "gh");
+        assert!(!screen.grid()[0].wrapped);
+        assert!(screen.grid()[1].wrapped);
+        assert!(screen.grid()[2].wrapped);
+        assert_eq!((screen.cursor.row, screen.cursor.col), (2, 2));
+
+        screen.resize(6, 2);
+        assert_eq!(screen.grid()[0].text(), "abcdef");
+        assert_eq!(screen.grid()[1].text(), "gh");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 2));
+    }
+
+    #[test]
+    fn resize_moves_only_required_top_rows_into_scrollback() {
+        let mut screen = Screen::new(4, 4, ScreenConfig::default());
+        for line in ['1', '2', '3', '4'] {
+            screen.put_char(line);
+            if line != '4' {
+                screen.carriage_return();
+                screen.line_feed();
+            }
+        }
+
+        screen.resize(4, 2);
+        assert_eq!(screen.scrollback().len(), 2);
+        assert_eq!(screen.scrollback()[0].text(), "1");
+        assert_eq!(screen.scrollback()[1].text(), "2");
+        assert_eq!(screen.grid()[0].text(), "3");
+        assert_eq!(screen.grid()[1].text(), "4");
+        assert_eq!(screen.cursor.row, 1);
+
+        screen.resize(4, 4);
+        assert!(screen.scrollback().is_empty());
+        assert_eq!(screen.grid()[0].text(), "1");
+        assert_eq!(screen.grid()[3].text(), "4");
+        assert_eq!(screen.cursor.row, 3);
+    }
+
+    #[test]
+    fn resize_never_splits_wide_graphemes() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "ab界".chars() {
+            screen.put_char(c);
+        }
+
+        screen.resize(3, 2);
+        assert_eq!(screen.grid()[0].text(), "ab");
+        assert_eq!(screen.grid()[1].text(), "界");
+        assert!(screen.grid()[1][0].is_wide());
+        assert!(screen.grid()[1][1].is_wide_spacer());
+    }
+
+    #[test]
+    fn resize_keeps_selection_attached_to_reflowed_text() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abcdefgh".chars() {
+            screen.put_char(c);
+        }
+        screen.start_selection(0, 1, SelectionMode::Char);
+        screen.extend_selection(1, 2);
+        assert_eq!(screen.get_selected_text().as_deref(), Some("bcdefg"));
+
+        screen.resize(3, 3);
+        assert_eq!(screen.get_selected_text().as_deref(), Some("bcdefg"));
+    }
+
+    #[test]
+    fn resize_reflows_hidden_primary_screen() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abcdefgh".chars() {
+            screen.put_char(c);
+        }
+        screen.enter_alternate_screen();
+
+        screen.resize(3, 3);
+        screen.exit_alternate_screen();
+
+        assert_eq!(screen.grid()[0].text(), "abc");
+        assert_eq!(screen.grid()[1].text(), "def");
+        assert_eq!(screen.grid()[2].text(), "gh");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (2, 2));
+    }
+
+    #[test]
+    fn resize_moves_image_anchor_with_reflowed_cells() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abcde".chars() {
+            screen.put_char(c);
+        }
+        screen.add_image_with_size(
+            0,
+            1,
+            1,
+            1,
+            SixelImage {
+                data: vec![255, 0, 0, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+
+        screen.resize(3, 3);
+
+        let image = screen.images()[0];
+        assert_eq!((image.line, image.col), (1, 1));
+        assert_eq!(screen.image_visible_row(image), Some(1));
+    }
+
+    #[test]
+    fn zero_scrollback_configuration_retains_no_rows() {
+        let mut screen = Screen::new(
+            4,
+            1,
+            ScreenConfig {
+                scrollback_lines: 0,
+            },
+        );
+        screen.put_char('a');
+        screen.line_feed();
+
+        assert!(screen.scrollback().is_empty());
     }
 
     #[test]

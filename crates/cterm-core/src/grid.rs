@@ -57,12 +57,12 @@ impl Row {
     }
 
     /// Iterator over cells
-    pub fn iter(&self) -> impl Iterator<Item = &Cell> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Cell> + ExactSizeIterator {
         self.cells.iter()
     }
 
     /// Mutable iterator over cells
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Cell> {
+    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Cell> + ExactSizeIterator {
         self.cells.iter_mut()
     }
 
