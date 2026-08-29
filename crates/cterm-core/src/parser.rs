@@ -914,12 +914,28 @@ impl vte::Perform for ScreenPerformer<'_> {
                     self.handle_dec_mode(param, set);
                 }
             }
+            // Request DEC private mode status (DECRQM).  Capability probing is
+            // common in modern TUIs, so distinguish unsupported modes from
+            // modes which are currently reset.
+            ('p', [b'?', b'$']) => {
+                let mode = first_param(&params_vec, 0);
+                let status = self.dec_private_mode_status(mode);
+                self.screen
+                    .queue_response(format!("\x1b[?{mode};{status}$y").into_bytes());
+            }
             // ANSI modes
             ('h', []) | ('l', []) => {
                 let set = action == 'h';
                 for &param in &params_vec {
                     self.handle_ansi_mode(param, set);
                 }
+            }
+            // Request ECMA-48/ANSI mode status (DECRQM).
+            ('p', [b'$']) => {
+                let mode = first_param(&params_vec, 0);
+                let status = self.ansi_mode_status(mode);
+                self.screen
+                    .queue_response(format!("\x1b[{mode};{status}$y").into_bytes());
             }
             // Soft reset (DECSTR)
             ('p', [b'!']) => {
@@ -1450,6 +1466,9 @@ impl ScreenPerformer<'_> {
             }
             // DECTCEM - Show Cursor
             25 => self.screen.modes.show_cursor = set,
+            // DECNKM - Numeric Keypad Mode.  This is equivalent to DECKPAM /
+            // DECKPNM, but expressed as a DEC private mode.
+            66 => self.screen.modes.application_keypad = set,
             // DECSDM - Sixel Display Mode (mode 80)
             // Note: The VT340 manual was wrong - 'set' actually DISABLES scrolling
             // When set (h): sixel scrolling OFF (image at top-left, no scroll)
@@ -1487,8 +1506,8 @@ impl ScreenPerformer<'_> {
             1006 => self.screen.modes.sgr_mouse = set,
             // Alternate Scroll Mode: wheel -> cursor keys on the alternate screen
             1007 => self.screen.modes.alternate_scroll = set,
-            // Alternate Screen Buffer
-            1047 => {
+            // Alternate Screen Buffer.  Mode 47 is the older xterm spelling.
+            47 | 1047 => {
                 if set {
                     self.screen.enter_alternate_screen();
                 } else {
@@ -1519,6 +1538,55 @@ impl ScreenPerformer<'_> {
             _ => {
                 log::trace!("Unknown DEC mode: {} = {}", mode, set);
             }
+        }
+    }
+
+    /// Return a DECRPM status value for a DEC private mode.
+    ///
+    /// 0 = unrecognized, 1 = set, 2 = reset, 3 = permanently set,
+    /// 4 = permanently reset.
+    fn dec_private_mode_status(&self, mode: usize) -> u8 {
+        let enabled = match mode {
+            1 => self.screen.modes.application_cursor,
+            6 => self.screen.modes.origin_mode,
+            7 => self.screen.modes.auto_wrap,
+            9 => self.screen.modes.mouse_mode == MouseMode::X10,
+            25 => self.screen.modes.show_cursor,
+            47 | 1047 | 1049 => self.screen.modes.alternate_screen,
+            66 => self.screen.modes.application_keypad,
+            // DECSDM is set when sixel scrolling is disabled.
+            80 => !self.screen.modes.sixel_scrolling,
+            1000 => self.screen.modes.mouse_mode == MouseMode::Normal,
+            1002 => self.screen.modes.mouse_mode == MouseMode::ButtonEvent,
+            1003 => self.screen.modes.mouse_mode == MouseMode::AnyEvent,
+            1004 => self.screen.modes.focus_events,
+            1006 => self.screen.modes.sgr_mouse,
+            1007 => self.screen.modes.alternate_scroll,
+            2004 => self.screen.modes.bracketed_paste,
+            // Recognized legacy encodings which cterm deliberately never uses.
+            67 | 1001 | 1005 => return 4,
+            _ => return 0,
+        };
+
+        if enabled {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Return a DECRPM status value for an ECMA-48/ANSI mode.
+    fn ansi_mode_status(&self, mode: usize) -> u8 {
+        let enabled = match mode {
+            4 => self.screen.modes.insert_mode,
+            20 => self.screen.modes.line_feed_mode,
+            _ => return 0,
+        };
+
+        if enabled {
+            1
+        } else {
+            2
         }
     }
 
@@ -1739,5 +1807,53 @@ mod tests {
         assert!(!screen.modes.alternate_scroll);
         parser.parse(&mut screen, b"\x1b[?1007h"); // re-enable
         assert!(screen.modes.alternate_scroll);
+    }
+
+    #[test]
+    fn test_dec_private_mode_queries_track_state() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?7$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?7;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?7l\x1b[?7$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?7;2$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?1005$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?1005;4$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?2026$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?2026;0$y"]);
+    }
+
+    #[test]
+    fn test_ansi_mode_queries_track_state() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[4$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[4;2$y"]);
+
+        parser.parse(&mut screen, b"\x1b[4h\x1b[4$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[4;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[9999$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[9999;0$y"]);
+    }
+
+    #[test]
+    fn test_legacy_alternate_screen_and_numeric_keypad_modes() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?47h\x1b[?47$p");
+        assert!(screen.modes.alternate_screen);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?47;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?47l\x1b[?66h\x1b[?66$p");
+        assert!(!screen.modes.alternate_screen);
+        assert!(screen.modes.application_keypad);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?66;1$y"]);
     }
 }
