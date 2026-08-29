@@ -565,6 +565,7 @@ message TerminalModes {
   // Rendering and cursor-wrap modes needed by reconnecting clients.
   bool reverse_video = 9;
   bool reverse_wrap = 10;
+  uint32 modify_other_keys = 11;
 }
 
 message GetCellRequest {

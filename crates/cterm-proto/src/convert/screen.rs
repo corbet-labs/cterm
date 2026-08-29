@@ -287,6 +287,7 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
         keyboard_enhancement_flags: u32::from(screen.keyboard_enhancement_flags().bits()),
         reverse_video: screen.modes.reverse_video,
         reverse_wrap: screen.modes.reverse_wrap,
+        modify_other_keys: u32::from(screen.modes.modify_other_keys),
     }
 }
 
@@ -380,6 +381,9 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.modes.charset_g1_active = modes.charset_g1_active;
         screen.modes.reverse_video = modes.reverse_video;
         screen.modes.reverse_wrap = modes.reverse_wrap;
+        screen.modes.modify_other_keys = u8::try_from(modes.modify_other_keys)
+            .unwrap_or(1)
+            .clamp(1, 2);
         screen.set_keyboard_enhancement_flags(
             cterm_core::KeyboardEnhancementFlags::from_bits_retain(
                 modes.keyboard_enhancement_flags as u8,
@@ -477,6 +481,7 @@ mod tests {
         source_cell.hyperlink = Some(expected_link.clone());
         source.screen_mut().modes.reverse_video = true;
         source.screen_mut().modes.reverse_wrap = false;
+        source.screen_mut().modes.modify_other_keys = 2;
 
         let snapshot = screen_to_proto(source.screen(), true);
         let mut restored = Terminal::new(1, 1, ScreenConfig::default());
@@ -488,6 +493,7 @@ mod tests {
         assert_eq!(restored_cell.hyperlink, Some(expected_link));
         assert!(restored.screen().modes.reverse_video);
         assert!(!restored.screen().modes.reverse_wrap);
+        assert_eq!(restored.screen().modes.modify_other_keys, 2);
     }
 
     #[test]

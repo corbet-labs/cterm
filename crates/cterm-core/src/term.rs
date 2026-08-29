@@ -471,6 +471,10 @@ impl Terminal {
                     Some(csi_u_key(c as u32, modifiers, kind, report_events))
                 } else if kind == KeyEventKind::Release {
                     None
+                } else if let Some(sequence) =
+                    modify_other_key(c, modifiers, self.screen.modes.modify_other_keys)
+                {
+                    Some(sequence)
                 } else {
                     self.handle_legacy_key(key, modifiers)
                 }
@@ -617,17 +621,7 @@ impl Terminal {
             Key::Char(c) => {
                 if modifiers.contains(Modifiers::CTRL) {
                     // Control characters
-                    let ctrl_char = match c.to_ascii_lowercase() {
-                        'a'..='z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
-                        '[' => Some(0x1b),
-                        '\\' => Some(0x1c),
-                        ']' => Some(0x1d),
-                        '^' => Some(0x1e),
-                        '_' => Some(0x1f),
-                        _ => None,
-                    };
-
-                    ctrl_char.map(|b| vec![b])
+                    legacy_control_char(c).map(|byte| vec![byte])
                 } else if modifiers.contains(Modifiers::ALT) {
                     // Alt + char = Escape + char
                     let mut buf = String::from('\x1b');
@@ -747,6 +741,39 @@ fn csi_u_key(
         format!("\x1b[{codepoint};{modifier}:{}u", kind.protocol_value()).into_bytes()
     } else {
         format!("\x1b[{codepoint};{modifier}u").into_bytes()
+    }
+}
+
+/// Encode xterm's unambiguous modified-character form. Level 1 preserves
+/// well-known control bytes and only encodes Ctrl combinations which would
+/// otherwise disappear; level 2 also encodes Ctrl/Alt and shifted ASCII
+/// letters, matching foot's behavior.
+fn modify_other_key(c: char, modifiers: Modifiers, level: u8) -> Option<Vec<u8>> {
+    if level == 0 || modifiers.contains(Modifiers::SUPER) {
+        return None;
+    }
+
+    let ctrl = modifiers.contains(Modifiers::CTRL);
+    let alt = modifiers.contains(Modifiers::ALT);
+    let shifted_ascii_letter = modifiers.contains(Modifiers::SHIFT) && c.is_ascii_uppercase();
+    let encode = if level >= 2 {
+        ctrl || alt || shifted_ascii_letter
+    } else {
+        ctrl && legacy_control_char(c).is_none()
+    };
+
+    encode.then(|| format!("\x1b[27;{};{}~", modifier_param(modifiers), c as u32).into_bytes())
+}
+
+fn legacy_control_char(c: char) -> Option<u8> {
+    match c.to_ascii_lowercase() {
+        'a'..='z' => Some(c.to_ascii_lowercase() as u8 - b'a' + 1),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        _ => None,
     }
 }
 
@@ -1093,6 +1120,38 @@ mod tests {
         assert_eq!(
             term.handle_key(Key::NumpadEnter, Modifiers::SHIFT | Modifiers::ALT),
             Some(b"\x1bO4M".to_vec())
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_matches_foot_levels() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        assert_eq!(
+            term.handle_key(Key::Char('i'), Modifiers::CTRL),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            term.handle_key(Key::Char('1'), Modifiers::CTRL),
+            Some(b"\x1b[27;5;49~".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::Char('x'), Modifiers::ALT),
+            Some(b"\x1bx".to_vec())
+        );
+
+        term.process_mirror(b"\x1b[>4;2m");
+        assert_eq!(
+            term.handle_key(Key::Char('i'), Modifiers::CTRL),
+            Some(b"\x1b[27;5;105~".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::Char('x'), Modifiers::ALT),
+            Some(b"\x1b[27;3;120~".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::Char('A'), Modifiers::SHIFT),
+            Some(b"\x1b[27;2;65~".to_vec())
         );
     }
 

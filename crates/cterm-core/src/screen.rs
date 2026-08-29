@@ -66,6 +66,10 @@ const fn default_enabled() -> bool {
     true
 }
 
+const fn default_modify_other_keys() -> u8 {
+    1
+}
+
 /// Terminal modes that affect behavior
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalModes {
@@ -100,6 +104,9 @@ pub struct TerminalModes {
     pub alternate_scroll: bool,
     /// Bracketed paste mode
     pub bracketed_paste: bool,
+    /// xterm modifyOtherKeys level. foot supports level 1 (default) and 2.
+    #[serde(default = "default_modify_other_keys")]
+    pub modify_other_keys: u8,
     /// Application synchronized updates (DEC private mode 2026)
     #[serde(default)]
     pub application_sync_updates: bool,
@@ -465,6 +472,7 @@ impl Screen {
             show_cursor: true,
             sixel_scrolling: true,  // Sixel scrolling enabled by default
             alternate_scroll: true, // Alternate-screen wheel-to-arrows enabled by default
+            modify_other_keys: 1,
             ..Default::default()
         };
 
@@ -1250,6 +1258,7 @@ impl Screen {
             show_cursor: true,
             sixel_scrolling: true,
             alternate_scroll: true,
+            modify_other_keys: 1,
             ..Default::default()
         };
         self.title.clear();

@@ -230,6 +230,8 @@ impl TerminalWidget {
         screen.style = cterm_core::cell::CellStyle::default();
         screen.modes = cterm_core::screen::TerminalModes {
             auto_wrap: true,
+            reverse_wrap: true,
+            modify_other_keys: 1,
             show_cursor: true,
             ..Default::default()
         };

@@ -898,6 +898,31 @@ impl vte::Perform for ScreenPerformer<'_> {
             ('m', []) => {
                 self.handle_sgr(&params_vec);
             }
+            // Set xterm modifyOtherKeys. foot treats every value except 2 as
+            // its backwards-compatible level 1.
+            ('m', [b'>']) => {
+                if first_param(&params_vec, 0) == 4 {
+                    self.screen.modes.modify_other_keys = if second_param(&params_vec, 1) == 2 {
+                        2
+                    } else {
+                        1
+                    };
+                }
+            }
+            // Query xterm keyboard modifier resources (XTQMODKEYS).
+            ('m', [b'?']) => {
+                if first_param(&params_vec, 0) == 4 {
+                    let level = self.screen.modes.modify_other_keys;
+                    self.screen
+                        .queue_response(format!("\x1b[>4;{level}m").into_bytes());
+                }
+            }
+            // Reset xterm keyboard modifier resource to foot's level 1.
+            ('n', [b'>']) => {
+                if first_param(&params_vec, 2) == 4 {
+                    self.screen.modes.modify_other_keys = 1;
+                }
+            }
             // Device Status Report (DSR)
             ('n', []) => {
                 let mode = first_param(&params_vec, 0);
@@ -2060,6 +2085,23 @@ mod tests {
                 b"\x1b[8;24;80t".to_vec(),
             ]
         );
+    }
+
+    #[test]
+    fn test_modify_other_keys_set_query_and_reset() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?4m");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>4;1m"]);
+
+        parser.parse(&mut screen, b"\x1b[>4;2m\x1b[?4m");
+        assert_eq!(screen.modes.modify_other_keys, 2);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>4;2m"]);
+
+        parser.parse(&mut screen, b"\x1b[>4n\x1b[?4m");
+        assert_eq!(screen.modes.modify_other_keys, 1);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>4;1m"]);
     }
 
     #[test]
