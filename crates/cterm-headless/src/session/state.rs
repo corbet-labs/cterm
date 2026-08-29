@@ -9,7 +9,7 @@ use cterm_core::Pty;
 use cterm_core::{PtyConfig, PtySize, Terminal};
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 
@@ -80,6 +80,10 @@ pub struct SessionState {
     /// under the terminal lock. Initialized lazily in `start_reader`, once the PTY
     /// exists (which for SSH sessions is only after the connection is established).
     pty_writer: OnceLock<PtyWriter>,
+
+    /// Fast-path flag used by the synchronized-update watchdog so idle
+    /// sessions do not require taking the terminal lock.
+    sync_update_active: AtomicBool,
 }
 
 impl SessionState {
@@ -130,6 +134,7 @@ impl SessionState {
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
             pty_writer: OnceLock::new(),
+            sync_update_active: AtomicBool::new(false),
         });
 
         Ok(state)
@@ -170,6 +175,7 @@ impl SessionState {
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
             pty_writer: OnceLock::new(),
+            sync_update_active: AtomicBool::new(false),
         })
     }
 
@@ -360,6 +366,7 @@ impl SessionState {
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
             pty_writer: OnceLock::new(),
+            sync_update_active: AtomicBool::new(false),
         });
 
         Ok(state)
@@ -377,6 +384,30 @@ impl SessionState {
             }
 
             let state = Arc::clone(self);
+            let sync_state = Arc::downgrade(self);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(16));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let Some(state) = sync_state.upgrade() else {
+                        break;
+                    };
+                    if !state.sync_update_active.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let mut term = state.terminal.write();
+                    let expired = term.expire_synchronized_update();
+                    state.sync_update_active.store(
+                        term.synchronized_update_deadline().is_some(),
+                        Ordering::Relaxed,
+                    );
+                    drop(term);
+                    if expired {
+                        state.broadcast_event(TerminalEvent::ContentChanged);
+                    }
+                }
+            });
             // Spawn the reader task - it will run until the PTY closes
             tokio::spawn(async move {
                 let pty_reader = PtyReader::new(reader);
@@ -559,7 +590,12 @@ impl SessionState {
     pub fn process_output(&self, data: &[u8]) -> Vec<TerminalEvent> {
         let (events, responses) = {
             let mut term = self.terminal.write();
-            term.process_collecting(data)
+            let (events, responses) = term.process_collecting(data);
+            self.sync_update_active.store(
+                term.synchronized_update_deadline().is_some(),
+                Ordering::Relaxed,
+            );
+            (events, responses)
         }; // terminal lock released here
 
         if !responses.is_empty() {

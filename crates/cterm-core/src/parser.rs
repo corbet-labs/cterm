@@ -430,6 +430,13 @@ impl vte::Perform for ScreenPerformer<'_> {
                     start_row: self.screen.cursor.row,
                 };
             }
+            // Legacy application synchronized-update protocol.  Mode 2026 is
+            // preferred, but foot supports this spelling for compatibility.
+            's' if intermediates == b"=" => match params_vec.first().copied() {
+                Some(1) => self.screen.set_application_sync_updates(true),
+                Some(2) => self.screen.set_application_sync_updates(false),
+                _ => {}
+            },
             // DECDLD (soft font download): DCS Pfn;Pcn;Pe;Pcmw;Pss;Pt;Pcmh;Pcss {
             '{' if intermediates.is_empty() => {
                 log::debug!("Starting DECDLD sequence, params: {:?}", params_vec);
@@ -1540,6 +1547,8 @@ impl ScreenPerformer<'_> {
             }
             // Bracketed Paste Mode
             2004 => self.screen.modes.bracketed_paste = set,
+            // Application synchronized updates
+            2026 => self.screen.set_application_sync_updates(set),
             // xterm Sixel Cursor Right of Graphics
             8452 => self.screen.modes.sixel_cursor_right = set,
             _ => {
@@ -1570,6 +1579,7 @@ impl ScreenPerformer<'_> {
             1006 => self.screen.modes.sgr_mouse,
             1007 => self.screen.modes.alternate_scroll,
             2004 => self.screen.modes.bracketed_paste,
+            2026 => self.screen.modes.application_sync_updates,
             8452 => self.screen.modes.sixel_cursor_right,
             // Recognized legacy encodings which cterm deliberately never uses.
             67 | 1001 | 1005 => return 4,
@@ -1832,7 +1842,7 @@ mod tests {
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?1005;4$y"]);
 
         parser.parse(&mut screen, b"\x1b[?2026$p");
-        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?2026;0$y"]);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?2026;2$y"]);
     }
 
     #[test]

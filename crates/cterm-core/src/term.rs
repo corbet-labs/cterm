@@ -6,6 +6,9 @@ use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
 use crate::screen::{ClipboardOperation, Screen, ScreenConfig, SearchResult};
 use crate::{KeyEventKind, KeyboardEnhancementFlags};
+use std::time::{Duration, Instant};
+
+const APPLICATION_SYNC_UPDATE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Events emitted by the terminal
 #[derive(Debug, Clone)]
@@ -41,6 +44,8 @@ pub struct Terminal {
     pty: Option<Pty>,
     write_fn: Option<WriteFn>,
     last_title: String,
+    synchronized_update_deadline: Option<Instant>,
+    content_change_pending: bool,
 }
 
 impl Terminal {
@@ -52,6 +57,8 @@ impl Terminal {
             pty: None,
             write_fn: None,
             last_title: String::new(),
+            synchronized_update_deadline: None,
+            content_change_pending: false,
         }
     }
 
@@ -81,6 +88,8 @@ impl Terminal {
             pty: Some(pty),
             write_fn: None,
             last_title: String::new(),
+            synchronized_update_deadline: None,
+            content_change_pending: false,
         })
     }
 
@@ -154,7 +163,19 @@ impl Terminal {
     pub fn process_collecting(&mut self, data: &[u8]) -> (Vec<TerminalEvent>, Vec<Vec<u8>>) {
         let mut events = Vec::new();
 
+        let sync_generation = self.screen.sync_update_generation();
         self.parser.parse(&mut self.screen, data);
+
+        if self.screen.modes.application_sync_updates {
+            if self.screen.sync_update_generation() != sync_generation
+                || self.synchronized_update_deadline.is_none()
+            {
+                self.synchronized_update_deadline =
+                    Some(Instant::now() + APPLICATION_SYNC_UPDATE_TIMEOUT);
+            }
+        } else {
+            self.synchronized_update_deadline = None;
+        }
 
         // Collect any pending responses for the caller to write back to the PTY
         let responses = if self.screen.has_pending_responses() {
@@ -182,12 +203,51 @@ impl Terminal {
             events.push(TerminalEvent::TitleChanged(self.last_title.clone()));
         }
 
-        // Always emit content changed if there was data
+        // Coalesce rendering while an application synchronized update is in
+        // progress. Other events and protocol replies are never delayed.
         if !data.is_empty() {
+            self.content_change_pending = true;
+        }
+        let content_changed = if self.screen.modes.application_sync_updates {
+            self.expire_synchronized_update_at(Instant::now())
+        } else {
+            std::mem::take(&mut self.content_change_pending)
+        };
+        if content_changed {
             events.push(TerminalEvent::ContentChanged);
         }
 
         (events, responses)
+    }
+
+    /// Deadline for the active application synchronized update, if any.
+    /// Frontends use this to drive the fail-safe even when PTY output stops.
+    pub fn synchronized_update_deadline(&self) -> Option<Instant> {
+        self.screen
+            .modes
+            .application_sync_updates
+            .then_some(self.synchronized_update_deadline)
+            .flatten()
+    }
+
+    /// End an application synchronized update once its one-second fail-safe
+    /// expires. Returns true when deferred screen damage should be rendered.
+    pub fn expire_synchronized_update(&mut self) -> bool {
+        self.expire_synchronized_update_at(Instant::now())
+    }
+
+    fn expire_synchronized_update_at(&mut self, now: Instant) -> bool {
+        if !self.screen.modes.application_sync_updates
+            || !self
+                .synchronized_update_deadline
+                .is_some_and(|deadline| now >= deadline)
+        {
+            return false;
+        }
+
+        self.screen.set_application_sync_updates(false);
+        self.synchronized_update_deadline = None;
+        std::mem::take(&mut self.content_change_pending)
     }
 
     /// Write input to the PTY (keyboard input)
@@ -1067,6 +1127,57 @@ mod tests {
 
         let (_, responses) = term.process_collecting(b"\x1b[>1u\x1b[?1049l\x1b[?u");
         assert_eq!(responses, [b"\x1b[?3u".to_vec()]);
+    }
+
+    #[test]
+    fn synchronized_updates_coalesce_content_until_commit() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let events = term.process_mirror(b"\x1b[?2026hfirst");
+        assert!(term.screen().modes.application_sync_updates);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::ContentChanged)));
+        assert!(term.synchronized_update_deadline().is_some());
+
+        let events = term.process_mirror(b" second\x1b[?2026l");
+        assert!(!term.screen().modes.application_sync_updates);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TerminalEvent::ContentChanged))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn synchronized_update_fail_safe_releases_deferred_damage() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.process_mirror(b"\x1b[?2026hpartial");
+        term.synchronized_update_deadline = Some(Instant::now());
+
+        assert!(term.expire_synchronized_update());
+        assert!(!term.screen().modes.application_sync_updates);
+        assert!(term.synchronized_update_deadline().is_none());
+        assert!(!term.expire_synchronized_update());
+    }
+
+    #[test]
+    fn synchronized_update_legacy_dcs_spelling_is_supported() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let events = term.process_mirror(b"\x1bP=1s\x1b\\frame");
+        assert!(term.screen().modes.application_sync_updates);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::ContentChanged)));
+
+        let events = term.process_mirror(b"\x1bP=2s\x1b\\");
+        assert!(!term.screen().modes.application_sync_updates);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TerminalEvent::ContentChanged)));
     }
 
     #[test]

@@ -1865,6 +1865,7 @@ impl TerminalView {
                                     Ok(chunk) => {
                                         let mut term = terminal.lock();
                                         let events = term.process_mirror(&chunk.data);
+                                        let mut content_changed = false;
 
                                         for event in events {
                                             match event {
@@ -1877,12 +1878,17 @@ impl TerminalView {
                                                 TerminalEvent::Bell => {
                                                     state.bell_changed.store(true, Ordering::Relaxed);
                                                 }
+                                                TerminalEvent::ContentChanged => {
+                                                    content_changed = true;
+                                                }
                                                 _ => {}
                                             }
                                         }
 
                                         drop(term);
-                                        state.needs_redraw.store(true, Ordering::Relaxed);
+                                        if content_changed {
+                                            state.needs_redraw.store(true, Ordering::Relaxed);
+                                        }
                                     }
                                     Err(e) => {
                                         log::error!("Daemon stream error: {}", e);
@@ -1904,6 +1910,7 @@ impl TerminalView {
     }
 
     fn schedule_redraw_check(&self, view_ptr: usize, state: Arc<ViewState>) {
+        let terminal = Arc::clone(&self.ivars().terminal);
         // Start a background thread that periodically triggers redraws on main thread
         std::thread::spawn(move || {
             // Wait briefly for app to initialize
@@ -1915,6 +1922,10 @@ impl TerminalView {
                 if state.view_invalid.load(Ordering::SeqCst) {
                     log::debug!("View invalidated, stopping redraw thread");
                     break;
+                }
+
+                if terminal.lock().expire_synchronized_update() {
+                    state.needs_redraw.store(true, Ordering::Relaxed);
                 }
 
                 // Check if PTY closed - if so, close the window

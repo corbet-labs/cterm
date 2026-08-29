@@ -1744,6 +1744,7 @@ impl TerminalWidget {
                     PtyMessage::Data(data) => {
                         let mut term = terminal_main.lock();
                         let events = term.process_mirror(&data);
+                        let mut content_changed = false;
 
                         for event in events {
                             match event {
@@ -1788,8 +1789,8 @@ impl TerminalWidget {
                                         callback(title);
                                     }
                                 }
-                                TerminalEvent::ContentChanged | TerminalEvent::ProcessExited(_) => {
-                                }
+                                TerminalEvent::ContentChanged => content_changed = true,
+                                TerminalEvent::ProcessExited(_) => {}
                             }
                         }
 
@@ -1809,8 +1810,10 @@ impl TerminalWidget {
                             }
                         }
 
-                        terminal_main.lock().screen_mut().dirty = false;
-                        drawing_area.queue_draw();
+                        if content_changed {
+                            terminal_main.lock().screen_mut().dirty = false;
+                            drawing_area.queue_draw();
+                        }
                     }
                     PtyMessage::Bell => {
                         if let Some(ref callback) = *on_bell.borrow() {
@@ -1825,6 +1828,10 @@ impl TerminalWidget {
                         return glib::ControlFlow::Break;
                     }
                 }
+            }
+            if terminal_main.lock().expire_synchronized_update() {
+                terminal_main.lock().screen_mut().dirty = false;
+                drawing_area.queue_draw();
             }
             glib::ControlFlow::Continue
         });

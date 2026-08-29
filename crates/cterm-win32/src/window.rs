@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -878,6 +879,7 @@ impl WindowState {
             let term = terminal.lock().unwrap();
             term.pty().and_then(|pty| pty.try_clone_reader().ok())
         };
+        let sync_watchdog = spawn_synchronized_update_watchdog(hwnd, tab_id, Arc::clone(&terminal));
 
         thread::spawn(move || {
             let Some(mut reader) = pty_reader else {
@@ -908,9 +910,10 @@ impl WindowState {
                 };
 
                 // Process the data (briefly lock the terminal)
-                {
+                let (content_changed, sync_deadline) = {
                     let mut term = terminal.lock().unwrap();
                     let events = term.process(&buffer[..bytes_read]);
+                    let mut content_changed = false;
 
                     // Handle events
                     for event in events {
@@ -946,19 +949,17 @@ impl WindowState {
                                 }
                                 return;
                             }
+                            TerminalEvent::ContentChanged => content_changed = true,
                             _ => {}
                         }
                     }
-                }
+                    (content_changed, term.synchronized_update_deadline())
+                };
 
-                // Request redraw
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(HWND(hwnd as *mut _)),
-                        WM_APP_PTY_DATA,
-                        WPARAM(tab_id as usize),
-                        LPARAM(0),
-                    );
+                let _ = sync_watchdog.send(sync_deadline);
+
+                if content_changed {
+                    post_message(hwnd, WM_APP_PTY_DATA, tab_id);
                 }
             }
 
@@ -2454,6 +2455,49 @@ impl WindowState {
     }
 }
 
+/// Start one deadline-driven synchronized-update watchdog for a terminal.
+/// New deadlines replace old ones, so rapid application frames never create
+/// an unbounded collection of sleeping threads.
+fn spawn_synchronized_update_watchdog(
+    hwnd: usize,
+    tab_id: u64,
+    terminal: Arc<Mutex<Terminal>>,
+) -> std::sync::mpsc::Sender<Option<Instant>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Instant>>();
+    thread::spawn(move || {
+        let mut deadline = None;
+        loop {
+            let message = match deadline {
+                Some(target) => rx.recv_timeout(target.saturating_duration_since(Instant::now())),
+                None => match rx.recv() {
+                    Ok(value) => {
+                        deadline = value;
+                        continue;
+                    }
+                    Err(_) => break,
+                },
+            };
+
+            match message {
+                Ok(value) => deadline = value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let (redraw, next_deadline) = {
+                        let mut term = terminal.lock().unwrap();
+                        let redraw = term.expire_synchronized_update();
+                        (redraw, term.synchronized_update_deadline())
+                    };
+                    deadline = next_deadline;
+                    if redraw {
+                        post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    tx
+}
+
 /// Window class name
 pub const WINDOW_CLASS: &str = "ctermWindow";
 
@@ -2960,12 +3004,20 @@ async fn run_daemon_io_loop(
             match session.stream_output().await {
                 Ok(mut stream) => {
                     use futures::StreamExt;
-                    while let Some(result) = stream.next().await {
-                        match result {
-                            Ok(chunk) => {
-                                {
+                    let mut sync_watchdog =
+                        tokio::time::interval(Duration::from_millis(16));
+                    sync_watchdog.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Skip,
+                    );
+                    loop {
+                        tokio::select! {
+                            result = stream.next() => {
+                                let Some(result) = result else { break };
+                                match result {
+                                    Ok(chunk) => {
                                     let mut term = terminal.lock().unwrap();
                                     let events = term.process_mirror(&chunk.data);
+                                    let mut content_changed = false;
                                     for event in events {
                                         match event {
                                             TerminalEvent::TitleChanged(_) => {
@@ -2974,15 +3026,25 @@ async fn run_daemon_io_loop(
                                             TerminalEvent::Bell => {
                                                 post_message(hwnd, WM_APP_BELL, tab_id);
                                             }
+                                            TerminalEvent::ContentChanged => content_changed = true,
                                             _ => {}
                                         }
                                     }
+                                    drop(term);
+                                    if content_changed {
+                                        post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                                    }
+                                    }
+                                    Err(e) => {
+                                        log::error!("Daemon output stream error: {}", e);
+                                        break;
+                                    }
                                 }
-                                post_message(hwnd, WM_APP_PTY_DATA, tab_id);
                             }
-                            Err(e) => {
-                                log::error!("Daemon output stream error: {}", e);
-                                break;
+                            _ = sync_watchdog.tick() => {
+                                if terminal.lock().unwrap().expire_synchronized_update() {
+                                    post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                                }
                             }
                         }
                     }

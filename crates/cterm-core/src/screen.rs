@@ -89,6 +89,9 @@ pub struct TerminalModes {
     pub alternate_scroll: bool,
     /// Bracketed paste mode
     pub bracketed_paste: bool,
+    /// Application synchronized updates (DEC private mode 2026)
+    #[serde(default)]
+    pub application_sync_updates: bool,
     /// Focus events reporting
     pub focus_events: bool,
     /// Alternate screen buffer active
@@ -437,6 +440,9 @@ pub struct Screen {
     /// Total number of lines ever pushed to scrollback (monotonically increasing).
     /// Used to compute correct absolute line numbers for image pruning.
     scrollback_total_pushed: usize,
+    /// Incremented whenever an application starts (or restarts) a synchronized
+    /// update, allowing Terminal to re-arm its fail-safe deadline.
+    sync_update_generation: u64,
 }
 
 impl Screen {
@@ -489,7 +495,22 @@ impl Screen {
             keyboard_alt_stack: Vec::new(),
             drcs_fonts: HashMap::new(),
             scrollback_total_pushed: 0,
+            sync_update_generation: 0,
         }
+    }
+
+    /// Change application synchronized-update mode.  Repeated enable requests
+    /// deliberately advance the generation so the one-second fail-safe is
+    /// restarted, matching foot's behavior.
+    pub(crate) fn set_application_sync_updates(&mut self, enabled: bool) {
+        self.modes.application_sync_updates = enabled;
+        if enabled {
+            self.sync_update_generation = self.sync_update_generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn sync_update_generation(&self) -> u64 {
+        self.sync_update_generation
     }
 
     /// Queue a response to be sent back through the PTY
