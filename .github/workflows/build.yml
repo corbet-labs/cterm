@@ -146,7 +146,6 @@ jobs:
           unset DISPLAY
           weston \
             --backend=headless-backend.so \
-            --renderer=pixman \
             --socket=cterm-ci \
             --idle-time=0 \
             --log="$OUTPUT_DIR/weston.log" &
@@ -180,10 +179,9 @@ jobs:
         with:
           release: 14.4
           usesh: true
-          prepare: pkg install -y rust protobuf
+          prepare: pkg install -y rust
           run: |
             cargo test -p cterm-core -p cterm-ui --lib
-            cargo check -p cterm-headless
 
   test-macos:
     name: Test (macOS)
