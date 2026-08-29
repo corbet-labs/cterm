@@ -1953,10 +1953,15 @@ fn draw_terminal(
     let palette = &theme.colors;
 
     // Draw background (use override if set, otherwise use theme)
-    let bg = config
+    let normal_background = config
         .background_override
         .as_ref()
         .unwrap_or(&palette.background);
+    let bg = if screen.modes.reverse_video {
+        &palette.foreground
+    } else {
+        normal_background
+    };
     let (r, g, b) = bg.to_f64();
     cr.set_source_rgb(r, g, b);
     cr.paint().ok();
@@ -2003,10 +2008,14 @@ fn draw_terminal(
             let is_selected = screen.is_selected(absolute_line, col_idx);
 
             // Determine if cell has INVERSE attribute (XOR with selection)
-            let is_inverted = cell.attrs.contains(CellAttrs::INVERSE) != is_selected;
+            let is_inverted =
+                cell.attrs.contains(CellAttrs::INVERSE) ^ is_selected ^ screen.modes.reverse_video;
 
             // Draw background (always draw for selected cells to show highlight)
-            let needs_bg = cell.bg != Color::Default || is_inverted || is_selected;
+            let needs_bg = cell.bg != Color::Default
+                || is_inverted
+                || is_selected
+                || screen.modes.reverse_video;
 
             if needs_bg {
                 let bg_color = if is_inverted {
@@ -2016,6 +2025,8 @@ fn draw_terminal(
                     } else {
                         cell.fg.to_rgb(palette)
                     }
+                } else if cell.bg == Color::Default {
+                    *normal_background
                 } else {
                     cell.bg.to_rgb(palette)
                 };
@@ -2037,7 +2048,11 @@ fn draw_terminal(
             if cell.c != ' ' && !cell.attrs.contains(CellAttrs::HIDDEN) {
                 let fg_color = if is_inverted {
                     // Inverted: use background color as foreground
-                    cell.bg.to_rgb(palette)
+                    if cell.bg == Color::Default {
+                        *normal_background
+                    } else {
+                        cell.bg.to_rgb(palette)
+                    }
                 } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
                     // Cornflower blue for hyperlinks with default fg
                     Rgb::new(100, 149, 237)

@@ -562,6 +562,9 @@ message TerminalModes {
   bool charset_g1_active = 7;
   // Active kitty progressive-keyboard flags (supported bits only).
   uint32 keyboard_enhancement_flags = 8;
+  // Rendering and cursor-wrap modes needed by reconnecting clients.
+  bool reverse_video = 9;
+  bool reverse_wrap = 10;
 }
 
 message GetCellRequest {

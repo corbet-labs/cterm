@@ -317,10 +317,13 @@ impl TerminalRenderer {
             rt.BeginDraw();
 
             // Clear with background color (use override if set)
-            let bg = self
-                .background_override
-                .as_ref()
-                .unwrap_or(&self.theme.colors.background);
+            let bg = if screen.modes.reverse_video {
+                &self.theme.colors.foreground
+            } else {
+                self.background_override
+                    .as_ref()
+                    .unwrap_or(&self.theme.colors.background)
+            };
             let bg_color = rgb_to_d2d_color(*bg);
             rt.Clear(Some(&bg_color));
         }
@@ -438,7 +441,7 @@ impl TerminalRenderer {
 
             for col in 0..cols {
                 if let Some(cell) = grid.get(grid_row, col) {
-                    self.draw_cell(row, col, cell)?;
+                    self.draw_cell(row, col, cell, screen.modes.reverse_video)?;
                 }
             }
         }
@@ -447,15 +450,27 @@ impl TerminalRenderer {
     }
 
     /// Draw a single cell
-    fn draw_cell(&mut self, row: usize, col: usize, cell: &Cell) -> windows::core::Result<()> {
+    fn draw_cell(
+        &mut self,
+        row: usize,
+        col: usize,
+        cell: &Cell,
+        reverse_video: bool,
+    ) -> windows::core::Result<()> {
         let x = col as f32 * self.cell_dims.width;
         let y = row as f32 * self.cell_dims.height;
 
         let attrs = cell.attrs;
-        let (fg, bg) = self.resolve_colors(cell);
+        let (fg, bg) = self.resolve_colors(cell, reverse_video);
 
         // Get brushes first (this mutably borrows self temporarily)
-        let bg_brush = if bg != self.theme.colors.background {
+        let canvas_background = if reverse_video {
+            self.theme.colors.foreground
+        } else {
+            self.background_override
+                .unwrap_or(self.theme.colors.background)
+        };
+        let bg_brush = if bg != canvas_background {
             Some(self.get_brush(bg)?)
         } else {
             None
@@ -569,18 +584,22 @@ impl TerminalRenderer {
     }
 
     /// Resolve foreground and background colors from a cell
-    fn resolve_colors(&self, cell: &Cell) -> (Rgb, Rgb) {
+    fn resolve_colors(&self, cell: &Cell, reverse_video: bool) -> (Rgb, Rgb) {
         let palette = &self.theme.colors;
+        let normal_background = self
+            .background_override
+            .unwrap_or(self.theme.colors.background);
 
         let mut fg = cell.fg.to_rgb(palette);
         let mut bg = if cell.bg == Color::Default {
-            palette.background
+            normal_background
         } else {
             cell.bg.to_rgb(palette)
         };
 
         // Handle inverse
-        if cell.attrs.contains(CellAttrs::INVERSE) {
+        let is_inverted = cell.attrs.contains(CellAttrs::INVERSE) != reverse_video;
+        if is_inverted {
             std::mem::swap(&mut fg, &mut bg);
         }
 
@@ -590,10 +609,7 @@ impl TerminalRenderer {
         }
 
         // Cornflower blue for hyperlinks with default foreground
-        if cell.hyperlink.is_some()
-            && cell.fg == Color::Default
-            && !cell.attrs.contains(CellAttrs::INVERSE)
-        {
+        if cell.hyperlink.is_some() && cell.fg == Color::Default && !is_inverted {
             fg = Rgb::new(100, 149, 237);
         }
 

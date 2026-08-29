@@ -285,6 +285,8 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
         charset_g1: screen.modes.charset_g1.clone(),
         charset_g1_active: screen.modes.charset_g1_active,
         keyboard_enhancement_flags: u32::from(screen.keyboard_enhancement_flags().bits()),
+        reverse_video: screen.modes.reverse_video,
+        reverse_wrap: screen.modes.reverse_wrap,
     }
 }
 
@@ -376,6 +378,8 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.modes.charset_g0 = modes.charset_g0.clone();
         screen.modes.charset_g1 = modes.charset_g1.clone();
         screen.modes.charset_g1_active = modes.charset_g1_active;
+        screen.modes.reverse_video = modes.reverse_video;
+        screen.modes.reverse_wrap = modes.reverse_wrap;
         screen.set_keyboard_enhancement_flags(
             cterm_core::KeyboardEnhancementFlags::from_bits_retain(
                 modes.keyboard_enhancement_flags as u8,
@@ -471,6 +475,8 @@ mod tests {
         source_cell.c = 'x';
         source_cell.underline_color = Some(Color::rgb(1, 2, 3));
         source_cell.hyperlink = Some(expected_link.clone());
+        source.screen_mut().modes.reverse_video = true;
+        source.screen_mut().modes.reverse_wrap = false;
 
         let snapshot = screen_to_proto(source.screen(), true);
         let mut restored = Terminal::new(1, 1, ScreenConfig::default());
@@ -480,6 +486,8 @@ mod tests {
         let restored_cell = restored.screen().get_cell(1, 0).unwrap();
         assert_eq!(restored_cell.underline_color, Some(Color::rgb(1, 2, 3)));
         assert_eq!(restored_cell.hyperlink, Some(expected_link));
+        assert!(restored.screen().modes.reverse_video);
+        assert!(!restored.screen().modes.reverse_wrap);
     }
 
     #[test]

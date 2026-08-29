@@ -130,9 +130,13 @@ impl CGRenderer {
         let screen = terminal.screen();
         let cols = screen.width();
         let rows = screen.height();
+        let normal_background = self
+            .background_override
+            .as_ref()
+            .unwrap_or(&self.theme.colors.background);
 
         // Draw background
-        self.draw_background(bounds);
+        self.draw_background(bounds, screen.modes.reverse_video);
 
         // Draw cells
         for row in 0..rows {
@@ -153,7 +157,9 @@ impl CGRenderer {
                     let is_selected = screen.is_selected(absolute_line, col);
 
                     // XOR selection with INVERSE attribute to determine if colors should be inverted
-                    let is_inverted = cell.attrs.contains(CellAttrs::INVERSE) != is_selected;
+                    let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
+                        ^ is_selected
+                        ^ screen.modes.reverse_video;
 
                     // Apply bold_is_bright: map base ANSI fg colors to bright variants
                     let fg = if self.bold_is_bright && cell.attrs.contains(CellAttrs::BOLD) {
@@ -170,7 +176,7 @@ impl CGRenderer {
                     let (fg_color, bg_color) = if is_inverted {
                         // Inverted: swap foreground and background
                         let fg_rgb = if cell.bg.is_default() {
-                            self.theme.colors.background
+                            *normal_background
                         } else {
                             self.color_to_rgb(&cell.bg)
                         };
@@ -181,7 +187,12 @@ impl CGRenderer {
                         };
                         (fg_rgb, bg_rgb)
                     } else {
-                        (self.color_to_rgb(&fg), self.color_to_rgb(&cell.bg))
+                        let bg = if cell.bg.is_default() {
+                            *normal_background
+                        } else {
+                            self.color_to_rgb(&cell.bg)
+                        };
+                        (self.color_to_rgb(&fg), bg)
                     };
 
                     // Apply dim (SGR 2) — halve foreground brightness
@@ -210,7 +221,11 @@ impl CGRenderer {
                     };
 
                     // Draw cell background if not default or if selected/inverted
-                    if !cell.bg.is_default() || is_inverted || is_selected {
+                    if !cell.bg.is_default()
+                        || is_inverted
+                        || is_selected
+                        || screen.modes.reverse_video
+                    {
                         self.draw_cell_background_sized(x, y, char_width, &bg_color);
                     }
 
@@ -549,12 +564,15 @@ impl CGRenderer {
         }
     }
 
-    fn draw_background(&self, bounds: NSRect) {
+    fn draw_background(&self, bounds: NSRect, reverse_video: bool) {
         // Use background override if set, otherwise use theme background
-        let bg = self
-            .background_override
-            .as_ref()
-            .unwrap_or(&self.theme.colors.background);
+        let bg = if reverse_video {
+            &self.theme.colors.foreground
+        } else {
+            self.background_override
+                .as_ref()
+                .unwrap_or(&self.theme.colors.background)
+        };
         unsafe {
             let color = Self::ns_color(bg.r, bg.g, bg.b);
             let _: () = msg_send![&*color, setFill];

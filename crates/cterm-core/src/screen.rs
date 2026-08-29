@@ -75,6 +75,9 @@ pub struct TerminalModes {
     pub application_keypad: bool,
     /// Auto-wrap mode (DECAWM)
     pub auto_wrap: bool,
+    /// Reverse screen mode (DECSCNM)
+    #[serde(default)]
+    pub reverse_video: bool,
     /// Reverse-wrap mode (DEC private mode 45). When enabled together with
     /// auto-wrap, backspace at the left edge moves to the previous line.
     #[serde(default = "default_enabled")]

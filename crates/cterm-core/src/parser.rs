@@ -1369,10 +1369,12 @@ fn decode_hex(encoded: &[u8]) -> Option<Vec<u8>> {
     }
 
     encoded
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = (pair[0] as char).to_digit(16)?;
-            let low = (pair[1] as char).to_digit(16)?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[high, low]| {
+            let high = (*high as char).to_digit(16)?;
+            let low = (*low as char).to_digit(16)?;
             Some(((high << 4) | low) as u8)
         })
         .collect()
@@ -1795,6 +1797,11 @@ impl ScreenPerformer<'_> {
                 self.screen.modes.origin_mode = set;
                 self.screen.move_cursor(0, 0);
             }
+            // DECSCNM - Reverse screen mode
+            5 => {
+                self.screen.modes.reverse_video = set;
+                self.screen.dirty = true;
+            }
             // DECAWM - Auto Wrap Mode
             7 => self.screen.modes.auto_wrap = set,
             // Reverse Wraparound Mode
@@ -1893,6 +1900,7 @@ impl ScreenPerformer<'_> {
     fn dec_private_mode_status(&self, mode: usize) -> u8 {
         let enabled = match mode {
             1 => self.screen.modes.application_cursor,
+            5 => self.screen.modes.reverse_video,
             6 => self.screen.modes.origin_mode,
             7 => self.screen.modes.auto_wrap,
             45 => self.screen.modes.reverse_wrap,
@@ -2237,6 +2245,14 @@ mod tests {
 
         parser.parse(&mut screen, b"\x1b[?7l\x1b[?7$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?7;2$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?5h\x1b[?5$p");
+        assert!(screen.modes.reverse_video);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?5;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?5l\x1b[?5$p");
+        assert!(!screen.modes.reverse_video);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?5;2$y"]);
 
         parser.parse(&mut screen, b"\x1b[?45$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?45;1$y"]);
