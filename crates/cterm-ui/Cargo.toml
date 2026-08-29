@@ -9,3 +9,4 @@ cterm-core.workspace = true
 bitflags.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+tiny-skia.workspace = true

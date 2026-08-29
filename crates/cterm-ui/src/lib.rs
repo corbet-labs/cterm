@@ -5,6 +5,7 @@
 //! interface.
 
 pub mod events;
+pub mod sprite;
 pub mod theme;
 pub mod traits;
 pub mod utils;

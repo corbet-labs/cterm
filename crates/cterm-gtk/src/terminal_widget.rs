@@ -19,6 +19,7 @@ use cterm_core::mouse::{encode_mouse_event, MouseButton, MouseModifiers};
 use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
+use cterm_ui::sprite::{Sprite, SpriteCache};
 use cterm_ui::theme::Theme;
 
 /// Cell dimensions calculated from font metrics
@@ -52,6 +53,7 @@ pub struct TerminalWidget {
     font_size: Rc<RefCell<f64>>,
     default_font_size: f64,
     cell_dims: Rc<RefCell<CellDimensions>>,
+    sprite_cache: Rc<RefCell<SpriteCache>>,
     /// Optional background color override (from template)
     background_override: Rc<RefCell<Option<cterm_core::color::Rgb>>>,
     /// Input method preedit (composition) state
@@ -216,6 +218,7 @@ impl TerminalWidget {
     fn update_cell_dimensions(&self, font_size: f64) {
         let new_dims = calculate_cell_dimensions(&self.font_family, font_size);
         *self.cell_dims.borrow_mut() = new_dims;
+        self.sprite_cache.borrow_mut().clear();
     }
 
     /// Reset the terminal (soft reset - keeps scrollback)
@@ -486,6 +489,7 @@ impl TerminalWidget {
         let cell_dims = Rc::clone(&self.cell_dims);
         let background_override = Rc::clone(&self.background_override);
         let preedit = Rc::clone(&self.preedit);
+        let sprite_cache = Rc::clone(&self.sprite_cache);
 
         self.drawing_area
             .set_draw_func(move |_area, cr, _width, _height| {
@@ -499,7 +503,15 @@ impl TerminalWidget {
                     cell_dims: dims,
                     background_override: bg_override,
                 };
-                draw_terminal(cr, &terminal, &theme, &render_config, &preedit_state);
+                let mut sprites = sprite_cache.borrow_mut();
+                draw_terminal(
+                    cr,
+                    &terminal,
+                    &theme,
+                    &render_config,
+                    &preedit_state,
+                    &mut sprites,
+                );
             });
     }
 
@@ -1361,6 +1373,7 @@ impl TerminalWidget {
             font_size: Rc::new(RefCell::new(font_size)),
             default_font_size: font_size,
             cell_dims,
+            sprite_cache: Rc::new(RefCell::new(SpriteCache::default())),
             background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
@@ -1436,6 +1449,7 @@ impl TerminalWidget {
             font_size: Rc::new(RefCell::new(font_size)),
             default_font_size: font_size,
             cell_dims,
+            sprite_cache: Rc::new(RefCell::new(SpriteCache::default())),
             background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
@@ -1925,6 +1939,7 @@ fn draw_terminal(
     theme: &Theme,
     config: &RenderConfig<'_>,
     preedit: &PreeditState,
+    sprite_cache: &mut SpriteCache,
 ) {
     let term = terminal.lock();
     let screen = term.screen();
@@ -2012,7 +2027,7 @@ fn draw_terminal(
             }
 
             // Draw character
-            if cell.c != ' ' {
+            if cell.c != ' ' && !cell.attrs.contains(CellAttrs::HIDDEN) {
                 let fg_color = if is_inverted {
                     // Inverted: use background color as foreground
                     cell.bg.to_rgb(palette)
@@ -2036,46 +2051,55 @@ fn draw_terminal(
                     fg_color
                 };
 
-                let (r, g, b) = fg_color.to_f64();
-                cr.set_source_rgb(r, g, b);
+                let sprite_width = cell_width.round().max(1.0) as u32;
+                let sprite_height = cell_height.round().max(1.0) as u32;
+                if let Some(sprite) = sprite_cache.get(cell.c as u32, sprite_width, sprite_height) {
+                    draw_sprite(cr, sprite, x, y, cell_width, cell_height, &fg_color);
+                } else {
+                    let (r, g, b) = fg_color.to_f64();
+                    cr.set_source_rgb(r, g, b);
 
-                // Apply text attributes to font
-                let attrs = pango::AttrList::new();
+                    // Apply text attributes to font
+                    let attrs = pango::AttrList::new();
 
-                if cell.attrs.contains(CellAttrs::BOLD) {
-                    let attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                    attrs.insert(attr);
-                }
-
-                if cell.attrs.contains(CellAttrs::ITALIC) {
-                    let attr = pango::AttrInt::new_style(pango::Style::Italic);
-                    attrs.insert(attr);
-                }
-
-                if cell.attrs.contains(CellAttrs::UNDERLINE) || cell.hyperlink.is_some() {
-                    let attr = pango::AttrInt::new_underline(pango::Underline::Single);
-                    attrs.insert(attr);
-                    if cell.hyperlink.is_some() {
-                        // Cornflower blue for hyperlinks
-                        let attr =
-                            pango::AttrColor::new_underline_color(100 * 256, 149 * 256, 237 * 256);
+                    if cell.attrs.contains(CellAttrs::BOLD) {
+                        let attr = pango::AttrInt::new_weight(pango::Weight::Bold);
                         attrs.insert(attr);
                     }
+
+                    if cell.attrs.contains(CellAttrs::ITALIC) {
+                        let attr = pango::AttrInt::new_style(pango::Style::Italic);
+                        attrs.insert(attr);
+                    }
+
+                    if cell.attrs.contains(CellAttrs::UNDERLINE) || cell.hyperlink.is_some() {
+                        let attr = pango::AttrInt::new_underline(pango::Underline::Single);
+                        attrs.insert(attr);
+                        if cell.hyperlink.is_some() {
+                            // Cornflower blue for hyperlinks
+                            let attr = pango::AttrColor::new_underline_color(
+                                100 * 256,
+                                149 * 256,
+                                237 * 256,
+                            );
+                            attrs.insert(attr);
+                        }
+                    }
+
+                    if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+                        let attr = pango::AttrInt::new_strikethrough(true);
+                        attrs.insert(attr);
+                    }
+
+                    layout.set_attributes(Some(&attrs));
+                    layout.set_text(&cell.c.to_string());
+
+                    cr.move_to(x, y);
+                    pangocairo::functions::show_layout(cr, &layout);
+
+                    // Reset attributes
+                    layout.set_attributes(None::<&pango::AttrList>);
                 }
-
-                if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
-                    let attr = pango::AttrInt::new_strikethrough(true);
-                    attrs.insert(attr);
-                }
-
-                layout.set_attributes(Some(&attrs));
-                layout.set_text(&cell.c.to_string());
-
-                cr.move_to(x, y);
-                pangocairo::functions::show_layout(cr, &layout);
-
-                // Reset attributes
-                layout.set_attributes(None::<&pango::AttrList>);
             }
         }
     }
@@ -2203,6 +2227,43 @@ fn draw_terminal(
         cr.set_source_rgba(0.5, 0.5, 0.5, opacity);
         cr.fill().ok();
     }
+}
+
+fn draw_sprite(
+    cr: &cairo::Context,
+    sprite: &Sprite,
+    x: f64,
+    y: f64,
+    cell_width: f64,
+    cell_height: f64,
+    color: &Rgb,
+) {
+    let width = usize::from(sprite.width);
+    let height = usize::from(sprite.height);
+    let (red, green, blue) = color.to_f64();
+
+    cr.save().ok();
+    cr.translate(x, y);
+    cr.scale(cell_width / width as f64, cell_height / height as f64);
+
+    for (row_index, row) in sprite.bytes.chunks_exact(width).enumerate() {
+        let mut column = 0;
+        while column < width {
+            let alpha = row[column];
+            let start = column;
+            while column < width && row[column] == alpha {
+                column += 1;
+            }
+            if alpha == 0 {
+                continue;
+            }
+            cr.set_source_rgba(red, green, blue, f64::from(alpha) / 255.0);
+            cr.rectangle(start as f64, row_index as f64, (column - start) as f64, 1.0);
+            cr.fill().ok();
+        }
+    }
+
+    cr.restore().ok();
 }
 
 /// Draw the terminal's decoded inline images with Cairo.
