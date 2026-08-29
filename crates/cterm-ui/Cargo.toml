@@ -2,6 +2,7 @@
 name = "cterm-ui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "UI abstraction traits for cterm"
 
 [dependencies]

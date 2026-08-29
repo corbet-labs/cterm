@@ -5,7 +5,12 @@ components listed here. The original notices are preserved in the derived files.
 
 | Component | Upstream revision | cterm use | License |
 |---|---|---|---|
+| KarpelesLab/cterm | `35ceaeccf3401de02b15037fc6e04a7e8a26aa83` | Fork base for the terminal runtime and native frontends | MIT |
 | Rio / Sugarloaf | `357281638216876a2406c46e50033e7143256175` | Adapted Rust rasterizers for box drawing, block elements, braille, sextants, and octants in `cterm-ui`; adapted XTGETTCAP parsing, DEC Special Graphics and modifyOtherKeys encoding, and tests in `cterm-core` | MIT |
+
+The KarpelesLab/cterm source incorporated at the fork base retains its original
+MIT grant and notice in `LICENSES/KARPELESLAB-CTERM-MIT.txt`. Subsequent cterm
+contributions are provided under FSL-1.1-ALv2; see `LICENSE`.
 
 foot (`85655c74a4ded119392ea8b632626c3920042807`, MIT) is the behavioral reference
 for the Linux terminal experience. No foot source is included by this revision.

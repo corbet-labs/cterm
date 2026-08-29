@@ -2,6 +2,7 @@
 name = "cterm-headless"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Headless terminal daemon with gRPC API for cterm"
 
 [[bin]]

@@ -41,7 +41,7 @@ version = "0.0.19"
 edition = "2021"
 rust-version = "1.88"
 authors = ["cterm contributors"]
-license = "MIT"
+license = "FSL-1.1-ALv2"
 repository = "https://github.com/corbet-labs/cterm"
 description = "A high-performance, customizable terminal emulator"
 

@@ -2,6 +2,7 @@
 name = "cterm-gtk"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "GTK4 UI implementation for cterm"
 
 [lib]

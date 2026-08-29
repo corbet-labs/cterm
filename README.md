@@ -466,7 +466,14 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 
 ## License
 
-MIT License
+cterm is licensed under
+[FSL-1.1-ALv2](https://fsl.software/FSL-1.1-ALv2.template.md). Each version
+automatically becomes available under Apache-2.0 two years after it is made
+available.
+
+Source inherited from KarpelesLab/cterm and Rio/Sugarloaf retains its MIT
+grants and notices; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) and
+[LICENSES](LICENSES/).
 
 ## Contributing
 

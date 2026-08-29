@@ -2,6 +2,7 @@
 name = "cterm-win32"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Native Windows UI implementation for cterm"
 
 [lib]
