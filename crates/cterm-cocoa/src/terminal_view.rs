@@ -59,6 +59,23 @@ fn terminal_key_for_keycode(keycode: u16) -> Option<Key> {
         0x24 => Key::Enter,
         0x30 => Key::Tab,
         0x35 => Key::Escape,
+        // Numeric keypad (preserve physical identity for DECKPAM and Kitty).
+        0x52 => Key::NumpadDigit(0),
+        0x53 => Key::NumpadDigit(1),
+        0x54 => Key::NumpadDigit(2),
+        0x55 => Key::NumpadDigit(3),
+        0x56 => Key::NumpadDigit(4),
+        0x57 => Key::NumpadDigit(5),
+        0x58 => Key::NumpadDigit(6),
+        0x59 => Key::NumpadDigit(7),
+        0x5B => Key::NumpadDigit(8),
+        0x5C => Key::NumpadDigit(9),
+        0x41 => Key::NumpadDecimal,
+        0x4B => Key::NumpadDivide,
+        0x43 => Key::NumpadMultiply,
+        0x4E => Key::NumpadSubtract,
+        0x45 => Key::NumpadAdd,
+        0x4C => Key::NumpadEnter,
         // Function keys
         0x7A => Key::F(1),
         0x78 => Key::F(2),
@@ -2783,6 +2800,8 @@ mod keyboard_event_tests {
         assert_eq!(terminal_key_for_keycode(0x75), Some(Key::Delete));
         assert_eq!(terminal_key_for_keycode(0x7A), Some(Key::F(1)));
         assert_eq!(terminal_key_for_keycode(0x6F), Some(Key::F(12)));
+        assert_eq!(terminal_key_for_keycode(0x57), Some(Key::NumpadDigit(5)));
+        assert_eq!(terminal_key_for_keycode(0x4C), Some(Key::NumpadEnter));
         assert_eq!(terminal_key_for_keycode(0x00), None);
     }
 

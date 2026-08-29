@@ -497,6 +497,20 @@ impl Terminal {
                 .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
             Key::F(n) => enhanced_function_key(n, modifiers, kind, report_events)
                 .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::NumpadDigit(_)
+            | Key::NumpadDecimal
+            | Key::NumpadDivide
+            | Key::NumpadMultiply
+            | Key::NumpadSubtract
+            | Key::NumpadAdd
+            | Key::NumpadEnter => {
+                if disambiguate || report_events {
+                    kitty_numpad_code(key)
+                        .map(|code| csi_u_key(code, modifiers, kind, report_events))
+                } else {
+                    self.handle_non_release_legacy(key, modifiers, kind)
+                }
+            }
         }
     }
 
@@ -537,7 +551,7 @@ impl Terminal {
 
     fn handle_legacy_key(&self, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
         let app_cursor = self.screen.modes.application_cursor;
-        let _app_keypad = self.screen.modes.application_keypad;
+        let app_keypad = self.screen.modes.application_keypad;
 
         match key {
             Key::Char(c) => {
@@ -605,8 +619,61 @@ impl Terminal {
             Key::Insert => Some(tilde_key(2, modifiers)),
             Key::Delete => Some(tilde_key(3, modifiers)),
             Key::F(n) => Some(function_key(n, modifiers)),
+            Key::NumpadDigit(digit) if digit <= 9 => {
+                let application_suffix = b'p' + digit;
+                let normal = b'0' + digit;
+                Some(keypad_key(
+                    application_suffix,
+                    normal,
+                    modifiers,
+                    app_keypad,
+                ))
+            }
+            Key::NumpadDecimal => Some(keypad_key(b'n', b'.', modifiers, app_keypad)),
+            Key::NumpadDivide => Some(keypad_key(b'o', b'/', modifiers, app_keypad)),
+            Key::NumpadMultiply => Some(keypad_key(b'j', b'*', modifiers, app_keypad)),
+            Key::NumpadSubtract => Some(keypad_key(b'm', b'-', modifiers, app_keypad)),
+            Key::NumpadAdd => Some(keypad_key(b'k', b'+', modifiers, app_keypad)),
+            Key::NumpadEnter => Some(keypad_key(b'M', b'\r', modifiers, app_keypad)),
+            Key::NumpadDigit(_) => None,
         }
     }
+}
+
+/// Encode a numeric-keypad key.  In application mode this follows the VT220
+/// SS3 keypad table, including foot/xterm's modifier parameter spelling.
+fn keypad_key(
+    application_suffix: u8,
+    normal: u8,
+    modifiers: Modifiers,
+    application: bool,
+) -> Vec<u8> {
+    if application {
+        let modifier = modifier_param(modifiers);
+        if modifier == 1 {
+            vec![0x1b, b'O', application_suffix]
+        } else {
+            format!("\x1bO{modifier}{}", application_suffix as char).into_bytes()
+        }
+    } else if modifiers.contains(Modifiers::ALT) {
+        vec![0x1b, normal]
+    } else {
+        vec![normal]
+    }
+}
+
+/// Kitty keyboard protocol functional-key code for physical keypad keys.
+fn kitty_numpad_code(key: Key) -> Option<u32> {
+    Some(match key {
+        Key::NumpadDigit(digit @ 0..=9) => 57399 + u32::from(digit),
+        Key::NumpadDecimal => 57409,
+        Key::NumpadDivide => 57410,
+        Key::NumpadMultiply => 57411,
+        Key::NumpadSubtract => 57412,
+        Key::NumpadAdd => 57413,
+        Key::NumpadEnter => 57414,
+        _ => return None,
+    })
 }
 
 fn csi_u_key(
@@ -778,6 +845,13 @@ pub enum Key {
     Insert,
     Delete,
     F(u8),
+    NumpadDigit(u8),
+    NumpadDecimal,
+    NumpadDivide,
+    NumpadMultiply,
+    NumpadSubtract,
+    NumpadAdd,
+    NumpadEnter,
 }
 
 bitflags::bitflags! {
@@ -931,6 +1005,53 @@ mod tests {
         assert_eq!(
             term.handle_key_event(Key::Up, Modifiers::CTRL, KeyEventKind::Press),
             Some(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
+    fn application_keypad_uses_vt_sequences_and_modifiers() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        assert_eq!(
+            term.handle_key(Key::NumpadDigit(0), Modifiers::empty()),
+            Some(b"0".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::NumpadEnter, Modifiers::empty()),
+            Some(b"\r".to_vec())
+        );
+
+        term.process(b"\x1b=");
+        assert_eq!(
+            term.handle_key(Key::NumpadDigit(0), Modifiers::empty()),
+            Some(b"\x1bOp".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::NumpadAdd, Modifiers::CTRL),
+            Some(b"\x1bO5k".to_vec())
+        );
+        assert_eq!(
+            term.handle_key(Key::NumpadEnter, Modifiers::SHIFT | Modifiers::ALT),
+            Some(b"\x1bO4M".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_reports_physical_keypad_codes() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.process(b"\x1b[>3u");
+
+        assert_eq!(
+            term.handle_key_event(Key::NumpadDigit(0), Modifiers::empty(), KeyEventKind::Press,),
+            Some(b"\x1b[57399;1:1u".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::NumpadAdd, Modifiers::CTRL, KeyEventKind::Repeat),
+            Some(b"\x1b[57413;5:2u".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(Key::NumpadEnter, Modifiers::empty(), KeyEventKind::Release,),
+            Some(b"\x1b[57414;1:3u".to_vec())
         );
     }
 
