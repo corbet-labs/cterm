@@ -467,9 +467,9 @@ impl TerminalRenderer {
             None
         };
 
-        let c = cell.c;
+        let text = cell.text();
         let has_hyperlink = cell.hyperlink.is_some();
-        let needs_fg = c != ' ' && c != '\0'
+        let needs_fg = text != " " && text != "\0"
             || attrs.has_underline()
             || has_hyperlink
             || attrs.contains(CellAttrs::STRIKETHROUGH);
@@ -502,19 +502,18 @@ impl TerminalRenderer {
         }
 
         // Draw character
-        if c != ' ' && c != '\0' {
+        if text != " " && text != "\0" {
             let text_format = if attrs.contains(CellAttrs::BOLD) {
                 self.text_format_bold.as_ref().unwrap()
             } else {
                 self.text_format.as_ref().unwrap()
             };
 
-            let mut buf = [0u16; 2];
-            let text: &[u16] = c.encode_utf16(&mut buf);
+            let utf16: Vec<u16> = text.encode_utf16().collect();
 
             let layout: IDWriteTextLayout = unsafe {
                 self.dwrite_factory.CreateTextLayout(
-                    text,
+                    &utf16,
                     text_format,
                     self.cell_dims.width * 2.0, // Allow for wide chars
                     self.cell_dims.height,
@@ -687,19 +686,18 @@ impl TerminalRenderer {
         // Draw the character under cursor with inverted color
         let grid = screen.grid();
         if let Some(cell) = grid.get(cursor.row, cursor.col) {
-            let c = cell.c;
+            let text = cell.text();
 
-            if c != ' ' && c != '\0' {
+            if text != " " && text != "\0" {
                 let text_color = self.theme.cursor.text_color;
                 let text_brush = self.get_brush(text_color)?;
 
                 let text_format = self.text_format.as_ref().unwrap();
-                let mut buf = [0u16; 2];
-                let text: &[u16] = c.encode_utf16(&mut buf);
+                let utf16: Vec<u16> = text.encode_utf16().collect();
 
                 let layout: IDWriteTextLayout = unsafe {
                     self.dwrite_factory.CreateTextLayout(
-                        text,
+                        &utf16,
                         text_format,
                         self.cell_dims.width * 2.0,
                         self.cell_dims.height,

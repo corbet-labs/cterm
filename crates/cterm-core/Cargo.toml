@@ -7,6 +7,8 @@ description = "Core terminal emulation library for cterm"
 [dependencies]
 bitflags.workspace = true
 unicode-width.workspace = true
+unicode-segmentation.workspace = true
+smol_str.workspace = true
 log.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true

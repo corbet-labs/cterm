@@ -80,7 +80,9 @@ impl Row {
     pub fn write_text_to(&self, buf: &mut String) {
         buf.clear();
         for cell in &self.cells {
-            buf.push(cell.c);
+            if !cell.is_wide_spacer() {
+                buf.push_str(cell.text());
+            }
         }
         let trimmed_len = buf.trim_end().len();
         buf.truncate(trimmed_len);
@@ -281,24 +283,24 @@ mod tests {
         let mut grid = Grid::new(80, 24);
 
         // Set a cell
-        grid[0][0].c = 'A';
-        assert_eq!(grid[0][0].c, 'A');
+        grid[0][0].set_char('A');
+        assert_eq!(grid[0][0].text(), "A");
 
         // Via get/get_mut
-        assert_eq!(grid.get(0, 0).unwrap().c, 'A');
-        grid.get_mut(0, 0).unwrap().c = 'B';
-        assert_eq!(grid[0][0].c, 'B');
+        assert_eq!(grid.get(0, 0).unwrap().text(), "A");
+        grid.get_mut(0, 0).unwrap().set_char('B');
+        assert_eq!(grid[0][0].text(), "B");
     }
 
     #[test]
     fn test_grid_resize() {
         let mut grid = Grid::new(80, 24);
-        grid[0][0].c = 'A';
+        grid[0][0].set_char('A');
 
         grid.resize(100, 30);
         assert_eq!(grid.width(), 100);
         assert_eq!(grid.height(), 30);
-        assert_eq!(grid[0][0].c, 'A'); // Content preserved
+        assert_eq!(grid[0][0].text(), "A"); // Content preserved
 
         grid.resize(40, 10);
         assert_eq!(grid.width(), 40);
@@ -311,21 +313,21 @@ mod tests {
 
         // Set up some content
         for i in 0..5 {
-            grid[i][0].c = char::from_digit(i as u32, 10).unwrap();
+            grid[i][0].set_char(char::from_digit(i as u32, 10).unwrap());
         }
 
         // Scroll up by 2 (full screen)
         let scrolled = grid.scroll_up(2, 0, 5);
         assert_eq!(scrolled.len(), 2);
-        assert_eq!(scrolled[0][0].c, '0');
-        assert_eq!(scrolled[1][0].c, '1');
+        assert_eq!(scrolled[0][0].text(), "0");
+        assert_eq!(scrolled[1][0].text(), "1");
 
         // Check remaining content
-        assert_eq!(grid[0][0].c, '2');
-        assert_eq!(grid[1][0].c, '3');
-        assert_eq!(grid[2][0].c, '4');
-        assert_eq!(grid[3][0].c, ' '); // Cleared
-        assert_eq!(grid[4][0].c, ' '); // Cleared
+        assert_eq!(grid[0][0].text(), "2");
+        assert_eq!(grid[1][0].text(), "3");
+        assert_eq!(grid[2][0].text(), "4");
+        assert_eq!(grid[3][0].text(), " "); // Cleared
+        assert_eq!(grid[4][0].text(), " "); // Cleared
     }
 
     #[test]
@@ -333,23 +335,23 @@ mod tests {
         let mut grid = Grid::new(80, 5);
 
         for i in 0..5 {
-            grid[i][0].c = char::from_digit(i as u32, 10).unwrap();
+            grid[i][0].set_char(char::from_digit(i as u32, 10).unwrap());
         }
 
         grid.scroll_down(2, 0, 5);
 
-        assert_eq!(grid[0][0].c, ' '); // Cleared
-        assert_eq!(grid[1][0].c, ' '); // Cleared
-        assert_eq!(grid[2][0].c, '0');
-        assert_eq!(grid[3][0].c, '1');
-        assert_eq!(grid[4][0].c, '2');
+        assert_eq!(grid[0][0].text(), " "); // Cleared
+        assert_eq!(grid[1][0].text(), " "); // Cleared
+        assert_eq!(grid[2][0].text(), "0");
+        assert_eq!(grid[3][0].text(), "1");
+        assert_eq!(grid[4][0].text(), "2");
     }
 
     #[test]
     fn test_row_text() {
         let mut row = Row::new(10);
-        row[0].c = 'H';
-        row[1].c = 'i';
+        row[0].set_char('H');
+        row[1].set_char('i');
         // Rest are spaces
 
         assert_eq!(row.text(), "Hi");

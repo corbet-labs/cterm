@@ -3,7 +3,7 @@
 //! Manages the visible grid and scrollback history, handling resize
 //! and scroll operations.
 
-use crate::cell::{Cell, CellStyle};
+use crate::cell::{Cell, CellAttrs, CellStyle, MAX_GRAPHEME_BYTES};
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
@@ -11,6 +11,8 @@ use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Configuration for the screen
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -876,10 +878,19 @@ impl Screen {
     /// Put a character at the current cursor position
     pub fn put_char(&mut self, c: char) {
         let c = self.map_active_charset_char(c);
-        let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+
+        if self.try_extend_previous_grapheme(c) {
+            return;
+        }
+
+        let width = UnicodeWidthChar::width(c).unwrap_or(0).min(2);
+        if width == 0 {
+            return;
+        }
 
         // Handle auto-wrap
-        if self.cursor.col >= self.width() {
+        if self.cursor.col >= self.width() || (width > 1 && self.cursor.col + width > self.width())
+        {
             if self.modes.auto_wrap {
                 self.carriage_return();
                 self.line_feed();
@@ -899,27 +910,118 @@ impl Screen {
         // Clear selection if writing to a selected row
         self.clear_selection_if_row_selected(self.cursor.row);
 
+        self.clear_wide_cell_at(self.cursor.row, self.cursor.col);
+
         // Write the character
         if let Some(cell) = self.grid.get_mut(self.cursor.row, self.cursor.col) {
-            cell.c = c;
+            cell.set_char(c);
             self.style.apply_to(cell);
 
             if width > 1 {
-                cell.attrs.insert(crate::cell::CellAttrs::WIDE);
+                cell.attrs.insert(CellAttrs::WIDE);
             }
         }
 
         // Handle wide characters (write spacer in next cell)
         if width > 1 && self.cursor.col + 1 < self.width() {
             if let Some(cell) = self.grid.get_mut(self.cursor.row, self.cursor.col + 1) {
-                cell.c = ' ';
-                cell.attrs = crate::cell::CellAttrs::WIDE_SPACER;
+                cell.set_char(' ');
+                self.style.apply_to(cell);
+                cell.attrs.remove(CellAttrs::WIDE);
+                cell.attrs.insert(CellAttrs::WIDE_SPACER);
             }
         }
 
         // Advance cursor
         self.cursor.col += width;
         self.dirty = true;
+    }
+
+    /// Extend the preceding cell when the next scalar belongs to the same
+    /// Unicode extended grapheme cluster.
+    fn try_extend_previous_grapheme(&mut self, c: char) -> bool {
+        let screen_width = self.width();
+        if screen_width == 0 {
+            return false;
+        }
+
+        let cursor_follows_cell = self.cursor.col > 0;
+        let mut col = self.cursor.col.min(screen_width).saturating_sub(1);
+        if self
+            .grid
+            .get(self.cursor.row, col)
+            .is_some_and(Cell::is_wide_spacer)
+        {
+            col = col.saturating_sub(1);
+        }
+
+        let Some(cell) = self.grid.get(self.cursor.row, col) else {
+            return false;
+        };
+        if cell.text().len() + c.len_utf8() > MAX_GRAPHEME_BYTES {
+            return UnicodeWidthChar::width(c).unwrap_or(0) == 0;
+        }
+
+        let old_width = if cell.is_wide() { 2 } else { 1 };
+        let mut candidate = String::with_capacity(cell.text().len() + c.len_utf8());
+        candidate.push_str(cell.text());
+        candidate.push(c);
+        if UnicodeSegmentation::graphemes(candidate.as_str(), true).count() != 1 {
+            return false;
+        }
+
+        let new_width = UnicodeWidthStr::width(candidate.as_str()).clamp(1, 2);
+        let Some(cell) = self.grid.get_mut(self.cursor.row, col) else {
+            return false;
+        };
+        if !cell.append_char(c) {
+            return true;
+        }
+        cell.attrs.remove(CellAttrs::WIDE | CellAttrs::WIDE_SPACER);
+        if new_width == 2 {
+            cell.attrs.insert(CellAttrs::WIDE);
+        }
+
+        if new_width == 2 && old_width == 1 && col + 1 < screen_width {
+            if let Some(spacer) = self.grid.get_mut(self.cursor.row, col + 1) {
+                spacer.reset();
+                self.style.apply_to(spacer);
+                spacer.attrs.remove(CellAttrs::WIDE);
+                spacer.attrs.insert(CellAttrs::WIDE_SPACER);
+            }
+        } else if new_width == 1 && old_width == 2 && col + 1 < screen_width {
+            if let Some(spacer) = self.grid.get_mut(self.cursor.row, col + 1) {
+                spacer.reset();
+            }
+        }
+
+        if cursor_follows_cell {
+            self.cursor.col = if new_width > old_width {
+                (self.cursor.col + new_width - old_width).min(screen_width)
+            } else {
+                self.cursor.col.saturating_sub(old_width - new_width)
+            };
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Remove both halves of a wide cell before overwriting either half.
+    fn clear_wide_cell_at(&mut self, row: usize, col: usize) {
+        let attrs = match self.grid.get(row, col) {
+            Some(cell) => cell.attrs,
+            None => return,
+        };
+
+        if attrs.contains(CellAttrs::WIDE) {
+            if let Some(spacer) = self.grid.get_mut(row, col + 1) {
+                spacer.reset();
+            }
+        } else if attrs.contains(CellAttrs::WIDE_SPACER) && col > 0 {
+            if let Some(wide) = self.grid.get_mut(row, col - 1) {
+                wide.reset();
+            }
+        }
     }
 
     /// Insert blank cells at cursor, shifting existing cells right
@@ -1457,8 +1559,8 @@ impl Screen {
                         break;
                     }
                     // Clear the cell but keep it as a space (not truly empty)
-                    grid_row[c].c = ' ';
-                    grid_row[c].attrs = crate::cell::CellAttrs::empty();
+                    grid_row[c].set_char(' ');
+                    grid_row[c].attrs = CellAttrs::empty();
                 }
             }
         }
@@ -1790,7 +1892,7 @@ impl Screen {
             );
         }
 
-        let center_char = row.get(col).map(|c| c.c).unwrap_or(' ');
+        let center_char = row.get(col).map(Cell::first_char).unwrap_or(' ');
 
         // If we clicked on a non-word character, just select that character
         if !Self::is_word_char(center_char) {
@@ -1807,7 +1909,7 @@ impl Screen {
             if start_col > 0 {
                 let r = self.get_row_by_absolute_line(start_line).unwrap();
                 if let Some(cell) = r.get(start_col - 1) {
-                    if Self::is_word_char(cell.c) {
+                    if Self::is_word_char(cell.first_char()) {
                         start_col -= 1;
                         continue;
                     }
@@ -1825,7 +1927,7 @@ impl Screen {
                     let prev_len = prev_row.len();
                     if prev_len > 0 {
                         if let Some(cell) = prev_row.get(prev_len - 1) {
-                            if Self::is_word_char(cell.c) {
+                            if Self::is_word_char(cell.first_char()) {
                                 start_line -= 1;
                                 start_col = prev_len - 1;
                                 continue;
@@ -1845,7 +1947,7 @@ impl Screen {
             let r_len = r.len();
             if end_col < r_len - 1 {
                 if let Some(cell) = r.get(end_col + 1) {
-                    if Self::is_word_char(cell.c) {
+                    if Self::is_word_char(cell.first_char()) {
                         end_col += 1;
                         continue;
                     }
@@ -1856,7 +1958,7 @@ impl Screen {
             if let Some(next_row) = self.get_row_by_absolute_line(end_line + 1) {
                 if next_row.wrapped {
                     if let Some(cell) = next_row.get(0) {
-                        if Self::is_word_char(cell.c) {
+                        if Self::is_word_char(cell.first_char()) {
                             end_line += 1;
                             end_col = 0;
                             continue;
@@ -2055,7 +2157,7 @@ impl Screen {
                 if let Some(cell) = row.get(col) {
                     // Skip wide character spacers
                     if !cell.attrs.contains(crate::cell::CellAttrs::WIDE_SPACER) {
-                        result.push(cell.c);
+                        result.push_str(cell.text());
                     }
                 }
             }
@@ -2238,13 +2340,15 @@ impl Screen {
                     }
 
                     // Append character (HTML-escaped)
-                    match cell.c {
-                        '<' => result.push_str("&lt;"),
-                        '>' => result.push_str("&gt;"),
-                        '&' => result.push_str("&amp;"),
-                        '"' => result.push_str("&quot;"),
-                        '\'' => result.push_str("&#39;"),
-                        c => result.push(c),
+                    for c in cell.text().chars() {
+                        match c {
+                            '<' => result.push_str("&lt;"),
+                            '>' => result.push_str("&gt;"),
+                            '&' => result.push_str("&amp;"),
+                            '"' => result.push_str("&quot;"),
+                            '\'' => result.push_str("&#39;"),
+                            c => result.push(c),
+                        }
                     }
                 }
             }
@@ -2407,8 +2511,56 @@ mod tests {
         screen.put_char('H');
         screen.put_char('i');
 
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, 'H');
-        assert_eq!(screen.get_cell(0, 1).unwrap().c, 'i');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "H");
+        assert_eq!(screen.get_cell(0, 1).unwrap().text(), "i");
+        assert_eq!(screen.cursor.col, 2);
+    }
+
+    #[test]
+    fn combines_unicode_scalars_into_grapheme_cells() {
+        let mut screen = Screen::new(8, 2, ScreenConfig::default());
+
+        for c in "e\u{301}👩\u{200d}💻🇨🇭".chars() {
+            screen.put_char(c);
+        }
+
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "e\u{301}");
+        assert_eq!(screen.get_cell(0, 1).unwrap().text(), "👩\u{200d}💻");
+        assert!(screen.get_cell(0, 1).unwrap().is_wide());
+        assert!(screen.get_cell(0, 2).unwrap().is_wide_spacer());
+        assert_eq!(screen.get_cell(0, 3).unwrap().text(), "🇨🇭");
+        assert!(screen.get_cell(0, 3).unwrap().is_wide());
+        assert!(screen.get_cell(0, 4).unwrap().is_wide_spacer());
+        assert_eq!(screen.cursor.col, 5);
+        assert_eq!(
+            screen.grid().row(0).unwrap().text(),
+            "e\u{301}👩\u{200d}💻🇨🇭"
+        );
+    }
+
+    #[test]
+    fn bounds_combining_character_growth_per_cell() {
+        let mut screen = Screen::new(8, 2, ScreenConfig::default());
+        screen.put_char('e');
+        for _ in 0..100 {
+            screen.put_char('\u{301}');
+        }
+
+        assert!(screen.get_cell(0, 0).unwrap().text().len() <= MAX_GRAPHEME_BYTES);
+        assert_eq!(screen.cursor.col, 1);
+    }
+
+    #[test]
+    fn wraps_wide_grapheme_before_last_column() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+        for c in "abc界".chars() {
+            screen.put_char(c);
+        }
+
+        assert_eq!(screen.grid().row(0).unwrap().text(), "abc");
+        assert_eq!(screen.grid().row(1).unwrap().text(), "界");
+        assert!(screen.grid().row(1).unwrap().wrapped);
+        assert_eq!(screen.cursor.row, 1);
         assert_eq!(screen.cursor.col, 2);
     }
 
@@ -2440,9 +2592,9 @@ mod tests {
         screen.line_feed(); // This should scroll
 
         assert_eq!(screen.scrollback.len(), 1);
-        assert_eq!(screen.scrollback[0][0].c, '1');
-        assert_eq!(screen.grid()[0][0].c, '2');
-        assert_eq!(screen.grid()[1][0].c, '3');
+        assert_eq!(screen.scrollback[0][0].text(), "1");
+        assert_eq!(screen.grid()[0][0].text(), "2");
+        assert_eq!(screen.grid()[1][0].text(), "3");
     }
 
     #[test]
@@ -2461,12 +2613,18 @@ mod tests {
         let first_line = screen.visible_row_to_absolute_line(0);
         let second_line = screen.visible_row_to_absolute_line(1);
         assert_eq!(
-            screen.get_cell_with_scrollback(first_line, 0).unwrap().c,
-            '1'
+            screen
+                .get_cell_with_scrollback(first_line, 0)
+                .unwrap()
+                .text(),
+            "1"
         );
         assert_eq!(
-            screen.get_cell_with_scrollback(second_line, 0).unwrap().c,
-            '2'
+            screen
+                .get_cell_with_scrollback(second_line, 0)
+                .unwrap()
+                .text(),
+            "2"
         );
     }
 
@@ -2478,13 +2636,13 @@ mod tests {
         screen.enter_alternate_screen();
 
         // Alternate screen should be empty
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, ' ');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), " ");
 
         screen.put_char('B');
         screen.exit_alternate_screen();
 
         // Should restore primary with 'A'
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, 'A');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "A");
     }
 
     #[test]
@@ -2494,7 +2652,7 @@ mod tests {
         screen.put_char('X');
         screen.clear(ClearMode::All);
 
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, ' ');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), " ");
     }
 
     /// Helper: create a screen with text on the first line

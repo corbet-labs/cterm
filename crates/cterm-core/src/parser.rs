@@ -2031,8 +2031,8 @@ mod tests {
 
         parser.parse(&mut screen, b"Hello");
 
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, 'H');
-        assert_eq!(screen.get_cell(0, 4).unwrap().c, 'o');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "H");
+        assert_eq!(screen.get_cell(0, 4).unwrap().text(), "o");
         assert_eq!(screen.cursor.col, 5);
     }
 
@@ -2182,7 +2182,7 @@ mod tests {
         parser.parse(&mut screen, b"\x1b[2J"); // Clear all
 
         for col in 0..5 {
-            assert_eq!(screen.get_cell(0, col).unwrap().c, ' ');
+            assert_eq!(screen.get_cell(0, col).unwrap().text(), " ");
         }
     }
 
@@ -2246,7 +2246,7 @@ mod tests {
 
         parser.parse(&mut screen, b"\x1b[?1049l"); // Exit alternate
         assert!(!screen.modes.alternate_screen);
-        assert_eq!(screen.get_cell(0, 0).unwrap().c, 'P');
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "P");
     }
 
     #[test]

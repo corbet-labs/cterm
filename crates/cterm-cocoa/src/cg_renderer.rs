@@ -230,12 +230,14 @@ impl CGRenderer {
                     }
 
                     // Draw character
-                    if cell.c != ' ' && cell.c != '\0' {
-                        // Check if this should be a DRCS glyph
-                        if let Some(glyph) = screen.get_drcs_for_char(cell.c) {
+                    if cell.text() != " " && cell.text() != "\0" {
+                        // DRCS is defined for individual character positions,
+                        // while normal text may be a full grapheme cluster.
+                        let drcs = cell.single_char().and_then(|c| screen.get_drcs_for_char(c));
+                        if let Some(glyph) = drcs {
                             self.draw_drcs_glyph(glyph, x, y, &fg_color);
                         } else {
-                            self.draw_char_rgb(cell.c, x, y, &fg_color, cell.attrs);
+                            self.draw_text_rgb(cell.text(), x, y, &fg_color, cell.attrs);
                         }
                     }
 
@@ -598,8 +600,8 @@ impl CGRenderer {
         }
     }
 
-    fn draw_char_rgb(&self, ch: char, x: f64, y: f64, rgb: &Rgb, attrs: CellAttrs) {
-        let text = NSString::from_str(&ch.to_string());
+    fn draw_text_rgb(&self, value: &str, x: f64, y: f64, rgb: &Rgb, attrs: CellAttrs) {
+        let text = NSString::from_str(value);
 
         let font = match (
             attrs.contains(CellAttrs::BOLD),

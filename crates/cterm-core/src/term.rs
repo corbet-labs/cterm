@@ -970,8 +970,8 @@ mod tests {
 
         term.process(b"Hello, World!");
 
-        assert_eq!(term.screen().get_cell(0, 0).unwrap().c, 'H');
-        assert_eq!(term.screen().get_cell(0, 12).unwrap().c, '!');
+        assert_eq!(term.screen().get_cell(0, 0).unwrap().text(), "H");
+        assert_eq!(term.screen().get_cell(0, 12).unwrap().text(), "!");
     }
 
     #[test]
@@ -998,7 +998,7 @@ mod tests {
             responses.is_empty(),
             "plain text must not generate PTY responses"
         );
-        assert_eq!(term.screen().get_cell(0, 0).unwrap().c, 'H');
+        assert_eq!(term.screen().get_cell(0, 0).unwrap().text(), "H");
     }
 
     #[test]
@@ -1248,7 +1248,7 @@ mod tests {
 
         assert_eq!(term.cols(), 100);
         assert_eq!(term.rows(), 30);
-        assert_eq!(term.screen().get_cell(0, 0).unwrap().c, 'X');
+        assert_eq!(term.screen().get_cell(0, 0).unwrap().text(), "X");
     }
 
     #[test]

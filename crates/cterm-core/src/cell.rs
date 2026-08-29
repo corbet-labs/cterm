@@ -1,12 +1,20 @@
 //! Terminal cell types
 //!
-//! A cell represents a single character position in the terminal grid,
-//! including its character, colors, and attributes.
+//! A cell represents one display position in the terminal grid, including its
+//! extended grapheme cluster, colors, and attributes.
 
 use crate::color::Color;
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::sync::Arc;
+
+/// Maximum UTF-8 payload retained in one terminal cell.
+///
+/// Real-world extended grapheme clusters are generally small. Bounding the
+/// exceptional case prevents an untrusted PTY from growing a single cell
+/// without limit by streaming combining characters.
+pub const MAX_GRAPHEME_BYTES: usize = 64;
 
 bitflags! {
     /// Cell rendering attributes
@@ -88,11 +96,11 @@ impl Hyperlink {
     }
 }
 
-/// A single terminal cell
+/// A single terminal cell containing one extended grapheme cluster
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
-    /// The character in this cell
-    pub c: char,
+    /// The extended grapheme cluster displayed in this cell.
+    text: SmolStr,
     /// Foreground color
     pub fg: Color,
     /// Background color
@@ -108,7 +116,7 @@ pub struct Cell {
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            c: ' ',
+            text: SmolStr::new_static(" "),
             fg: Color::Default,
             bg: Color::Default,
             underline_color: None,
@@ -122,9 +130,58 @@ impl Cell {
     /// Create a new cell with the given character
     pub fn new(c: char) -> Self {
         Self {
-            c,
+            text: SmolStr::new(c.to_string()),
             ..Default::default()
         }
+    }
+
+    /// Return the full extended grapheme cluster in this cell.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Return the first scalar value, primarily for character classification.
+    pub fn first_char(&self) -> char {
+        self.text.chars().next().unwrap_or(' ')
+    }
+
+    /// Return the cell content when it consists of exactly one scalar value.
+    pub fn single_char(&self) -> Option<char> {
+        let mut chars = self.text.chars();
+        let first = chars.next()?;
+        chars.next().is_none().then_some(first)
+    }
+
+    /// Replace the cell content with one scalar value.
+    pub fn set_char(&mut self, c: char) {
+        self.text = SmolStr::new(c.to_string());
+    }
+
+    /// Replace the cell content with a bounded UTF-8 string.
+    pub fn set_text(&mut self, text: &str) {
+        if text.is_empty() {
+            self.text = SmolStr::new_static(" ");
+            return;
+        }
+
+        let mut end = text.len().min(MAX_GRAPHEME_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text = SmolStr::new(&text[..end]);
+    }
+
+    /// Append a scalar value while enforcing the per-cell memory bound.
+    pub(crate) fn append_char(&mut self, c: char) -> bool {
+        if self.text.len() + c.len_utf8() > MAX_GRAPHEME_BYTES {
+            return false;
+        }
+
+        let mut text = String::with_capacity(self.text.len() + c.len_utf8());
+        text.push_str(&self.text);
+        text.push(c);
+        self.text = SmolStr::new(text);
+        true
     }
 
     /// Create an empty (space) cell
@@ -134,7 +191,7 @@ impl Cell {
 
     /// Check if this cell is empty (space with default colors and no attrs)
     pub fn is_empty(&self) -> bool {
-        self.c == ' '
+        self.text == " "
             && self.fg == Color::Default
             && self.bg == Color::Default
             && self.attrs.is_empty()
@@ -189,7 +246,7 @@ impl CellStyle {
     /// Create a cell with this style and the given character
     pub fn create_cell(&self, c: char) -> Cell {
         Cell {
-            c,
+            text: SmolStr::new(c.to_string()),
             fg: self.fg,
             bg: self.bg,
             underline_color: self.underline_color,
@@ -211,7 +268,7 @@ mod tests {
     #[test]
     fn test_cell_default() {
         let cell = Cell::default();
-        assert_eq!(cell.c, ' ');
+        assert_eq!(cell.text(), " ");
         assert!(cell.is_empty());
     }
 
@@ -245,7 +302,7 @@ mod tests {
         };
 
         let cell = style.create_cell('X');
-        assert_eq!(cell.c, 'X');
+        assert_eq!(cell.text(), "X");
         assert_eq!(cell.fg, Color::Ansi(crate::color::AnsiColor::Red));
         assert!(cell.attrs.contains(CellAttrs::BOLD));
     }

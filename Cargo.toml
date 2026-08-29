@@ -49,6 +49,8 @@ description = "A high-performance, customizable terminal emulator"
 # Core dependencies
 bitflags = { version = "2", features = ["serde"] }
 unicode-width = "0.2"
+unicode-segmentation = "1.13.3"
+smol_str = { version = "=0.3.2", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"
 thiserror = "2"

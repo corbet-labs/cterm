@@ -2047,7 +2047,7 @@ fn draw_terminal(
             }
 
             // Draw character
-            if cell.c != ' ' && !cell.attrs.contains(CellAttrs::HIDDEN) {
+            if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
                 let fg_color = if is_inverted {
                     // Inverted: use background color as foreground
                     if cell.bg == Color::Default {
@@ -2077,7 +2077,10 @@ fn draw_terminal(
 
                 let sprite_width = cell_width.round().max(1.0) as u32;
                 let sprite_height = cell_height.round().max(1.0) as u32;
-                if let Some(sprite) = sprite_cache.get(cell.c as u32, sprite_width, sprite_height) {
+                if let Some(sprite) = cell
+                    .single_char()
+                    .and_then(|c| sprite_cache.get(c as u32, sprite_width, sprite_height))
+                {
                     draw_sprite(cr, sprite, x, y, cell_width, cell_height, &fg_color);
                 } else {
                     let (r, g, b) = fg_color.to_f64();
@@ -2116,7 +2119,7 @@ fn draw_terminal(
                     }
 
                     layout.set_attributes(Some(&attrs));
-                    layout.set_text(&cell.c.to_string());
+                    layout.set_text(cell.text());
 
                     cr.move_to(x, y);
                     pangocairo::functions::show_layout(cr, &layout);
@@ -2148,10 +2151,10 @@ fn draw_terminal(
 
                 // Draw character under cursor with inverted color
                 if let Some(cell) = screen.get_cell(cursor.row, cursor.col) {
-                    if cell.c != ' ' {
+                    if cell.text() != " " {
                         let (r, g, b) = theme.cursor.text_color.to_f64();
                         cr.set_source_rgb(r, g, b);
-                        layout.set_text(&cell.c.to_string());
+                        layout.set_text(cell.text());
                         cr.move_to(x, y);
                         pangocairo::functions::show_layout(cr, &layout);
                     }

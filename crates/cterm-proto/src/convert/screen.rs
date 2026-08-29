@@ -83,7 +83,7 @@ pub fn proto_to_attrs(attrs: &proto::CellAttributes) -> CellAttrs {
 /// Convert a cell to proto
 pub fn cell_to_proto(cell: &Cell) -> proto::Cell {
     proto::Cell {
-        char: cell.c.to_string(),
+        char: cell.text().to_owned(),
         fg: Some(color_to_proto(&cell.fg)),
         bg: Some(color_to_proto(&cell.bg)),
         attrs: Some(attrs_to_proto(cell.attrs)),
@@ -303,8 +303,7 @@ pub fn screen_to_text(
     // Add scrollback if requested
     if include_scrollback {
         for row in screen.scrollback().iter() {
-            let text: String = row.iter().map(|c| c.c).collect();
-            lines.push(text.trim_end().to_string());
+            lines.push(row.text());
         }
     }
 
@@ -314,10 +313,13 @@ pub fn screen_to_text(
     let end = end.min(screen.height());
 
     for row_idx in start..end {
-        let text: String = (0..screen.width())
-            .map(|col| screen.get_cell(row_idx, col).map(|c| c.c).unwrap_or(' '))
-            .collect();
-        lines.push(text.trim_end().to_string());
+        lines.push(
+            screen
+                .grid()
+                .row(row_idx)
+                .map(|row| row.text())
+                .unwrap_or_default(),
+        );
     }
 
     lines
@@ -411,7 +413,7 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
 }
 
 fn apply_proto_cell(cell: &mut Cell, proto_cell: &proto::Cell) {
-    cell.c = proto_cell.char.chars().next().unwrap_or(' ');
+    cell.set_text(&proto_cell.char);
     cell.fg = proto_cell
         .fg
         .as_ref()
@@ -476,7 +478,7 @@ mod tests {
             "https://example.test".into(),
         ));
         let source_cell = source.screen_mut().grid_mut().get_mut(1, 0).unwrap();
-        source_cell.c = 'x';
+        source_cell.set_text("x\u{301}");
         source_cell.underline_color = Some(Color::rgb(1, 2, 3));
         source_cell.hyperlink = Some(expected_link.clone());
         source.screen_mut().modes.reverse_video = true;
@@ -489,6 +491,7 @@ mod tests {
 
         assert_eq!(restored.screen().images(), source.screen().images());
         let restored_cell = restored.screen().get_cell(1, 0).unwrap();
+        assert_eq!(restored_cell.text(), "x\u{301}");
         assert_eq!(restored_cell.underline_color, Some(Color::rgb(1, 2, 3)));
         assert_eq!(restored_cell.hyperlink, Some(expected_link));
         assert!(restored.screen().modes.reverse_video);
