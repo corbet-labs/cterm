@@ -424,23 +424,14 @@ impl TerminalRenderer {
     /// Draw the terminal grid
     fn draw_grid(&mut self, screen: &Screen) -> windows::core::Result<()> {
         let grid = screen.grid();
-        let scroll_offset = screen.scroll_offset;
         let rows = grid.height();
         let cols = grid.width();
 
         for row in 0..rows {
-            let grid_row = if scroll_offset > 0 {
-                row.saturating_sub(scroll_offset)
-            } else {
-                row
-            };
-
-            if grid_row >= rows {
-                continue;
-            }
+            let absolute_line = screen.visible_row_to_absolute_line(row);
 
             for col in 0..cols {
-                if let Some(cell) = grid.get(grid_row, col) {
+                if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
                     self.draw_cell(row, col, cell, screen.modes.reverse_video)?;
                 }
             }

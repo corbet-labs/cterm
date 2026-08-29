@@ -2446,6 +2446,31 @@ mod tests {
     }
 
     #[test]
+    fn visible_rows_resolve_into_scrollback() {
+        let mut screen = Screen::new(4, 2, ScreenConfig::default());
+
+        for line in ['1', '2', '3'] {
+            screen.put_char(line);
+            screen.carriage_return();
+            screen.line_feed();
+        }
+
+        assert_eq!(screen.scrollback.len(), 2);
+        screen.scroll_offset = 2;
+
+        let first_line = screen.visible_row_to_absolute_line(0);
+        let second_line = screen.visible_row_to_absolute_line(1);
+        assert_eq!(
+            screen.get_cell_with_scrollback(first_line, 0).unwrap().c,
+            '1'
+        );
+        assert_eq!(
+            screen.get_cell_with_scrollback(second_line, 0).unwrap().c,
+            '2'
+        );
+    }
+
+    #[test]
     fn test_alternate_screen() {
         let mut screen = Screen::new(80, 24, ScreenConfig::default());
 
