@@ -62,6 +62,10 @@ impl ScrollRegion {
     }
 }
 
+const fn default_enabled() -> bool {
+    true
+}
+
 /// Terminal modes that affect behavior
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalModes {
@@ -71,6 +75,10 @@ pub struct TerminalModes {
     pub application_keypad: bool,
     /// Auto-wrap mode (DECAWM)
     pub auto_wrap: bool,
+    /// Reverse-wrap mode (DEC private mode 45). When enabled together with
+    /// auto-wrap, backspace at the left edge moves to the previous line.
+    #[serde(default = "default_enabled")]
+    pub reverse_wrap: bool,
     /// Origin mode (DECOM)
     pub origin_mode: bool,
     /// Insert mode (IRM)
@@ -450,6 +458,7 @@ impl Screen {
     pub fn new(width: usize, height: usize, config: ScreenConfig) -> Self {
         let modes = TerminalModes {
             auto_wrap: true,
+            reverse_wrap: true,
             show_cursor: true,
             sixel_scrolling: true,  // Sixel scrolling enabled by default
             alternate_scroll: true, // Alternate-screen wheel-to-arrows enabled by default
@@ -840,6 +849,19 @@ impl Screen {
         }
     }
 
+    /// Move the cursor left for a C0 BS control, including DEC reverse-wrap.
+    pub(crate) fn backspace(&mut self) {
+        if self.cursor.col > 0 {
+            self.cursor.col -= 1;
+        } else if self.modes.reverse_wrap
+            && self.modes.auto_wrap
+            && self.cursor.row > self.scroll_region.top
+        {
+            self.cursor.row -= 1;
+            self.cursor.col = self.width().saturating_sub(1);
+        }
+    }
+
     /// Put a character at the current cursor position
     pub fn put_char(&mut self, c: char) {
         let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
@@ -1220,6 +1242,7 @@ impl Screen {
         self.style = CellStyle::default();
         self.modes = TerminalModes {
             auto_wrap: true,
+            reverse_wrap: true,
             show_cursor: true,
             sixel_scrolling: true,
             alternate_scroll: true,

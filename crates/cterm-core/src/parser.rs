@@ -370,11 +370,7 @@ impl vte::Perform for ScreenPerformer<'_> {
                 log::debug!("Bell");
             }
             // Backspace (BS)
-            0x08 => {
-                if self.screen.cursor.col > 0 {
-                    self.screen.cursor.col -= 1;
-                }
-            }
+            0x08 => self.screen.backspace(),
             // Horizontal Tab (HT)
             0x09 => {
                 self.screen.tab_forward(1);
@@ -1472,6 +1468,8 @@ impl ScreenPerformer<'_> {
             }
             // DECAWM - Auto Wrap Mode
             7 => self.screen.modes.auto_wrap = set,
+            // Reverse Wraparound Mode
+            45 => self.screen.modes.reverse_wrap = set,
             // X10 Mouse Reporting
             9 => {
                 self.screen.modes.mouse_mode = if set { MouseMode::X10 } else { MouseMode::None };
@@ -1566,6 +1564,7 @@ impl ScreenPerformer<'_> {
             1 => self.screen.modes.application_cursor,
             6 => self.screen.modes.origin_mode,
             7 => self.screen.modes.auto_wrap,
+            45 => self.screen.modes.reverse_wrap,
             9 => self.screen.modes.mouse_mode == MouseMode::X10,
             25 => self.screen.modes.show_cursor,
             47 | 1047 | 1049 => self.screen.modes.alternate_screen,
@@ -1838,11 +1837,35 @@ mod tests {
         parser.parse(&mut screen, b"\x1b[?7l\x1b[?7$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?7;2$y"]);
 
+        parser.parse(&mut screen, b"\x1b[?45$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?45;1$y"]);
+
+        parser.parse(&mut screen, b"\x1b[?45l\x1b[?45$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?45;2$y"]);
+
         parser.parse(&mut screen, b"\x1b[?1005$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?1005;4$y"]);
 
         parser.parse(&mut screen, b"\x1b[?2026$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?2026;2$y"]);
+    }
+
+    #[test]
+    fn test_backspace_reverse_wrap_matches_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[2;1H\x08");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (0, 79));
+
+        parser.parse(&mut screen, b"\x1b[?45l\x1b[2;1H\x08");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 0));
+
+        parser.parse(&mut screen, b"\x1b[?45h\x1b[?7l\x1b[2;1H\x08");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 0));
+
+        parser.parse(&mut screen, b"\x1b[?7h\x1b[2;24r\x1b[2;1H\x08");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 0));
     }
 
     #[test]
