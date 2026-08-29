@@ -36,6 +36,8 @@ enum DcsState {
     Decdld { decoder: DecdldDecoder },
     /// XTGETTCAP terminfo capability query in progress
     Xtgettcap { buffer: Vec<u8>, overflowed: bool },
+    /// DECRQSS request-status-string query in progress
+    Decrqss { query: Vec<u8> },
 }
 
 const XTGETTCAP_MAX_REQUEST_SIZE: usize = 64 * 1024;
@@ -450,6 +452,12 @@ impl vte::Perform for ScreenPerformer<'_> {
                     overflowed: false,
                 };
             }
+            // Request status string (DECSTBM, SGR, or DECSCUSR).
+            'q' if intermediates == b"$" => {
+                *self.dcs_state = DcsState::Decrqss {
+                    query: Vec::with_capacity(2),
+                };
+            }
             // DECDLD (soft font download): DCS Pfn;Pcn;Pe;Pcmw;Pss;Pt;Pcmh;Pcss {
             '{' if intermediates.is_empty() => {
                 log::debug!("Starting DECDLD sequence, params: {:?}", params_vec);
@@ -483,6 +491,11 @@ impl vte::Perform for ScreenPerformer<'_> {
                     buffer.push(byte);
                 } else {
                     *overflowed = true;
+                }
+            }
+            DcsState::Decrqss { ref mut query } => {
+                if query.len() < 2 {
+                    query.push(byte);
                 }
             }
             DcsState::None => {}
@@ -582,6 +595,10 @@ impl vte::Perform for ScreenPerformer<'_> {
                 if !response.is_empty() {
                     self.screen.queue_response(response);
                 }
+            }
+            DcsState::Decrqss { query } => {
+                self.screen
+                    .queue_response(decrqss_response(&query, self.screen));
             }
             DcsState::None => {}
         }
@@ -1184,6 +1201,94 @@ fn secondary_device_attributes() -> String {
         env!("CARGO_PKG_VERSION_MINOR"),
         env!("CARGO_PKG_VERSION_PATCH")
     )
+}
+
+fn decrqss_response(query: &[u8], screen: &Screen) -> Vec<u8> {
+    let setting = match query {
+        b"r" => format!(
+            "{};{}r",
+            screen.scroll_region().top + 1,
+            screen.scroll_region().bottom
+        ),
+        b"m" => sgr_status_string(screen),
+        b" q" => {
+            let mode = match (screen.cursor.style, screen.cursor.blink) {
+                (CursorStyle::Block, true) => 1,
+                (CursorStyle::Block, false) => 2,
+                (CursorStyle::Underline, true) => 3,
+                (CursorStyle::Underline, false) => 4,
+                (CursorStyle::Bar, true) => 5,
+                (CursorStyle::Bar, false) => 6,
+            };
+            format!("{mode} q")
+        }
+        _ => return b"\x1bP0$r\x1b\\".to_vec(),
+    };
+
+    format!("\x1bP1$r{setting}\x1b\\").into_bytes()
+}
+
+fn sgr_status_string(screen: &Screen) -> String {
+    let mut attributes = vec!["0".to_string()];
+    let attrs = screen.style.attrs;
+
+    for (flag, value) in [
+        (CellAttrs::BOLD, "1"),
+        (CellAttrs::DIM, "2"),
+        (CellAttrs::ITALIC, "3"),
+        (CellAttrs::BLINK, "5"),
+        (CellAttrs::INVERSE, "7"),
+        (CellAttrs::HIDDEN, "8"),
+        (CellAttrs::STRIKETHROUGH, "9"),
+        (CellAttrs::OVERLINE, "53"),
+    ] {
+        if attrs.contains(flag) {
+            attributes.push(value.to_string());
+        }
+    }
+
+    let underline = if attrs.contains(CellAttrs::DOUBLE_UNDERLINE) {
+        Some("4:2")
+    } else if attrs.contains(CellAttrs::CURLY_UNDERLINE) {
+        Some("4:3")
+    } else if attrs.contains(CellAttrs::DOTTED_UNDERLINE) {
+        Some("4:4")
+    } else if attrs.contains(CellAttrs::DASHED_UNDERLINE) {
+        Some("4:5")
+    } else if attrs.contains(CellAttrs::UNDERLINE) {
+        Some("4")
+    } else {
+        None
+    };
+    if let Some(underline) = underline {
+        attributes.push(underline.to_string());
+    }
+
+    if let Some(color) = sgr_color_status(screen.style.fg, 38, 30, 90) {
+        attributes.push(color);
+    }
+    if let Some(color) = sgr_color_status(screen.style.bg, 48, 40, 100) {
+        attributes.push(color);
+    }
+    if let Some(color) = screen
+        .style
+        .underline_color
+        .and_then(|color| sgr_color_status(color, 58, 0, 0))
+    {
+        attributes.push(color);
+    }
+
+    attributes.join(";") + "m"
+}
+
+fn sgr_color_status(color: Color, extended: usize, base: usize, bright: usize) -> Option<String> {
+    match color {
+        Color::Default => None,
+        Color::Ansi(color) if (color as usize) < 8 => Some((base + color as usize).to_string()),
+        Color::Ansi(color) => Some((bright + color as usize - 8).to_string()),
+        Color::Indexed(index) => Some(format!("{extended}:5:{index}")),
+        Color::Rgb(rgb) => Some(format!("{extended}:2::{}:{}:{}", rgb.r, rgb.g, rgb.b)),
+    }
 }
 
 /// Build foot/xterm-compatible XTGETTCAP replies. The shape and parsing are
@@ -1910,6 +2015,36 @@ mod tests {
                 b"\x1b[4;384;640t".to_vec(),
                 b"\x1b[6;16;8t".to_vec(),
                 b"\x1b[8;24;80t".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_decrqss_reports_scroll_style_and_cursor_state() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            concat!(
+                "\x1b[3;20r",
+                "\x1b[1;3;4:3;38;2;1;2;3;48;5;42;58;2;4;5;6m",
+                "\x1b[5 q",
+                "\x1bP$qm\x1b\\",
+                "\x1bP$qr\x1b\\",
+                "\x1bP$q q\x1b\\",
+                "\x1bP$qz\x1b\\",
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1bP1$r0;1;3;4:3;38:2::1:2:3;48:5:42;58:2::4:5:6m\x1b\\".to_vec(),
+                b"\x1bP1$r3;20r\x1b\\".to_vec(),
+                b"\x1bP1$r5 q\x1b\\".to_vec(),
+                b"\x1bP0$r\x1b\\".to_vec(),
             ]
         );
     }
