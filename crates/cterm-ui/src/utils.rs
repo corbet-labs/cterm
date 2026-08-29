@@ -26,12 +26,13 @@ pub fn format_size(bytes: usize) -> String {
 /// premultiplied BGRA, so keeping the conversion here prevents the two native
 /// backends from quietly disagreeing about alpha or channel order.
 pub fn rgba_to_premultiplied_bgra(rgba: &[u8]) -> Option<Vec<u8>> {
-    if !rgba.len().is_multiple_of(4) {
+    let (pixels, remainder) = rgba.as_chunks::<4>();
+    if !remainder.is_empty() {
         return None;
     }
 
     let mut bgra = Vec::with_capacity(rgba.len());
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in pixels {
         let alpha = u16::from(pixel[3]);
         let premultiply = |channel: u8| ((u16::from(channel) * alpha + 127) / 255) as u8;
         bgra.extend_from_slice(&[
