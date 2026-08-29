@@ -34,7 +34,11 @@ enum DcsState {
     },
     /// DECDLD (soft font download) in progress
     Decdld { decoder: DecdldDecoder },
+    /// XTGETTCAP terminfo capability query in progress
+    Xtgettcap { buffer: Vec<u8>, overflowed: bool },
 }
+
+const XTGETTCAP_MAX_REQUEST_SIZE: usize = 64 * 1024;
 
 /// State for intercepting OSC 1337 File transfers before VTE buffers them
 #[derive(Debug, Default)]
@@ -433,6 +437,13 @@ impl vte::Perform for ScreenPerformer<'_> {
                 Some(2) => self.screen.set_application_sync_updates(false),
                 _ => {}
             },
+            // Query the builtin terminal capability set.
+            'q' if intermediates == b"+" => {
+                *self.dcs_state = DcsState::Xtgettcap {
+                    buffer: Vec::new(),
+                    overflowed: false,
+                };
+            }
             // DECDLD (soft font download): DCS Pfn;Pcn;Pe;Pcmw;Pss;Pt;Pcmh;Pcss {
             '{' if intermediates.is_empty() => {
                 log::debug!("Starting DECDLD sequence, params: {:?}", params_vec);
@@ -457,6 +468,16 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             DcsState::Decdld { ref mut decoder } => {
                 decoder.put(byte);
+            }
+            DcsState::Xtgettcap {
+                ref mut buffer,
+                ref mut overflowed,
+            } => {
+                if buffer.len() < XTGETTCAP_MAX_REQUEST_SIZE {
+                    buffer.push(byte);
+                } else {
+                    *overflowed = true;
+                }
             }
             DcsState::None => {}
         }
@@ -544,6 +565,16 @@ impl vte::Perform for ScreenPerformer<'_> {
 
                     // Store the font in the screen
                     self.screen.add_drcs_font(font, erase_control, font_number);
+                }
+            }
+            DcsState::Xtgettcap { buffer, overflowed } => {
+                let response = if overflowed {
+                    b"\x1bP0+r\x1b\\".to_vec()
+                } else {
+                    xtgettcap_response(&buffer, self.screen.width(), self.screen.height())
+                };
+                if !response.is_empty() {
+                    self.screen.queue_response(response);
                 }
             }
             DcsState::None => {}
@@ -1087,6 +1118,103 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
         }
     }
+}
+
+enum XtgettcapCapability {
+    Boolean,
+    Value(Vec<u8>),
+}
+
+/// Build foot/xterm-compatible XTGETTCAP replies. The shape and parsing are
+/// adapted from Rio; the table deliberately contains only capabilities cterm
+/// implements end to end.
+fn xtgettcap_response(request: &[u8], cols: usize, lines: usize) -> Vec<u8> {
+    if request.is_empty() {
+        return b"\x1bP0+r\x1b\\".to_vec();
+    }
+
+    let mut response = Vec::new();
+    for encoded_name in request.split(|byte| *byte == b';') {
+        let Some(name) = decode_hex(encoded_name) else {
+            continue;
+        };
+
+        match xtgettcap_capability(&name, cols, lines) {
+            Some(XtgettcapCapability::Boolean) => {
+                response.extend_from_slice(b"\x1bP1+r");
+                response.extend_from_slice(encoded_name);
+                response.extend_from_slice(b"\x1b\\");
+            }
+            Some(XtgettcapCapability::Value(value)) => {
+                response.extend_from_slice(b"\x1bP1+r");
+                response.extend_from_slice(encoded_name);
+                response.push(b'=');
+                encode_hex_into(&value, &mut response);
+                response.extend_from_slice(b"\x1b\\");
+            }
+            None => {
+                response.extend_from_slice(b"\x1bP0+r");
+                response.extend_from_slice(encoded_name);
+                response.extend_from_slice(b"\x1b\\");
+            }
+        }
+    }
+
+    response
+}
+
+fn decode_hex(encoded: &[u8]) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+
+    encoded
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn encode_hex_into(bytes: &[u8], output: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    output.reserve(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize]);
+        output.push(HEX[(byte & 0x0f) as usize]);
+    }
+}
+
+fn xtgettcap_capability(name: &[u8], cols: usize, lines: usize) -> Option<XtgettcapCapability> {
+    use XtgettcapCapability::{Boolean, Value};
+
+    let value = match name {
+        b"TN" | b"name" => Value(b"cterm".to_vec()),
+        b"Co" | b"colors" => Value(b"256".to_vec()),
+        b"pa" | b"pairs" => Value(b"32767".to_vec()),
+        b"RGB" => Value(b"8/8/8".to_vec()),
+        b"co" | b"cols" => Value(cols.to_string().into_bytes()),
+        b"li" | b"lines" => Value(lines.to_string().into_bytes()),
+        b"it" => Value(b"8".to_vec()),
+        b"OTbs" | b"bs" | b"am" | b"bce" | b"km" | b"mir" | b"msgr" | b"xenl" | b"xn" | b"AX"
+        | b"XT" | b"XF" | b"npc" | b"Tc" | b"sixel" | b"iterm2" => Boolean,
+        b"Ss" => Value(b"\x1b[%p1%d q".to_vec()),
+        b"Se" => Value(b"\x1b[0 q".to_vec()),
+        b"Smulx" => Value(b"\x1b[4:%p1%dm".to_vec()),
+        b"Sync" => Value(b"\x1bP=%p1%ds\x1b\\".to_vec()),
+        b"kxIN" => Value(b"\x1b[I".to_vec()),
+        b"kxOUT" => Value(b"\x1b[O".to_vec()),
+        b"BE" => Value(b"\x1b[?2004h".to_vec()),
+        b"BD" => Value(b"\x1b[?2004l".to_vec()),
+        b"PS" => Value(b"\x1b[200~".to_vec()),
+        b"PE" => Value(b"\x1b[201~".to_vec()),
+        b"Ms" => Value(b"\x1b]52;%p1%s;%p2%s\x07".to_vec()),
+        _ => return None,
+    };
+
+    Some(value)
 }
 
 impl ScreenPerformer<'_> {
@@ -1848,6 +1976,43 @@ mod tests {
 
         parser.parse(&mut screen, b"\x1b[?2026$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?2026;2$y"]);
+    }
+
+    #[test]
+    fn test_xtgettcap_reports_only_supported_capabilities() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1bP+q544E;436F;524742;636F;6C69;616D;5858\x1b\\",
+        );
+
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![concat!(
+                "\x1bP1+r544E=637465726D\x1b\\",
+                "\x1bP1+r436F=323536\x1b\\",
+                "\x1bP1+r524742=382F382F38\x1b\\",
+                "\x1bP1+r636F=3830\x1b\\",
+                "\x1bP1+r6C69=3234\x1b\\",
+                "\x1bP1+r616D\x1b\\",
+                "\x1bP0+r5858\x1b\\",
+            )
+            .as_bytes()]
+        );
+    }
+
+    #[test]
+    fn test_xtgettcap_empty_and_malformed_queries_are_bounded() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1bP+q\x1b\\");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1bP0+r\x1b\\"]);
+
+        parser.parse(&mut screen, b"\x1bP+qnot-hex\x1b\\");
+        assert!(screen.take_pending_responses().is_empty());
     }
 
     #[test]
