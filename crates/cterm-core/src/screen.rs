@@ -867,6 +867,7 @@ impl Screen {
 
     /// Put a character at the current cursor position
     pub fn put_char(&mut self, c: char) {
+        let c = self.map_active_charset_char(c);
         let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
 
         // Handle auto-wrap
@@ -1691,6 +1692,51 @@ impl Screen {
             self.modes.charset_g1.as_deref()
         } else {
             self.modes.charset_g0.as_deref()
+        }
+    }
+
+    /// Translate the DEC Special Graphics set to Unicode. This table is
+    /// adapted from Rio's tested Rust implementation and matches foot's VT100
+    /// behavior for G0/G1 line drawing.
+    pub(crate) fn map_active_charset_char(&self, c: char) -> char {
+        if self.active_charset_designator() != Some("0") {
+            return c;
+        }
+
+        match c {
+            '_' => ' ',
+            '`' => '◆',
+            'a' => '▒',
+            'b' => '\u{2409}',
+            'c' => '\u{240c}',
+            'd' => '\u{240d}',
+            'e' => '\u{240a}',
+            'f' => '°',
+            'g' => '±',
+            'h' => '\u{2424}',
+            'i' => '\u{240b}',
+            'j' => '┘',
+            'k' => '┐',
+            'l' => '┌',
+            'm' => '└',
+            'n' => '┼',
+            'o' => '⎺',
+            'p' => '⎻',
+            'q' => '─',
+            'r' => '⎼',
+            's' => '⎽',
+            't' => '├',
+            'u' => '┤',
+            'v' => '┴',
+            'w' => '┬',
+            'x' => '│',
+            'y' => '≤',
+            'z' => '≥',
+            '{' => 'π',
+            '|' => '≠',
+            '}' => '£',
+            '~' => '·',
+            _ => c,
         }
     }
 

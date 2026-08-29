@@ -376,6 +376,7 @@ struct ScreenPerformer<'a> {
 
 impl vte::Perform for ScreenPerformer<'_> {
     fn print(&mut self, c: char) {
+        let c = self.screen.map_active_charset_char(c);
         *self.last_printed = Some(c);
         self.screen.put_char(c);
     }
@@ -1602,9 +1603,9 @@ impl ScreenPerformer<'_> {
         // Standard character sets return None (use built-in)
         // B = ASCII, 0 = DEC Special Graphics, etc.
         match (intermediates, final_char) {
-            ([], b'B') => None, // ASCII
-            ([], b'0') => None, // DEC Special Graphics (handled separately)
-            ([], b'A') => None, // UK
+            ([], b'B') => None,                  // ASCII
+            ([], b'0') => Some("0".to_string()), // DEC Special Graphics
+            ([], b'A') => None,                  // UK
             _ => {
                 // Build designator string for DRCS lookup
                 let mut designator = String::new();
@@ -2365,6 +2366,26 @@ mod tests {
         assert!(!screen.modes.alternate_screen);
         assert!(screen.modes.application_keypad);
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?66;1$y"]);
+    }
+
+    #[test]
+    fn test_dec_special_graphics_maps_g0_and_g1_like_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b(0ABCabcdefghijklmnopqrstuvwxyzDEF\r\n\x1b(Bhello",
+        );
+        assert_eq!(
+            screen.grid().row(0).unwrap().text().trim_end(),
+            "ABC▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥DEF"
+        );
+        assert_eq!(screen.grid().row(1).unwrap().text().trim_end(), "hello");
+
+        let mut screen = make_screen();
+        parser.parse(&mut screen, b"\x1b)0\x0eSO-lqk\x0f-SI");
+        assert_eq!(screen.grid().row(0).unwrap().text().trim_end(), "SO-┌─┐-SI");
     }
 
     #[test]

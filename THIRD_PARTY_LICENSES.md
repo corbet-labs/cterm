@@ -5,7 +5,7 @@ components listed here. The original notices are preserved in the derived files.
 
 | Component | Upstream revision | cterm use | License |
 |---|---|---|---|
-| Rio / Sugarloaf | `357281638216876a2406c46e50033e7143256175` | Adapted Rust rasterizers for box drawing, block elements, braille, sextants, and octants in `cterm-ui`; adapted XTGETTCAP parsing and tests in `cterm-core` | MIT |
+| Rio / Sugarloaf | `357281638216876a2406c46e50033e7143256175` | Adapted Rust rasterizers for box drawing, block elements, braille, sextants, and octants in `cterm-ui`; adapted XTGETTCAP parsing, DEC Special Graphics mapping, and tests in `cterm-core` | MIT |
 
 foot (`85655c74a4ded119392ea8b632626c3920042807`, MIT) is the behavioral reference
 for the Linux terminal experience. No foot source is included by this revision.
