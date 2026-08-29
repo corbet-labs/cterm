@@ -6,6 +6,7 @@
 //! Special handling is provided for OSC 1337 (iTerm2) file transfers
 //! which are intercepted before VTE to enable streaming large files.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use vte::Params;
 
@@ -66,6 +67,8 @@ pub struct Parser {
     dcs_state: DcsState,
     /// Most recent graphic character for ECMA-48 REP.
     last_printed: Option<char>,
+    /// Saved DEC private modes for xterm XTSAVE/XTRESTORE.
+    saved_dec_modes: HashMap<usize, bool>,
     /// State for intercepting OSC 1337 File sequences
     osc_1337_state: Osc1337State,
     /// Whether an OSC 1337 string terminator (BEL or ESC \) was seen
@@ -84,6 +87,7 @@ impl Parser {
             state_machine: vte::Parser::new(),
             dcs_state: DcsState::None,
             last_printed: None,
+            saved_dec_modes: HashMap::new(),
             osc_1337_state: Osc1337State::None,
             osc_1337_terminated: false,
         }
@@ -110,6 +114,7 @@ impl Parser {
                 screen,
                 dcs_state: &mut self.dcs_state,
                 last_printed: &mut self.last_printed,
+                saved_dec_modes: &mut self.saved_dec_modes,
             };
             self.state_machine.advance(&mut performer, byte);
         }
@@ -366,6 +371,7 @@ struct ScreenPerformer<'a> {
     screen: &'a mut Screen,
     dcs_state: &'a mut DcsState,
     last_printed: &'a mut Option<char>,
+    saved_dec_modes: &'a mut HashMap<usize, bool>,
 }
 
 impl vte::Perform for ScreenPerformer<'_> {
@@ -1014,6 +1020,34 @@ impl vte::Perform for ScreenPerformer<'_> {
                     _ => requested,
                 };
                 self.screen.set_keyboard_enhancement_flags(flags);
+            }
+            // Save DEC private modes (XTSAVE).
+            ('s', [b'?']) => {
+                for &mode in &params_vec {
+                    if mode == 1048 {
+                        self.screen.save_cursor();
+                        continue;
+                    }
+                    match self.dec_private_mode_status(mode) {
+                        1 => {
+                            self.saved_dec_modes.insert(mode, true);
+                        }
+                        2 => {
+                            self.saved_dec_modes.insert(mode, false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Restore DEC private modes (XTRESTORE).
+            ('r', [b'?']) => {
+                for &mode in &params_vec {
+                    if mode == 1048 {
+                        self.screen.restore_cursor();
+                    } else if let Some(enabled) = self.saved_dec_modes.get(&mode).copied() {
+                        self.handle_dec_mode(mode, enabled);
+                    }
+                }
             }
             // Set Mode (SM) / Reset Mode (RM)
             ('h', [b'?']) | ('l', [b'?']) => {
@@ -2215,6 +2249,21 @@ mod tests {
 
         parser.parse(&mut screen, b"\x1b[?2026$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?2026;2$y"]);
+    }
+
+    #[test]
+    fn test_xtsave_and_xtrestore_preserve_private_modes_and_cursor() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[?1h\x1b[?45l\x1b[?2004h\x1b[?1;45;2004s");
+        parser.parse(&mut screen, b"\x1b[?1l\x1b[?45h\x1b[?2004l\x1b[?1;45;2004r");
+        assert!(screen.modes.application_cursor);
+        assert!(!screen.modes.reverse_wrap);
+        assert!(screen.modes.bracketed_paste);
+
+        parser.parse(&mut screen, b"\x1b[8;12H\x1b[?1048s\x1b[1;1H\x1b[?1048r");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (7, 11));
     }
 
     #[test]
