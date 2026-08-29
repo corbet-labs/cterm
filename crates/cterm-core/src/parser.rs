@@ -503,8 +503,9 @@ impl vte::Perform for ScreenPerformer<'_> {
 
                     // Handle cursor positioning based on DECSDM mode
                     if self.screen.modes.sixel_scrolling {
-                        // Sixel scrolling enabled: cursor moves to last row of image, column 0
-                        // VT340 behavior: cursor at first column of last image row
+                        // Sixel scrolling enabled: place the cursor on the last
+                        // image row.  By default it remains at the image's left
+                        // edge; xterm mode 8452 moves it just to the right.
                         let last_image_row = img_row + rows_spanned.saturating_sub(1);
 
                         if last_image_row >= self.screen.height() {
@@ -515,7 +516,11 @@ impl vte::Perform for ScreenPerformer<'_> {
                         } else {
                             self.screen.cursor.row = last_image_row;
                         }
-                        self.screen.cursor.col = 0;
+                        self.screen.cursor.col = if self.screen.modes.sixel_cursor_right {
+                            (img_col + cols_spanned).min(self.screen.width().saturating_sub(1))
+                        } else {
+                            img_col
+                        };
                     }
                     // If sixel_scrolling is false, cursor stays where it was (start_col, start_row)
                 }
@@ -1535,6 +1540,8 @@ impl ScreenPerformer<'_> {
             }
             // Bracketed Paste Mode
             2004 => self.screen.modes.bracketed_paste = set,
+            // xterm Sixel Cursor Right of Graphics
+            8452 => self.screen.modes.sixel_cursor_right = set,
             _ => {
                 log::trace!("Unknown DEC mode: {} = {}", mode, set);
             }
@@ -1563,6 +1570,7 @@ impl ScreenPerformer<'_> {
             1006 => self.screen.modes.sgr_mouse,
             1007 => self.screen.modes.alternate_scroll,
             2004 => self.screen.modes.bracketed_paste,
+            8452 => self.screen.modes.sixel_cursor_right,
             // Recognized legacy encodings which cterm deliberately never uses.
             67 | 1001 | 1005 => return 4,
             _ => return 0,
@@ -1855,5 +1863,22 @@ mod tests {
         assert!(!screen.modes.alternate_screen);
         assert!(screen.modes.application_keypad);
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?66;1$y"]);
+    }
+
+    #[test]
+    fn test_sixel_cursor_position_matches_mode_8452() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        // Draw a one-cell sixel from column 5.  The DEC default leaves the
+        // cursor at the image's left edge, not at column zero.
+        parser.parse(&mut screen, b"\x1b[6G\x1bPq~\x1b\\");
+        assert_eq!(screen.cursor.col, 5);
+
+        parser.parse(&mut screen, b"\x1b[?8452h\x1b[6G\x1bPq~\x1b\\");
+        assert_eq!(screen.cursor.col, 6);
+
+        parser.parse(&mut screen, b"\x1b[?8452$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?8452;1$y"]);
     }
 }

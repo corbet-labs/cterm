@@ -99,6 +99,10 @@ pub struct TerminalModes {
     /// When true (default), sixel images start at cursor and can scroll
     /// When false, sixel images start at top-left and don't scroll
     pub sixel_scrolling: bool,
+    /// Position the cursor to the right of newly drawn sixels (mode 8452)
+    /// instead of at the image's left edge on the following text row.
+    #[serde(default)]
+    pub sixel_cursor_right: bool,
     /// G0 character set designator (None = standard ASCII)
     pub charset_g0: Option<String>,
     /// G1 character set designator (None = standard)
