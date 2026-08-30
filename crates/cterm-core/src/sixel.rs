@@ -742,7 +742,7 @@ mod tests {
         decoder.put(b'~');
         let image = decoder.finish().unwrap();
         assert_eq!((image.width, image.height), (1, 12));
-        for pixel in image.data.chunks_exact(4) {
+        for pixel in image.data.as_chunks::<4>().0 {
             assert_eq!(pixel[3], 255);
         }
     }
@@ -832,8 +832,10 @@ mod tests {
         assert_eq!(image.data.len(), 12 * 10 * 4);
         assert!(image
             .data
-            .chunks_exact(4)
-            .all(|pixel| pixel == [0, 0, 0, 255]));
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel == &[0, 0, 0, 255]));
     }
 
     #[test]
