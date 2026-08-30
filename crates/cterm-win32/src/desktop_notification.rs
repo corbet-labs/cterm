@@ -179,7 +179,7 @@ fn remove_native(hwnd: HWND, native_id: u32) {
         ..Default::default()
     };
     unsafe {
-        Shell_NotifyIconW(NIM_DELETE, &remove);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &remove);
     }
 }
 
