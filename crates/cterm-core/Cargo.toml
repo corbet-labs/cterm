@@ -33,4 +33,13 @@ libc = "0.2"
 winapi = { version = "0.3", features = ["consoleapi", "handleapi", "namedpipeapi", "processthreadsapi", "synchapi", "winbase", "wincon", "winnt", "winerror"] }
 
 [dev-dependencies]
+criterion = "0.8.2"
 env_logger.workspace = true
+
+[[bench]]
+name = "parser"
+harness = false
+
+[[bench]]
+name = "resize_reflow"
+harness = false

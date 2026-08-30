@@ -330,6 +330,7 @@ identity_file = "~/.ssh/prod_key"
 | 1047 | — | Alternate screen buffer |
 | 1048 | — | Save/restore cursor |
 | 1049 | — | Alternate screen buffer with cursor save/restore |
+| 1070 | — | Use a private palette for each Sixel image |
 | 2004 | — | Bracketed paste mode |
 | 2026 | — | Synchronized application updates |
 | 2031 | — | Native theme change reports |
@@ -422,8 +423,13 @@ page, and preserve the cursor position.
 ### Sixel Graphics
 
 cterm supports DEC Sixel graphics for inline image display:
-- Full color palette support (up to 256 colors)
-- RGB and HLS color definitions
+- Full color palette support (up to 1024 colors)
+- RGB and DEC HLS color definitions
+- DEC pixel-aspect ratios and raster attributes (`Pan`, `Pad`, `Ph`, `Pv`)
+- Private and shared color registers via DEC mode 1070
+- Foot-compatible color and geometry management replies (`CSI ? … S`)
+- Configurable dimensions up to 10,000×10,000 pixels, with a separate 64 MiB
+  default allocation budget for untrusted output
 - DECSDM mode for controlling image placement and scrolling
 - Images scroll with terminal content
 - Grid cells under images are cleared (xterm-compatible behavior)
@@ -496,12 +502,17 @@ cterm/
 
 The modular architecture enables:
 - **cterm-core**: Pure Rust terminal emulation, reusable in other projects
-- **cterm-ui**: UI-agnostic traits for toolkit abstraction
+- **cterm-ui**: UI-agnostic traits plus the deterministic split-pane layout core
 - **cterm-app**: Shared application logic between UI implementations
 - **cterm-cocoa**: Native macOS implementation using AppKit and CoreGraphics
 - **cterm-gtk**: GTK4-specific rendering and widgets (Linux)
 - **cterm-win32**: Native Windows implementation using Win32 and Direct2D
 - **cterm-headless**: Headless terminal daemon for remote access (ctermd)
+
+Parser, full-screen redraw, Unicode, resize, and scrollback-reflow performance
+can be measured locally with `cargo bench -p cterm-core`. GitHub Actions runs
+the same deterministic Criterion suite on changes to the benchmarks and on a
+weekly schedule, retaining its HTML report as an artifact.
 
 ## Built-in Themes
 
@@ -529,7 +540,7 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 
 ### Future
 
-- Split panes
+- Bind the completed pane-layout core to the three native frontends
 - Plugin system
 - Additional foot-compatible behavior and performance work
 - Android and iOS local-terminal frontends (distant targets)
