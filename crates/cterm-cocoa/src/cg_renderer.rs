@@ -356,7 +356,8 @@ impl CGRenderer {
             return;
         };
         unsafe {
-            let cg_context: *mut std::ffi::c_void = msg_send![&context, CGContext];
+            let cg_context = context.CGContext();
+            let cg_context: *mut std::ffi::c_void = Retained::as_ptr(&cg_context).cast_mut().cast();
 
             #[repr(C)]
             #[derive(Copy, Clone)]
@@ -553,7 +554,9 @@ impl CGRenderer {
 
             // Get current graphics context
             if let Some(context) = NSGraphicsContext::currentContext() {
-                let cg_context: *mut std::ffi::c_void = msg_send![&context, CGContext];
+                let cg_context = context.CGContext();
+                let cg_context: *mut std::ffi::c_void =
+                    Retained::as_ptr(&cg_context).cast_mut().cast();
 
                 if !cg_context.is_null() {
                     CGContextSaveGState(cg_context);
