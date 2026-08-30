@@ -100,6 +100,24 @@ run_probe() {
         exit 1
     fi
 
+    if kill -0 "$app_pid" 2>/dev/null; then
+        # A partial report means the probe reached at least one case but is
+        # still blocked on a later reply. Preserve the exact progress in logs.
+        for _attempt in $(seq 1 30); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+    fi
+
+    if kill -0 "$app_pid" 2>/dev/null; then
+        printf 'ERROR: %s compatibility probe stopped after:\n' "$terminal" >&2
+        cat "$report" >&2
+        tail -100 "$stderr_log" >&2 || true
+        exit 1
+    fi
+
     kill "$app_pid" 2>/dev/null || true
     wait "$app_pid" 2>/dev/null || true
     app_pid=

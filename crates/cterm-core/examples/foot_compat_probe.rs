@@ -86,6 +86,7 @@ mod unix {
 
         let mut report = String::new();
         for (name, request, terminator) in cases {
+            eprintln!("cterm compatibility probe: starting {name}");
             let response = exchange(&mut stdin, &mut stdout, request, terminator)?;
             report.push_str(name);
             report.push('=');
@@ -94,6 +95,8 @@ mod unix {
                 write!(report, "{byte:02x}")?;
             }
             report.push('\n');
+            fs::write(&output_path, &report)?;
+            eprintln!("cterm compatibility probe: completed {name}");
         }
 
         stdout.write_all(b"\x1b[0m\x1b[r\x1b[H\x1b]110\x1b\\")?;
