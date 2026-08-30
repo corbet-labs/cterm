@@ -118,6 +118,24 @@ send_pane_shortcut() {
     esac
 }
 
+select_pane_menu_item() {
+    local item="$1"
+
+    # macOS reserves some Control+Option combinations for system features, so
+    # hosted runners may consume directional pane shortcuts before AppKit sees
+    # them. Clicking the native menu item still exercises the same production
+    # selector and first-responder path without depending on host key settings.
+    focus_cterm
+    osascript <<EOF
+tell application "System Events"
+    set ctermProcess to first process whose unix id is $CTERM_PID
+    tell ctermProcess
+        click menu item "$item" of menu 1 of menu bar item "Pane" of menu bar 1
+    end tell
+end tell
+EOF
+}
+
 wait_for_cterm_log() {
     local pattern="$1"
     local description="$2"
@@ -272,8 +290,8 @@ sleep 1
 take_screenshot "05_new_tab"
 
 # Exercise the native AppKit pane host. Key codes avoid keyboard-layout
-# ambiguity on the hosted runner (42=backslash, 27=minus, 126=up,
-# 125=down, 36=return, 117=forward delete).
+# ambiguity on the hosted runner (42=backslash, 27=minus, 36=return,
+# 117=forward delete).
 log "Testing native horizontal pane split..."
 send_pane_shortcut 42 "ctrl+shift"
 wait_for_cterm_log 'Split pane Horizontal' "Horizontal pane split succeeded"
@@ -284,11 +302,11 @@ wait_for_cterm_log 'Split pane Vertical' "Vertical pane split succeeded"
 take_screenshot "06_split_panes"
 
 log "Testing directional pane focus..."
-send_pane_shortcut 126 "ctrl+option"
+select_pane_menu_item "Focus Up"
 wait_for_cterm_log 'Focused pane .*Up' "Directional pane focus succeeded"
 
 log "Testing pane divider resize..."
-send_pane_shortcut 125 "ctrl+option+shift"
+select_pane_menu_item "Resize Down"
 wait_for_cterm_log 'Resized pane .*Down' "Pane divider resize succeeded"
 
 log "Testing pane zoom and unzoom..."
