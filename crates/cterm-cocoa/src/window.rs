@@ -636,12 +636,13 @@ impl CtermWindow {
             return false;
         };
         let point = self.point_in_pane_host(point_in_window);
-        match self
-            .ivars()
-            .panes
-            .borrow_mut()
-            .drag_divider(&divider, point.x, point.y)
-        {
+        let drag_result = {
+            self.ivars()
+                .panes
+                .borrow_mut()
+                .drag_divider(&divider, point.x, point.y)
+        };
+        match drag_result {
             Ok(true) => {
                 self.layout_panes();
                 self.sync_active_terminal(false);
@@ -776,7 +777,8 @@ impl CtermWindow {
     }
 
     fn focus_pane(&self, id: PaneId) {
-        if self.ivars().panes.borrow_mut().set_active(id).is_ok() {
+        let focused = { self.ivars().panes.borrow_mut().set_active(id).is_ok() };
+        if focused {
             log::info!("Focused pane {}", id);
             self.layout_panes();
             self.sync_active_terminal(true);
@@ -785,12 +787,13 @@ impl CtermWindow {
 
     fn focus_pane_direction(&self, direction: PaneDirection) {
         let bounds = self.pane_bounds();
-        if let Some(active) = self
-            .ivars()
-            .panes
-            .borrow_mut()
-            .focus_direction(direction, bounds)
-        {
+        let focused = {
+            self.ivars()
+                .panes
+                .borrow_mut()
+                .focus_direction(direction, bounds)
+        };
+        if let Some(active) = focused {
             log::info!("Focused pane {} {:?}", active, direction);
             self.layout_panes();
             self.sync_active_terminal(true);
@@ -811,13 +814,14 @@ impl CtermWindow {
                 .max(1.0) as u32
             })
             .unwrap_or(1);
-        if self
-            .ivars()
-            .panes
-            .borrow_mut()
-            .layout_mut()
-            .adjust_active_size(direction, amount, bounds)
-        {
+        let resized = {
+            self.ivars()
+                .panes
+                .borrow_mut()
+                .layout_mut()
+                .adjust_active_size(direction, amount, bounds)
+        };
+        if resized {
             let active = self.ivars().panes.borrow().active_id();
             log::info!("Resized pane {} {:?}", active, direction);
             self.layout_panes();
@@ -959,12 +963,13 @@ impl CtermWindow {
             placement: SplitPlacement::Second,
             ratio: SplitRatio::HALF,
         };
-        match self
-            .ivars()
-            .panes
-            .borrow_mut()
-            .split(target, request, entry)
-        {
+        let split_result = {
+            self.ivars()
+                .panes
+                .borrow_mut()
+                .split(target, request, entry)
+        };
+        match split_result {
             Ok(pane_id) => {
                 log::info!("Split pane {:?}: pane {}", direction, pane_id);
                 self.add_pane_frame(&frame);
@@ -1014,7 +1019,8 @@ impl CtermWindow {
     }
 
     fn remove_pane(&self, target: PaneId) {
-        match self.ivars().panes.borrow_mut().close(target) {
+        let close_result = { self.ivars().panes.borrow_mut().close(target) };
+        match close_result {
             Ok(entry) => {
                 log::info!("Closed pane {}", target);
                 entry.terminal.removeFromSuperview();
