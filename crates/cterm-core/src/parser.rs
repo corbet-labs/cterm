@@ -664,6 +664,21 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // Set/query 256-color palette entries.
+            4 => {
+                for pair in params[1..].chunks_exact(2) {
+                    let Ok(index) = std::str::from_utf8(pair[0]).unwrap_or("").parse::<u8>() else {
+                        continue;
+                    };
+                    let value = std::str::from_utf8(pair[1]).unwrap_or("");
+                    if value == "?" {
+                        self.screen.queue_palette_query(index);
+                    } else if let Some(color) = Rgb::from_xparse_color(value) {
+                        self.screen
+                            .set_dynamic_color(ColorQuery::Palette(index), Some(color));
+                    }
+                }
+            }
             // Set/query colors (10-19)
             // OSC 10 = foreground, 11 = background, 12 = cursor
             10..=12 => {
@@ -687,6 +702,19 @@ impl vte::Perform for ScreenPerformer<'_> {
             110..=112 => {
                 if let Some(target) = ColorQuery::from_osc_code(command - 100) {
                     self.screen.set_dynamic_color(target, None);
+                }
+            }
+            // Reset one, several, or all 256-color palette entries.
+            104 => {
+                if params.get(1).is_none_or(|value| value.is_empty()) {
+                    self.screen.reset_dynamic_palette();
+                } else {
+                    for value in &params[1..] {
+                        if let Ok(index) = std::str::from_utf8(value).unwrap_or("").parse::<u8>() {
+                            self.screen
+                                .set_dynamic_color(ColorQuery::Palette(index), None);
+                        }
+                    }
                 }
             }
             // iTerm2 inline images and file transfer (1337)
@@ -2226,6 +2254,57 @@ mod tests {
             Some(Rgb::new(0x40, 0x50, 0x60))
         );
         assert_eq!(screen.dynamic_color(ColorQuery::Cursor), None);
+    }
+
+    #[test]
+    fn test_osc_palette_set_query_and_reset_match_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]4;1;#123;200;rgb:40/80/c0;1;?;200;?\x1b\\",
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Palette(1)),
+            Some(Rgb::new(0x11, 0x22, 0x33))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Palette(200)),
+            Some(Rgb::new(0x40, 0x80, 0xc0))
+        );
+        assert_eq!(
+            screen.take_color_queries(),
+            vec![
+                (ColorQuery::Palette(1), Some(Rgb::new(0x11, 0x22, 0x33))),
+                (ColorQuery::Palette(200), Some(Rgb::new(0x40, 0x80, 0xc0))),
+            ]
+        );
+
+        parser.parse(&mut screen, b"\x1b]104;1;bogus;200\x1b\\");
+        assert_eq!(screen.dynamic_color(ColorQuery::Palette(1)), None);
+        assert_eq!(screen.dynamic_color(ColorQuery::Palette(200)), None);
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]4;2;#abcdef;255;#010203\x1b\\\x1b]104\x1b\\",
+        );
+        assert_eq!(screen.dynamic_color(ColorQuery::Palette(2)), None);
+        assert_eq!(screen.dynamic_color(ColorQuery::Palette(255)), None);
+    }
+
+    #[test]
+    fn test_osc_palette_rejects_invalid_indices_and_colors() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]4;256;#ffffff;3;invalid;not-an-index;?\x1b\\",
+        );
+
+        assert_eq!(screen.dynamic_palette_colors().count(), 0);
+        assert!(screen.take_color_queries().is_empty());
     }
 
     #[test]

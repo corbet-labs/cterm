@@ -4,7 +4,7 @@
 //! and scroll operations.
 
 use crate::cell::{Cell, CellAttrs, CellStyle, MAX_GRAPHEME_BYTES};
-use crate::color::{ColorPalette, Rgb};
+use crate::color::{Color, ColorPalette, Rgb};
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
@@ -183,9 +183,11 @@ pub enum ClipboardOperation {
     Query { selection: ClipboardSelection },
 }
 
-/// Color query type (OSC 10-12)
+/// Color query type (OSC 4 and OSC 10-12)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorQuery {
+    /// Query one entry in the 256-color palette (OSC 4)
+    Palette(u8),
     /// Query foreground color (OSC 10)
     Foreground,
     /// Query background color (OSC 11)
@@ -206,6 +208,7 @@ impl ColorQuery {
 
     pub const fn osc_code(self) -> u8 {
         match self {
+            Self::Palette(_) => 4,
             Self::Foreground => 10,
             Self::Background => 11,
             Self::Cursor => 12,
@@ -455,7 +458,7 @@ pub struct Screen {
     pending_responses: Vec<Vec<u8>>,
     /// Pending clipboard operations from OSC 52
     pending_clipboard_ops: Vec<ClipboardOperation>,
-    /// Pending color queries (OSC 10-12)
+    /// Pending color queries (OSC 4 and OSC 10-12)
     pending_color_queries: Vec<(ColorQuery, Option<Rgb>)>,
     /// UI theme used when replying to color queries. The headless daemon does
     /// not set this; the attached frontend is authoritative for theme colors.
@@ -465,6 +468,8 @@ pub struct Screen {
     dynamic_foreground: Option<Rgb>,
     dynamic_background: Option<Rgb>,
     dynamic_cursor: Option<Rgb>,
+    /// Application-provided overrides from OSC 4, indexed by palette entry.
+    dynamic_palette: [Option<Rgb>; 256],
     /// Current text selection (if any)
     pub selection: Option<Selection>,
     /// Terminal images (Sixel, etc.)
@@ -661,6 +666,7 @@ impl Screen {
             dynamic_foreground: None,
             dynamic_background: None,
             dynamic_cursor: None,
+            dynamic_palette: [None; 256],
             selection: None,
             images: HashMap::new(),
             // Zero is reserved as an invalid/sentinel identifier by native UI
@@ -765,7 +771,7 @@ impl Screen {
         !self.pending_clipboard_ops.is_empty()
     }
 
-    /// Queue a color query (from OSC 10-12)
+    /// Queue a default-color query (from OSC 10-12)
     pub fn queue_color_query(&mut self, osc_code: u8) {
         let query = match osc_code {
             10 => ColorQuery::Foreground,
@@ -775,6 +781,13 @@ impl Screen {
         };
         let dynamic_color = self.dynamic_color(query);
         self.pending_color_queries.push((query, dynamic_color));
+    }
+
+    /// Queue one 256-color palette query (OSC 4).
+    pub fn queue_palette_query(&mut self, index: u8) {
+        let query = ColorQuery::Palette(index);
+        self.pending_color_queries
+            .push((query, self.dynamic_color(query)));
     }
 
     /// Take all pending color queries (drains the queue)
@@ -802,6 +815,7 @@ impl Screen {
     /// Set or reset an application-provided default color.
     pub fn set_dynamic_color(&mut self, target: ColorQuery, color: Option<Rgb>) {
         match target {
+            ColorQuery::Palette(index) => self.dynamic_palette[index as usize] = color,
             ColorQuery::Foreground => self.dynamic_foreground = color,
             ColorQuery::Background => self.dynamic_background = color,
             ColorQuery::Cursor => self.dynamic_cursor = color,
@@ -812,6 +826,7 @@ impl Screen {
     /// Return an application-provided default color override.
     pub fn dynamic_color(&self, target: ColorQuery) -> Option<Rgb> {
         match target {
+            ColorQuery::Palette(index) => self.dynamic_palette[index as usize],
             ColorQuery::Foreground => self.dynamic_foreground,
             ColorQuery::Background => self.dynamic_background,
             ColorQuery::Cursor => self.dynamic_cursor,
@@ -821,6 +836,11 @@ impl Screen {
     /// Resolve dynamic terminal defaults over a frontend theme palette.
     pub fn resolved_palette(&self, base: &ColorPalette) -> ColorPalette {
         let mut palette = base.clone();
+        for (index, color) in self.dynamic_palette[..16].iter().enumerate() {
+            if let Some(color) = color {
+                palette.ansi[index] = *color;
+            }
+        }
         if let Some(color) = self.dynamic_foreground {
             palette.foreground = color;
         }
@@ -833,9 +853,37 @@ impl Screen {
         palette
     }
 
+    /// Resolve a cell color, including all OSC 4 palette overrides.
+    pub fn resolve_color(&self, color: Color, palette: &ColorPalette) -> Rgb {
+        match color {
+            Color::Ansi(ansi) => {
+                self.dynamic_palette[ansi as usize].unwrap_or_else(|| color.to_rgb(palette))
+            }
+            Color::Indexed(index) => {
+                self.dynamic_palette[index as usize].unwrap_or_else(|| color.to_rgb(palette))
+            }
+            _ => color.to_rgb(palette),
+        }
+    }
+
+    /// Reset every application-provided OSC 4 palette override.
+    pub fn reset_dynamic_palette(&mut self) {
+        self.dynamic_palette.fill(None);
+        self.dirty = true;
+    }
+
+    /// Iterate over the active OSC 4 palette overrides.
+    pub fn dynamic_palette_colors(&self) -> impl Iterator<Item = (u8, Rgb)> + '_ {
+        self.dynamic_palette
+            .iter()
+            .enumerate()
+            .filter_map(|(index, color)| color.map(|color| (index as u8, color)))
+    }
+
     /// Return one queried color from the frontend's configured palette.
     pub fn base_query_color(&self, target: ColorQuery) -> Rgb {
         match target {
+            ColorQuery::Palette(index) => Color::Indexed(index).to_rgb(&self.base_palette),
             ColorQuery::Foreground => self.base_palette.foreground,
             ColorQuery::Background => self.base_palette.background,
             ColorQuery::Cursor => self.base_palette.cursor,
@@ -1708,6 +1756,7 @@ impl Screen {
         self.dynamic_foreground = None;
         self.dynamic_background = None;
         self.dynamic_cursor = None;
+        self.dynamic_palette.fill(None);
         self.drcs_fonts.clear();
         self.keyboard_main_stack.clear();
         self.keyboard_alt_stack.clear();
@@ -2602,14 +2651,14 @@ impl Screen {
 
                         // Foreground color (skip if default)
                         if !cell.fg.is_default() {
-                            let rgb = cell.fg.to_rgb(palette);
+                            let rgb = self.resolve_color(cell.fg, palette);
                             style_parts
                                 .push(format!("color: #{:02X}{:02X}{:02X}", rgb.r, rgb.g, rgb.b));
                         }
 
                         // Background color (skip if default)
                         if !cell.bg.is_default() {
-                            let rgb = cell.bg.to_rgb(palette);
+                            let rgb = self.resolve_color(cell.bg, palette);
                             style_parts.push(format!(
                                 "background-color: #{:02X}{:02X}{:02X}",
                                 rgb.r, rgb.g, rgb.b
@@ -2759,6 +2808,35 @@ mod tests {
         assert_eq!(screen.height(), 24);
         assert_eq!(screen.cursor.row, 0);
         assert_eq!(screen.cursor.col, 0);
+    }
+
+    #[test]
+    fn dynamic_palette_resolves_ansi_and_extended_indices() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        let base = ColorPalette::default_dark();
+        let ansi = Rgb::new(1, 2, 3);
+        let extended = Rgb::new(4, 5, 6);
+
+        screen.set_dynamic_color(ColorQuery::Palette(1), Some(ansi));
+        screen.set_dynamic_color(ColorQuery::Palette(200), Some(extended));
+
+        let resolved = screen.resolved_palette(&base);
+        assert_eq!(resolved.ansi[1], ansi);
+        assert_eq!(
+            screen.resolve_color(Color::Ansi(crate::AnsiColor::Red), &resolved),
+            ansi
+        );
+        assert_eq!(screen.resolve_color(Color::Indexed(1), &resolved), ansi);
+        assert_eq!(
+            screen.resolve_color(Color::Indexed(200), &resolved),
+            extended
+        );
+
+        screen.reset_dynamic_palette();
+        assert_ne!(
+            screen.resolve_color(Color::Indexed(200), &resolved),
+            extended
+        );
     }
 
     #[test]

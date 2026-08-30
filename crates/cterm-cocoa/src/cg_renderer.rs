@@ -180,21 +180,21 @@ impl CGRenderer {
                         let fg_rgb = if cell.bg.is_default() {
                             *normal_background
                         } else {
-                            Self::color_to_rgb(&cell.bg, &palette)
+                            Self::color_to_rgb(screen, &cell.bg, &palette)
                         };
                         let bg_rgb = if fg.is_default() {
                             palette.foreground
                         } else {
-                            Self::color_to_rgb(&fg, &palette)
+                            Self::color_to_rgb(screen, &fg, &palette)
                         };
                         (fg_rgb, bg_rgb)
                     } else {
                         let bg = if cell.bg.is_default() {
                             *normal_background
                         } else {
-                            Self::color_to_rgb(&cell.bg, &palette)
+                            Self::color_to_rgb(screen, &cell.bg, &palette)
                         };
-                        (Self::color_to_rgb(&fg, &palette), bg)
+                        (Self::color_to_rgb(screen, &fg, &palette), bg)
                     };
 
                     // Apply dim (SGR 2) — halve foreground brightness
@@ -258,7 +258,7 @@ impl CGRenderer {
                                 b: 237,
                             } // Cornflower blue for hyperlinks
                         } else if let Some(ref uc) = cell.underline_color {
-                            Self::color_to_rgb(uc, &palette)
+                            Self::color_to_rgb(screen, uc, &palette)
                         } else {
                             fg_color
                         };
@@ -808,8 +808,8 @@ impl CGRenderer {
         }
     }
 
-    fn color_to_rgb(color: &Color, palette: &ColorPalette) -> Rgb {
-        color.to_rgb(palette)
+    fn color_to_rgb(screen: &cterm_core::Screen, color: &Color, palette: &ColorPalette) -> Rgb {
+        screen.resolve_color(*color, palette)
     }
 
     /// Update theme colors

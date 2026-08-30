@@ -2029,14 +2029,14 @@ fn draw_terminal(
                 if cell.bg == Color::Default {
                     *normal_background
                 } else {
-                    cell.bg.to_rgb(palette)
+                    screen.resolve_color(cell.bg, palette)
                 }
             } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
                 Rgb::new(100, 149, 237)
             } else if cell.fg == Color::Default {
                 palette.foreground
             } else {
-                cell.fg.to_rgb(palette)
+                screen.resolve_color(cell.fg, palette)
             };
             let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
                 Rgb::new(fg_color.r / 2, fg_color.g / 2, fg_color.b / 2)
@@ -2056,12 +2056,12 @@ fn draw_terminal(
                     if cell.fg == Color::Default {
                         palette.foreground
                     } else {
-                        cell.fg.to_rgb(palette)
+                        screen.resolve_color(cell.fg, palette)
                     }
                 } else if cell.bg == Color::Default {
                     *normal_background
                 } else {
-                    cell.bg.to_rgb(palette)
+                    screen.resolve_color(cell.bg, palette)
                 };
 
                 let (r, g, b) = bg_color.to_f64();
@@ -2116,6 +2116,7 @@ fn draw_terminal(
                     (char_width, cell_height),
                     &fg_color,
                     palette,
+                    screen,
                 );
             }
         }
@@ -2262,6 +2263,7 @@ fn draw_cell_decorations(
     size: (f64, f64),
     foreground: &Rgb,
     palette: &cterm_core::color::ColorPalette,
+    screen: &cterm_core::Screen,
 ) {
     let (x, y) = origin;
     let (width, height) = size;
@@ -2270,7 +2272,7 @@ fn draw_cell_decorations(
         let color = if has_hyperlink {
             Rgb::new(100, 149, 237)
         } else if let Some(color) = cell.underline_color {
-            color.to_rgb(palette)
+            screen.resolve_color(color, palette)
         } else {
             *foreground
         };

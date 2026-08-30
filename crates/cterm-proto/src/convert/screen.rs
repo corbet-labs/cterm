@@ -298,6 +298,13 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
             cursor: screen
                 .dynamic_color(ColorQuery::Cursor)
                 .map(|color| color_to_proto(&Color::Rgb(color))),
+            palette: screen
+                .dynamic_palette_colors()
+                .map(|(index, color)| proto::DynamicPaletteColor {
+                    index: u32::from(index),
+                    color: Some(color_to_proto(&Color::Rgb(color))),
+                })
+                .collect(),
         }),
     }
 }
@@ -419,6 +426,17 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             ColorQuery::Cursor,
             dynamic_rgb(dynamic_colors.and_then(|colors| colors.cursor.as_ref())),
         );
+        screen.reset_dynamic_palette();
+        if let Some(colors) = dynamic_colors {
+            for entry in &colors.palette {
+                let Ok(index) = u8::try_from(entry.index) else {
+                    continue;
+                };
+                if let Some(color) = dynamic_rgb(entry.color.as_ref()) {
+                    screen.set_dynamic_color(ColorQuery::Palette(index), Some(color));
+                }
+            }
+        }
         screen.set_keyboard_enhancement_flags(
             cterm_core::KeyboardEnhancementFlags::from_bits_retain(
                 modes.keyboard_enhancement_flags as u8,
@@ -526,6 +544,10 @@ mod tests {
         source
             .screen_mut()
             .set_dynamic_color(ColorQuery::Cursor, Some(cterm_core::Rgb::new(10, 11, 12)));
+        source.screen_mut().set_dynamic_color(
+            ColorQuery::Palette(200),
+            Some(cterm_core::Rgb::new(13, 14, 15)),
+        );
 
         let snapshot = screen_to_proto(source.screen(), true);
         let mut restored = Terminal::new(1, 1, ScreenConfig::default());
@@ -551,6 +573,10 @@ mod tests {
             restored.screen().dynamic_color(ColorQuery::Cursor),
             Some(cterm_core::Rgb::new(10, 11, 12))
         );
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Palette(200)),
+            Some(cterm_core::Rgb::new(13, 14, 15))
+        );
     }
 
     #[test]
@@ -561,11 +587,19 @@ mod tests {
         restored
             .screen_mut()
             .set_dynamic_color(ColorQuery::Foreground, Some(cterm_core::Rgb::new(1, 2, 3)));
+        restored.screen_mut().set_dynamic_color(
+            ColorQuery::Palette(200),
+            Some(cterm_core::Rgb::new(4, 5, 6)),
+        );
 
         apply_screen_snapshot(&mut restored, &snapshot);
 
         assert_eq!(
             restored.screen().dynamic_color(ColorQuery::Foreground),
+            None
+        );
+        assert_eq!(
+            restored.screen().dynamic_color(ColorQuery::Palette(200)),
             None
         );
     }

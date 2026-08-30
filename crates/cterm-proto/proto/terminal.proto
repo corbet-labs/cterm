@@ -575,6 +575,12 @@ message DynamicColors {
   Color foreground = 1;
   Color background = 2;
   Color cursor = 3;
+  repeated DynamicPaletteColor palette = 4;
+}
+
+message DynamicPaletteColor {
+  uint32 index = 1;
+  Color color = 2;
 }
 
 message GetCellRequest {

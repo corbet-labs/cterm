@@ -490,7 +490,7 @@ impl TerminalRenderer {
             let color = if has_hyperlink {
                 Rgb::new(100, 149, 237)
             } else if let Some(color) = cell.underline_color {
-                color.to_rgb(&palette)
+                screen.resolve_color(color, &palette)
             } else {
                 fg
             };
@@ -608,11 +608,11 @@ impl TerminalRenderer {
         let palette = self.resolved_palette(screen);
         let normal_background = palette.background;
 
-        let mut fg = cell.fg.to_rgb(&palette);
+        let mut fg = screen.resolve_color(cell.fg, &palette);
         let mut bg = if cell.bg == Color::Default {
             normal_background
         } else {
-            cell.bg.to_rgb(&palette)
+            screen.resolve_color(cell.bg, &palette)
         };
 
         // Handle inverse
