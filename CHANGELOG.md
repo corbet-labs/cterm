@@ -9,22 +9,53 @@ is omitted for readability.
 
 ## [Unreleased]
 
+## [0.0.20] - 2026-08-31
+
 ### Added
+- Direct command launch with exact argv, working directory, environment, title,
+  and initial native window state, plus an isolated managed-product mode with
+  authenticated local daemon handshakes and exact identity/version matching.
+- Cross-platform inline Sixel and iTerm2 image rendering and persistence, plus
+  font-independent box, block, Braille, and legacy-computing glyph rendering.
+- Foot-compatible terminal behavior including palette stacks and dynamic
+  colors, native theme/visibility reports, DEC rectangular editing,
+  synchronized updates, reverse wrap/video, DEC special graphics, keypad
+  identity, modified and Kitty keys, capability/status queries, pixel and
+  URXVT mouse reporting, OSC 7 working-directory tracking, and colon-form SGR
+  colors.
+- OSC 133 shell integration with prompt navigation and native OSC 9/777 and
+  Kitty OSC 99 desktop notifications on macOS, Wayland, and Windows.
+- Foot-compatible Sixel cursor placement, aspect ratios, private/shared
+  palettes, resource limits, geometry/color replies, and up to 1024 colors.
 - Native split panes on AppKit, GTK4/Wayland, and Win32/Direct2D, including
   draggable dividers, directional focus and resize, pane zoom, and configurable
   shortcuts. New panes inherit the active pane's exact process or SSH launch
   context and its working directory where the target daemon can honor one;
   native SSH keeps the same target while the remote login shell selects its
   initial directory.
+- Deterministic parser/render/reflow/scrollback benchmarks, real-TUI and foot
+  differential compatibility tests, authoritative native UI automation, and
+  FreeBSD core CI.
 
 ### Changed
 - Establish FSL-1.1-ALv2 as cterm's product license, with Apache-2.0 becoming
   available automatically after two years per version. Source inherited from
   KarpelesLab/cterm and Rio/Sugarloaf retains its MIT grants and notices.
-- Seamless-upgrade state now preserves each tab's complete split topology and
-  every pane session instead of only the active terminal.
+- Store complete extended grapheme clusters and safely reflow scrollback when
+  the terminal resizes.
+- Seamless-upgrade state now preserves every window, tab, complete split
+  topology, pane session, and exact process/SSH launch context.
+- Linux and Windows client packages now bundle the matching `ctermd`; every
+  distributed client and daemon package carries the product and inherited-code
+  license notices and a SHA-256 checksum sidecar.
 
 ### Fixed
+- Render scrollback and terminal attributes consistently across Direct2D,
+  CoreGraphics, and GTK/Cairo.
+- Windows child processes now keep their standard streams attached to ConPTY,
+  including when ctermd itself runs with redirected handles.
+- Unix PTYs now use the platform login-terminal setup, removing intermittent
+  controlling-terminal failures on FreeBSD.
 - OSC 10/11/12 color queries now receive theme-accurate replies from the
   attached frontend. Dynamic foreground, background, and cursor colors support
   foot-compatible XParseColor forms, reset through OSC 110/111/112, render on
@@ -32,6 +63,14 @@ is omitted for readability.
 - Restoring pane snapshots no longer leaks daemon attachment counts, and
   independent windows connected to the same SSH host no longer overwrite or
   tear down each other's tunnel registry entries.
+- GTK tab context menus activate reliably, and SSH dialogs remember and
+  autocomplete earlier targets.
+- Update checks and remote daemon bootstrapping use the `corbet-labs` release
+  source. Client assets and checksums are matched by exact platform filenames,
+  Linux archives are validated before relaunch, and daemon-only assets can no
+  longer be mistaken for client updates.
+- Cocoa split-pane layout releases mutable model borrows before re-entry, and
+  obtains its CoreGraphics drawing context through the typed AppKit binding.
 
 ## [0.0.19] - 2026-07-09
 
@@ -312,21 +351,24 @@ Initial pre-release.
 ### Changed
 - Replace `portable-pty` with a unified native PTY implementation.
 
-[Unreleased]: https://github.com/KarpelesLab/cterm/compare/v0.0.17...HEAD
-[0.0.17]: https://github.com/KarpelesLab/cterm/compare/v0.0.16...v0.0.17
-[0.0.16]: https://github.com/KarpelesLab/cterm/compare/v0.0.15...v0.0.16
-[0.0.15]: https://github.com/KarpelesLab/cterm/compare/v0.0.14...v0.0.15
-[0.0.14]: https://github.com/KarpelesLab/cterm/compare/v0.0.13...v0.0.14
-[0.0.13]: https://github.com/KarpelesLab/cterm/compare/v0.0.12...v0.0.13
-[0.0.12]: https://github.com/KarpelesLab/cterm/compare/v0.0.11...v0.0.12
-[0.0.11]: https://github.com/KarpelesLab/cterm/compare/v0.0.10...v0.0.11
-[0.0.10]: https://github.com/KarpelesLab/cterm/compare/v0.0.9...v0.0.10
-[0.0.9]: https://github.com/KarpelesLab/cterm/compare/v0.0.8...v0.0.9
-[0.0.8]: https://github.com/KarpelesLab/cterm/compare/v0.0.7...v0.0.8
-[0.0.7]: https://github.com/KarpelesLab/cterm/compare/v0.0.6...v0.0.7
-[0.0.6]: https://github.com/KarpelesLab/cterm/compare/v0.0.5...v0.0.6
-[0.0.5]: https://github.com/KarpelesLab/cterm/compare/v0.0.4...v0.0.5
-[0.0.4]: https://github.com/KarpelesLab/cterm/compare/v0.0.3...v0.0.4
-[0.0.3]: https://github.com/KarpelesLab/cterm/compare/v0.0.2...v0.0.3
-[0.0.2]: https://github.com/KarpelesLab/cterm/compare/v0.0.1...v0.0.2
-[0.0.1]: https://github.com/KarpelesLab/cterm/releases/tag/v0.0.1
+[Unreleased]: https://github.com/corbet-labs/cterm/compare/v0.0.20...HEAD
+[0.0.20]: https://github.com/corbet-labs/cterm/compare/v0.0.19...v0.0.20
+[0.0.19]: https://github.com/corbet-labs/cterm/compare/v0.0.18...v0.0.19
+[0.0.18]: https://github.com/corbet-labs/cterm/compare/v0.0.17...v0.0.18
+[0.0.17]: https://github.com/corbet-labs/cterm/compare/v0.0.16...v0.0.17
+[0.0.16]: https://github.com/corbet-labs/cterm/compare/v0.0.15...v0.0.16
+[0.0.15]: https://github.com/corbet-labs/cterm/compare/v0.0.14...v0.0.15
+[0.0.14]: https://github.com/corbet-labs/cterm/compare/v0.0.13...v0.0.14
+[0.0.13]: https://github.com/corbet-labs/cterm/compare/v0.0.12...v0.0.13
+[0.0.12]: https://github.com/corbet-labs/cterm/compare/v0.0.11...v0.0.12
+[0.0.11]: https://github.com/corbet-labs/cterm/compare/v0.0.10...v0.0.11
+[0.0.10]: https://github.com/corbet-labs/cterm/compare/v0.0.9...v0.0.10
+[0.0.9]: https://github.com/corbet-labs/cterm/compare/v0.0.8...v0.0.9
+[0.0.8]: https://github.com/corbet-labs/cterm/compare/v0.0.7...v0.0.8
+[0.0.7]: https://github.com/corbet-labs/cterm/compare/v0.0.6...v0.0.7
+[0.0.6]: https://github.com/corbet-labs/cterm/compare/v0.0.5...v0.0.6
+[0.0.5]: https://github.com/corbet-labs/cterm/compare/v0.0.4...v0.0.5
+[0.0.4]: https://github.com/corbet-labs/cterm/compare/v0.0.3...v0.0.4
+[0.0.3]: https://github.com/corbet-labs/cterm/compare/v0.0.2...v0.0.3
+[0.0.2]: https://github.com/corbet-labs/cterm/compare/v0.0.1...v0.0.2
+[0.0.1]: https://github.com/corbet-labs/cterm/releases/tag/v0.0.1
