@@ -187,26 +187,28 @@ jobs:
   compatibility-linux:
     name: Compatibility (foot + real TUIs)
     runs-on: ubuntu-22.04
+    container: archlinux:base-devel
     timeout-minutes: 15
     needs: [format, lint-linux]
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v7
-
       - name: Install dependencies and reference applications
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          pacman -Syu --noconfirm --needed \
+            curl \
             foot \
-            libgtk-4-dev \
-            libadwaita-1-dev \
-            libpango1.0-dev \
-            libcairo2-dev \
-            libglib2.0-dev \
+            git \
+            gtk4 \
+            libadwaita \
             neovim \
-            protobuf-compiler \
+            protobuf \
             tmux \
             weston \
-            xvfb
+            xorg-server-xvfb
+
+      - uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
