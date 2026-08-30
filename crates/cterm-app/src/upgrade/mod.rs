@@ -17,4 +17,4 @@ pub use state::{
     PaneLaunchContext, PaneUpgradeState, PortForwardLaunchState, SshLaunchState, TabUpgradeState,
     UpgradeState, WindowUpgradeState,
 };
-pub use updater::{UpdateError, UpdateInfo, Updater};
+pub use updater::{UpdateError, UpdateInfo, Updater, CTERM_GITHUB_REPOSITORY};

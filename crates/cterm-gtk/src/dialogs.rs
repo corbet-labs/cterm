@@ -308,9 +308,10 @@ pub fn show_about_dialog(parent: &impl IsA<Window>) {
         .program_name("cterm")
         .version(env!("CARGO_PKG_VERSION"))
         .comments("A modern terminal emulator built with Rust and GTK4")
-        .website("https://github.com/KarpelesLab/cterm")
+        .website("https://github.com/corbet-labs/cterm")
         .website_label("GitHub Repository")
-        .license_type(gtk4::License::MitX11)
+        .license("Functional Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2). See LICENSE for the complete terms.")
+        .license_type(gtk4::License::Custom)
         .authors(vec!["cterm contributors"])
         .build();
 

@@ -10,6 +10,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// Canonical GitHub repository used for cterm releases and updates.
+pub const CTERM_GITHUB_REPOSITORY: &str = "corbet-labs/cterm";
+
 /// Errors that can occur during update operations
 #[derive(Error, Debug)]
 pub enum UpdateError {

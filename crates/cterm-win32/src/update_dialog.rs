@@ -13,6 +13,7 @@ use winapi::um::wingdi::{CreateFontW, GetDeviceCaps, FW_NORMAL, LOGPIXELSY};
 use winapi::um::winuser::*;
 
 use crate::dialog_utils::{create_button, create_label, set_edit_text, to_wide};
+use cterm_app::upgrade::CTERM_GITHUB_REPOSITORY;
 
 /// Window class name for update dialog
 const UPDATE_DIALOG_CLASS: &str = "cterm_update_dialog";
@@ -26,9 +27,6 @@ const IDC_RELEASE_NOTES_EDIT: i32 = 1003;
 const IDC_OPEN_RELEASES_BTN: i32 = 1004;
 const IDC_CLOSE_BTN: i32 = 1005;
 const IDC_STATUS_LABEL: i32 = 1006;
-
-/// GitHub repository for update checks
-const GITHUB_REPO: &str = "KarpelesLab/cterm";
 
 /// Update check result passed via window message
 enum UpdateResult {
@@ -148,7 +146,10 @@ unsafe extern "system" fn window_proc(
             match id {
                 IDC_OPEN_RELEASES_BTN => {
                     // Open GitHub releases page
-                    let url = to_wide(&format!("https://github.com/{}/releases", GITHUB_REPO));
+                    let url = to_wide(&format!(
+                        "https://github.com/{}/releases",
+                        CTERM_GITHUB_REPOSITORY
+                    ));
                     winapi::um::shellapi::ShellExecuteW(
                         ptr::null_mut(),
                         to_wide("open").as_ptr(),
@@ -309,16 +310,17 @@ unsafe fn start_update_check(hwnd: HWND) {
         }
 
         let current_version = env!("CARGO_PKG_VERSION");
-        let updater = match cterm_app::upgrade::Updater::new(GITHUB_REPO, current_version) {
-            Ok(u) => u,
-            Err(e) => {
-                PENDING_UPDATE.with(|p| {
-                    *p.borrow_mut() = Some(UpdateResult::Error(e.to_string()));
-                });
-                post_update_result(hwnd_ptr);
-                return;
-            }
-        };
+        let updater =
+            match cterm_app::upgrade::Updater::new(CTERM_GITHUB_REPOSITORY, current_version) {
+                Ok(u) => u,
+                Err(e) => {
+                    PENDING_UPDATE.with(|p| {
+                        *p.borrow_mut() = Some(UpdateResult::Error(e.to_string()));
+                    });
+                    post_update_result(hwnd_ptr);
+                    return;
+                }
+            };
 
         // Check for cancellation
         if UPDATE_CHECK_CANCELLED.load(Ordering::SeqCst) {

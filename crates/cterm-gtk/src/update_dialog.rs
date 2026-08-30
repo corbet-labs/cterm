@@ -7,7 +7,7 @@
 //! - Ready to upgrade button
 //! - Error messages
 
-use cterm_app::upgrade::{UpdateError, UpdateInfo, Updater};
+use cterm_app::upgrade::{UpdateError, UpdateInfo, Updater, CTERM_GITHUB_REPOSITORY};
 use gtk4::prelude::*;
 use gtk4::{glib, Align, Box as GtkBox, Button, Label, Orientation, ProgressBar, Spinner, Window};
 use std::cell::RefCell;
@@ -16,9 +16,6 @@ use std::rc::Rc;
 
 /// Current application version
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// GitHub repository for updates
-const GITHUB_REPO: &str = "KarpelesLab/cterm";
 
 /// State of the update process
 #[derive(Debug, Clone)]
@@ -296,7 +293,7 @@ async fn check_for_updates() -> Result<Option<UpdateInfo>, UpdateError> {
 
     std::thread::spawn(move || {
         let result = (|| {
-            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
+            let updater = Updater::new(CTERM_GITHUB_REPOSITORY, CURRENT_VERSION)?;
             updater.check_for_update()
         })();
         let _ = tx.send(result);
@@ -318,7 +315,7 @@ where
 
     std::thread::spawn(move || {
         let result = (|| {
-            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
+            let updater = Updater::new(CTERM_GITHUB_REPOSITORY, CURRENT_VERSION)?;
             updater.download(&info, on_progress)
         })();
         let _ = tx.send(result);

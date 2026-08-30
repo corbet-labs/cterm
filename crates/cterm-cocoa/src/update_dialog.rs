@@ -11,13 +11,10 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{MainThreadMarker, NSRect, NSSize, NSString};
 
-use cterm_app::upgrade::{UpdateError, UpdateInfo, Updater};
+use cterm_app::upgrade::{UpdateError, UpdateInfo, Updater, CTERM_GITHUB_REPOSITORY};
 
 /// Current application version
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// GitHub repository for updates
-const GITHUB_REPO: &str = "KarpelesLab/cterm";
 
 /// Check for updates synchronously and show result
 ///
@@ -48,7 +45,7 @@ pub fn check_for_updates_sync(mtm: MainThreadMarker) {
 
     std::thread::spawn(move || {
         let result = (|| {
-            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
+            let updater = Updater::new(CTERM_GITHUB_REPOSITORY, CURRENT_VERSION)?;
             updater.check_for_update()
         })();
 
@@ -181,7 +178,7 @@ fn download_and_install_update(mtm: MainThreadMarker, info: UpdateInfo) {
     // Start download in background thread
     std::thread::spawn(move || {
         let result = (|| {
-            let updater = Updater::new(GITHUB_REPO, CURRENT_VERSION)?;
+            let updater = Updater::new(CTERM_GITHUB_REPOSITORY, CURRENT_VERSION)?;
 
             // Download with progress callback
             let downloaded_cb = Arc::clone(&downloaded_clone);
@@ -419,6 +416,6 @@ fn create_release_notes_view(mtm: MainThreadMarker, notes: &str) -> Retained<NSS
 
 /// Open the GitHub releases page in the default browser
 fn open_releases_page() {
-    let url = format!("https://github.com/{}/releases", GITHUB_REPO);
+    let url = format!("https://github.com/{}/releases", CTERM_GITHUB_REPOSITORY);
     let _ = std::process::Command::new("open").arg(&url).spawn();
 }

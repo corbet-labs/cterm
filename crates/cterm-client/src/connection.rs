@@ -13,7 +13,7 @@ use tonic::transport::Channel;
 
 /// GitHub repository for downloading ctermd releases
 #[cfg(unix)]
-const GITHUB_REPO: &str = "KarpelesLab/cterm";
+const CTERM_GITHUB_REPOSITORY: &str = "corbet-labs/cterm";
 
 /// Max time to establish the HTTP/2 transport to the daemon. A wedged daemon can
 /// accept the socket connection (the listen backlog is kernel-side) yet never
@@ -96,7 +96,7 @@ if [ -z "$CTERMD" ]; then
 fi
 "$CTERMD" >/dev/null 2>&1 || true
 "$CTERMD" --print-socket-path"#,
-        repo = GITHUB_REPO
+        repo = CTERM_GITHUB_REPOSITORY
     )
 }
 
@@ -1274,6 +1274,17 @@ mod tests {
             config.auth_file,
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_downloads_from_product_repository() {
+        let script = remote_setup_script();
+
+        assert!(script.contains(
+            "https://github.com/corbet-labs/cterm/releases/latest/download/$ASSET.tar.gz"
+        ));
+        assert!(!script.contains("KarpelesLab/cterm"));
     }
 
     #[cfg(unix)]
