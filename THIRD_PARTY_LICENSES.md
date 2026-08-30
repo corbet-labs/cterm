@@ -8,7 +8,7 @@ components listed here. The original notices are preserved in the derived files.
 | KarpelesLab/cterm | `35ceaeccf3401de02b15037fc6e04a7e8a26aa83` | Fork base for the terminal runtime and native frontends | MIT |
 | Rio / Sugarloaf | `357281638216876a2406c46e50033e7143256175` | Adapted Rust rasterizers for box drawing, block elements, braille, sextants, and octants in `cterm-ui`; adapted XTGETTCAP parsing, DEC Special Graphics and modifyOtherKeys encoding, and tests in `cterm-core` | MIT |
 | Alacritty VTE | `89c12df969145ffb5084d1122627d7292c2c638f` (`vte` 0.13.1) | Adapted tested SGR parameter grouping and extended-color validation in `cterm-core` | MIT |
-| foot | `765ca4070bb6f095fc58c030f2154ed03857701d` (1.27.0) | Behavioral reference and adapted DEC rectangular-editing and xterm palette-stack semantics, validation and tests in `cterm-core` | MIT |
+| foot | `765ca4070bb6f095fc58c030f2154ed03857701d` (1.27.0) | Behavioral reference and adapted DEC rectangular-editing, xterm palette-stack, and theme/visibility-reporting semantics, validation and tests in `cterm-core` | MIT |
 
 The KarpelesLab/cterm source incorporated at the fork base retains its original
 MIT grant and notice in `LICENSES/KARPELESLAB-CTERM-MIT.txt`. Subsequent cterm

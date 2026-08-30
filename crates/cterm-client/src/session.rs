@@ -399,6 +399,22 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Update native theme/window state used for terminal protocol reports.
+    pub async fn set_frontend_state(&self, state: cterm_core::FrontendState) -> Result<()> {
+        let (theme_appearance, window_visibility) =
+            cterm_proto::convert::frontend_state_to_proto(state);
+        self.client
+            .lock()
+            .await
+            .set_session_frontend_state(SetSessionFrontendStateRequest {
+                session_id: self.session_id.clone(),
+                theme_appearance: Some(theme_appearance),
+                window_visibility: Some(window_visibility),
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Get session info
     pub async fn info(&self) -> Result<SessionInfo> {
         let response = self

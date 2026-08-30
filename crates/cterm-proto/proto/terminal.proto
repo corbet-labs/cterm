@@ -21,6 +21,7 @@ service TerminalService {
   rpc SetSessionTitle(SetSessionTitleRequest) returns (SetSessionTitleResponse);
   rpc SetSessionMetadata(SetSessionMetadataRequest) returns (SetSessionMetadataResponse);
   rpc SetSessionPalette(SetSessionPaletteRequest) returns (SetSessionPaletteResponse);
+  rpc SetSessionFrontendState(SetSessionFrontendStateRequest) returns (SetSessionFrontendStateResponse);
 
   // Input
   rpc WriteInput(WriteInputRequest) returns (WriteInputResponse);
@@ -160,6 +161,10 @@ message CreateSessionRequest {
   // Frontend palette used by the daemon to answer OSC 4/10-12 queries from
   // the first byte of process output. Omitted by older/non-visual clients.
   FrontendPalette base_palette = 11;
+
+  // Native frontend state used for foot-compatible theme/visibility reports.
+  FrontendTheme theme_appearance = 12;
+  FrontendVisibility window_visibility = 13;
 }
 
 message CreateSessionResponse {
@@ -289,6 +294,28 @@ message SetSessionPaletteRequest {
 }
 
 message SetSessionPaletteResponse {
+  bool success = 1;
+}
+
+enum FrontendTheme {
+  FRONTEND_THEME_UNSPECIFIED = 0;
+  FRONTEND_THEME_DARK = 1;
+  FRONTEND_THEME_LIGHT = 2;
+}
+
+enum FrontendVisibility {
+  FRONTEND_VISIBILITY_UNSPECIFIED = 0;
+  FRONTEND_VISIBILITY_VISIBLE = 1;
+  FRONTEND_VISIBILITY_HIDDEN = 2;
+}
+
+message SetSessionFrontendStateRequest {
+  string session_id = 1;
+  optional FrontendTheme theme_appearance = 2;
+  optional FrontendVisibility window_visibility = 3;
+}
+
+message SetSessionFrontendStateResponse {
   bool success = 1;
 }
 
@@ -594,6 +621,8 @@ message TerminalModes {
   DynamicColors dynamic_colors = 12;
   // Shell-reported OSC 7 working directory for reconnecting frontends.
   optional string current_working_directory = 13;
+  bool theme_change_reports = 14;
+  bool visibility_change_reports = 15;
 }
 
 message DynamicColors {

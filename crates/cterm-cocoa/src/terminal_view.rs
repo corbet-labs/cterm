@@ -166,6 +166,7 @@ enum DaemonCommand {
     SetTabColor(String),
     SetTemplateName(String),
     SetPalette(cterm_core::ColorPalette),
+    SetFrontendState(cterm_core::FrontendState),
 }
 
 /// Terminal view state
@@ -1529,6 +1530,10 @@ impl TerminalView {
         base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
         terminal.set_base_palette(base_palette.clone());
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        });
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
@@ -1564,6 +1569,10 @@ impl TerminalView {
 
         // Start daemon I/O thread — owns the connection, handles reads and writes
         let state_clone = state.clone();
+        let frontend_state = cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        };
         std::thread::spawn(move || {
             Self::read_daemon_loop(
                 sid,
@@ -1572,6 +1581,7 @@ impl TerminalView {
                 cmd_rx,
                 daemon_socket,
                 base_palette,
+                frontend_state,
             );
         });
 
@@ -1602,6 +1612,10 @@ impl TerminalView {
         base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
         terminal.set_base_palette(base_palette.clone());
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        });
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
@@ -1640,6 +1654,10 @@ impl TerminalView {
 
         // Start daemon I/O thread — owns the connection, handles reads and writes
         let state_clone = state.clone();
+        let frontend_state = cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        };
         std::thread::spawn(move || {
             Self::read_daemon_loop(
                 sid,
@@ -1648,6 +1666,7 @@ impl TerminalView {
                 cmd_rx,
                 daemon_socket,
                 base_palette,
+                frontend_state,
             );
         });
 
@@ -1674,6 +1693,7 @@ impl TerminalView {
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
         daemon_socket: Option<std::path::PathBuf>,
         base_palette: cterm_core::ColorPalette,
+        frontend_state: cterm_core::FrontendState,
     ) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1713,6 +1733,9 @@ impl TerminalView {
 
             if let Err(error) = session.set_base_palette(&base_palette).await {
                 log::warn!("Failed to synchronize frontend palette with daemon: {error}");
+            }
+            if let Err(error) = session.set_frontend_state(frontend_state).await {
+                log::warn!("Failed to synchronize frontend state with daemon: {error}");
             }
 
             // Spawn command handler — drains write/resize/destroy commands and forwards to daemon
@@ -1820,6 +1843,11 @@ impl TerminalView {
                         DaemonCommand::SetPalette(palette) => {
                             if let Err(error) = cmd_session.set_base_palette(&palette).await {
                                 log::error!("Failed to update daemon palette: {error}");
+                            }
+                        }
+                        DaemonCommand::SetFrontendState(state) => {
+                            if let Err(error) = cmd_session.set_frontend_state(state).await {
+                                log::error!("Failed to update daemon frontend state: {error}");
                             }
                         }
                     }
@@ -2095,6 +2123,22 @@ impl TerminalView {
             .set_base_palette(palette.clone());
         if let Some(sender) = self.ivars().daemon_cmd_tx.borrow().as_ref() {
             let _ = sender.send(DaemonCommand::SetPalette(palette));
+        }
+    }
+
+    /// Report native window visibility to the local terminal or owning daemon.
+    pub fn set_window_visibility(&self, visibility: cterm_core::WindowVisibility) {
+        let mut terminal = self.ivars().terminal.lock();
+        let mut state = terminal.screen().frontend_state();
+        state.visibility = visibility;
+        if self.ivars().daemon_cmd_tx.borrow().is_some() {
+            let _ = terminal.set_frontend_state_collecting(state);
+        } else {
+            terminal.set_frontend_state(state);
+        }
+        drop(terminal);
+        if let Some(sender) = self.ivars().daemon_cmd_tx.borrow().as_ref() {
+            let _ = sender.send(DaemonCommand::SetFrontendState(state));
         }
     }
 

@@ -5,7 +5,9 @@
 use crate::color::ColorPalette;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
-use crate::screen::{ClipboardOperation, ColorQuery, Screen, ScreenConfig, SearchResult};
+use crate::screen::{
+    ClipboardOperation, ColorQuery, FrontendState, Screen, ScreenConfig, SearchResult,
+};
 use crate::{KeyEventKind, KeyboardEnhancementFlags};
 use std::time::{Duration, Instant};
 
@@ -240,6 +242,24 @@ impl Terminal {
     /// Set the frontend theme used to answer OSC 10-12 color queries.
     pub fn set_base_palette(&mut self, palette: ColorPalette) {
         self.screen.set_base_palette(palette);
+    }
+
+    /// Update state owned by an in-process native frontend and send any
+    /// application-requested change reports through this terminal's PTY.
+    pub fn set_frontend_state(&mut self, state: FrontendState) {
+        for response in self.set_frontend_state_collecting(state) {
+            if let Err(error) = self.write(&response) {
+                log::error!("Failed to send frontend state report to PTY: {error}");
+            }
+        }
+    }
+
+    /// Update frontend-owned state while returning reports for a daemon-owned
+    /// PTY, keeping potentially blocking writes outside the terminal lock.
+    pub fn set_frontend_state_collecting(&mut self, state: FrontendState) -> Vec<Vec<u8>> {
+        self.screen.set_theme_appearance(state.appearance);
+        self.screen.set_window_visibility(state.visibility);
+        self.screen.take_pending_responses()
     }
 
     /// Deadline for the active application synchronized update, if any.
@@ -1155,6 +1175,63 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| matches!(event, TerminalEvent::ContentChanged)));
+    }
+
+    #[test]
+    fn foot_theme_and_visibility_queries_report_frontend_state() {
+        use crate::{FrontendState, ThemeAppearance, WindowVisibility};
+
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let (_, responses) = term.process_collecting(b"\x1b[?996n\x1b[?998n");
+        assert_eq!(
+            responses,
+            [b"\x1b[?997;1n".to_vec(), b"\x1b[?999;1n".to_vec()]
+        );
+
+        let reports = term.set_frontend_state_collecting(FrontendState {
+            appearance: ThemeAppearance::Light,
+            visibility: WindowVisibility::Hidden,
+        });
+        assert!(reports.is_empty());
+
+        let (_, responses) = term.process_collecting(b"\x1b[?996n\x1b[?998n");
+        assert_eq!(
+            responses,
+            [b"\x1b[?997;2n".to_vec(), b"\x1b[?999;2n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn foot_theme_and_visibility_change_modes_report_and_restore() {
+        use crate::{FrontendState, ThemeAppearance, WindowVisibility};
+
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        let (_, responses) =
+            term.process_collecting(b"\x1b[?2031h\x1b[?2033h\x1b[?2031$p\x1b[?2033$p");
+        assert_eq!(
+            responses,
+            [
+                b"\x1b[?999;1n".to_vec(),
+                b"\x1b[?2031;1$y".to_vec(),
+                b"\x1b[?2033;1$y".to_vec(),
+            ]
+        );
+
+        let reports = term.set_frontend_state_collecting(FrontendState {
+            appearance: ThemeAppearance::Light,
+            visibility: WindowVisibility::Hidden,
+        });
+        assert_eq!(
+            reports,
+            [b"\x1b[?997;2n".to_vec(), b"\x1b[?999;2n".to_vec()]
+        );
+
+        let (_, responses) = term.process_collecting(
+            b"\x1b[?2031s\x1b[?2033s\x1b[?2031l\x1b[?2033l\x1b[?2031r\x1b[?2033r",
+        );
+        assert_eq!(responses, [b"\x1b[?999;2n".to_vec()]);
+        assert!(term.screen().modes.theme_change_reports);
+        assert!(term.screen().modes.visibility_change_reports);
     }
 
     #[test]

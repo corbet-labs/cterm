@@ -123,6 +123,33 @@ impl TerminalWidget {
         }
     }
 
+    /// Report native window visibility to the local terminal or owning daemon.
+    pub fn set_window_visibility(&self, visibility: cterm_core::WindowVisibility) {
+        update_window_visibility(&self.terminal, self.daemon_cmd_tx.as_ref(), visibility);
+    }
+
+    fn setup_visibility_reporting(&self) {
+        let terminal = Arc::clone(&self.terminal);
+        let sender = self.daemon_cmd_tx.clone();
+        self.drawing_area.connect_map(move |_| {
+            update_window_visibility(
+                &terminal,
+                sender.as_ref(),
+                cterm_core::WindowVisibility::Visible,
+            );
+        });
+
+        let terminal = Arc::clone(&self.terminal);
+        let sender = self.daemon_cmd_tx.clone();
+        self.drawing_area.connect_unmap(move |_| {
+            update_window_visibility(
+                &terminal,
+                sender.as_ref(),
+                cterm_core::WindowVisibility::Hidden,
+            );
+        });
+    }
+
     /// Set callback for when the terminal process exits
     pub fn set_on_exit<F: Fn() + 'static>(&self, callback: F) {
         *self.on_exit.borrow_mut() = Some(Box::new(callback));
@@ -1352,6 +1379,10 @@ impl TerminalWidget {
         // Create a Terminal with no PTY — write callback forwards via channel
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
         terminal.set_base_palette(frontend_palette(theme, None));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        });
         terminal.screen_mut().set_cell_width_hint(cell_dims.width);
         terminal.screen_mut().set_cell_height_hint(cell_dims.height);
         let write_tx = cmd_tx.clone();
@@ -1383,9 +1414,19 @@ impl TerminalWidget {
 
         let daemon_socket = session.socket_path().map(|p| p.to_owned());
         widget.setup_drawing();
+        widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
-        widget.setup_daemon_reader(sid, cmd_rx, daemon_socket, frontend_palette(theme, None));
+        widget.setup_daemon_reader(
+            sid,
+            cmd_rx,
+            daemon_socket,
+            frontend_palette(theme, None),
+            cterm_core::FrontendState {
+                appearance: theme.appearance(),
+                ..Default::default()
+            },
+        );
         widget.setup_daemon_resize(cmd_tx);
 
         widget
@@ -1418,6 +1459,10 @@ impl TerminalWidget {
         // Create a Terminal with no PTY
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
         terminal.set_base_palette(frontend_palette(theme, None));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: theme.appearance(),
+            ..Default::default()
+        });
         terminal.screen_mut().set_cell_width_hint(cell_dims.width);
         terminal.screen_mut().set_cell_height_hint(cell_dims.height);
 
@@ -1460,9 +1505,19 @@ impl TerminalWidget {
 
         let daemon_socket = recon.handle.socket_path().map(|p| p.to_owned());
         widget.setup_drawing();
+        widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
-        widget.setup_daemon_reader(sid, cmd_rx, daemon_socket, frontend_palette(theme, None));
+        widget.setup_daemon_reader(
+            sid,
+            cmd_rx,
+            daemon_socket,
+            frontend_palette(theme, None),
+            cterm_core::FrontendState {
+                appearance: theme.appearance(),
+                ..Default::default()
+            },
+        );
         widget.setup_daemon_resize(cmd_tx);
 
         widget
@@ -1482,6 +1537,7 @@ impl TerminalWidget {
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
         daemon_socket: Option<std::path::PathBuf>,
         base_palette: ColorPalette,
+        frontend_state: cterm_core::FrontendState,
     ) {
         let drawing_area = self.drawing_area.clone();
 
@@ -1526,6 +1582,9 @@ impl TerminalWidget {
 
                 if let Err(error) = session.set_base_palette(&base_palette).await {
                     log::warn!("Failed to synchronize frontend palette with daemon: {error}");
+                }
+                if let Err(error) = session.set_frontend_state(frontend_state).await {
+                    log::warn!("Failed to synchronize frontend state with daemon: {error}");
                 }
 
                 // Spawn command handler — drains write/resize/destroy commands and forwards to daemon
@@ -1655,6 +1714,11 @@ impl TerminalWidget {
                             DaemonCommand::SetPalette(palette) => {
                                 if let Err(error) = cmd_session.set_base_palette(&palette).await {
                                     log::error!("Failed to update daemon palette: {error}");
+                                }
+                            }
+                            DaemonCommand::SetFrontendState(state) => {
+                                if let Err(error) = cmd_session.set_frontend_state(state).await {
+                                    log::error!("Failed to update daemon frontend state: {error}");
                                 }
                             }
                         }
@@ -1939,6 +2003,29 @@ enum DaemonCommand {
     SetTemplateName(String),
     ClearAlert,
     SetPalette(ColorPalette),
+    SetFrontendState(cterm_core::FrontendState),
+}
+
+fn update_window_visibility(
+    terminal: &Arc<Mutex<Terminal>>,
+    sender: Option<&tokio::sync::mpsc::UnboundedSender<DaemonCommand>>,
+    visibility: cterm_core::WindowVisibility,
+) {
+    let mut terminal = terminal.lock();
+    let mut state = terminal.screen().frontend_state();
+    if state.visibility == visibility {
+        return;
+    }
+    state.visibility = visibility;
+    if sender.is_some() {
+        let _ = terminal.set_frontend_state_collecting(state);
+    } else {
+        terminal.set_frontend_state(state);
+    }
+    drop(terminal);
+    if let Some(sender) = sender {
+        let _ = sender.send(DaemonCommand::SetFrontendState(state));
+    }
 }
 
 /// Rendering parameters for draw_terminal

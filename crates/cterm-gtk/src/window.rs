@@ -43,6 +43,17 @@ struct TabEntry {
     remote_name: Option<String>,
 }
 
+fn report_window_visibility(tabs: &Rc<RefCell<Vec<TabEntry>>>, window_visible: bool) {
+    for tab in tabs.borrow().iter() {
+        let visibility = if window_visible && tab.terminal.widget().is_mapped() {
+            cterm_core::WindowVisibility::Visible
+        } else {
+            cterm_core::WindowVisibility::Hidden
+        };
+        tab.terminal.set_window_visibility(visibility);
+    }
+}
+
 /// Main window container
 pub struct CtermWindow {
     pub window: ApplicationWindow,
@@ -194,6 +205,7 @@ impl CtermWindow {
 
         // Set up close request handler for process confirmation
         cterm_window.setup_close_request_handler();
+        cterm_window.setup_visibility_handler();
 
         cterm_window
     }
@@ -282,6 +294,7 @@ impl CtermWindow {
         cterm_window.setup_tab_bar_callbacks();
         cterm_window.setup_tab_switch_handler();
         cterm_window.setup_close_request_handler();
+        cterm_window.setup_visibility_handler();
 
         cterm_window
     }
@@ -318,6 +331,35 @@ impl CtermWindow {
             None,
         );
         window
+    }
+
+    /// Forward GTK map/minimize state to terminal applications that enabled
+    /// foot's visibility-reporting extension.
+    fn setup_visibility_handler(&self) {
+        let tabs = Rc::clone(&self.tabs);
+        self.window.connect_map(move |_| {
+            report_window_visibility(&tabs, true);
+        });
+
+        let tabs = Rc::clone(&self.tabs);
+        self.window.connect_unmap(move |_| {
+            report_window_visibility(&tabs, false);
+        });
+
+        let tabs = Rc::clone(&self.tabs);
+        self.window.connect_realize(move |window| {
+            let Some(surface) = window.surface() else {
+                return;
+            };
+            let Ok(toplevel) = surface.dynamic_cast::<gdk::Toplevel>() else {
+                return;
+            };
+            let notify_tabs = Rc::clone(&tabs);
+            toplevel.connect_state_notify(move |toplevel| {
+                let visible = !toplevel.state().contains(gdk::ToplevelState::MINIMIZED);
+                report_window_visibility(&notify_tabs, visible);
+            });
+        });
     }
 
     /// Set up window actions for the menu
@@ -2666,6 +2708,7 @@ fn spawn_daemon_tab(
         theme,
         background_color.as_deref().and_then(parse_rgb),
     ));
+    opts.frontend_state.appearance = theme.appearance();
     if opts.pixel_width == 0 || opts.pixel_height == 0 {
         let cell_dims = calculate_initial_cell_dimensions(&config.borrow());
         opts.pixel_width = (cell_dims.width * opts.cols.max(1) as f64)

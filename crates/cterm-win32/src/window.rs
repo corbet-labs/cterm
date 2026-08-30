@@ -56,6 +56,7 @@ pub enum DaemonCmd {
     SetTitle(String),
     SetTabColor(String),
     SetTemplateName(String),
+    SetFrontendState(cterm_core::FrontendState),
 }
 
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
@@ -195,6 +196,8 @@ pub struct WindowState {
     /// Modified text keys handled on WM_KEYDOWN; their generated WM_CHAR or
     /// WM_SYSCHAR messages must not be delivered a second time.
     enhanced_text_keys: HashSet<u16>,
+    /// Visibility of the native window; only its active tab is actually visible.
+    window_visibility: cterm_core::WindowVisibility,
     #[allow(dead_code)]
     menu_handle: winapi::shared::windef::HMENU,
     /// Skip close confirmation (set during relaunch)
@@ -243,6 +246,7 @@ impl WindowState {
             suppressed_key_releases: HashSet::new(),
             reported_keys: HashMap::new(),
             enhanced_text_keys: HashSet::new(),
+            window_visibility: cterm_core::WindowVisibility::Visible,
             menu_handle,
             skip_close_confirm: false,
             remote_manager: cterm_client::RemoteManager::new(),
@@ -334,6 +338,10 @@ impl WindowState {
 
         let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
         terminal.set_base_palette(terminal_palette(&self.theme, None));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: self.theme.appearance(),
+            ..Default::default()
+        });
         let terminal = Arc::new(Mutex::new(terminal));
 
         // Start PTY reader thread
@@ -354,6 +362,7 @@ impl WindowState {
 
         self.tabs.push(entry);
         self.active_tab_index = self.tabs.len() - 1;
+        self.set_window_visibility(self.window_visibility);
 
         // Update tab bar with shell basename
         self.tab_bar.add_tab(tab_id, &initial_title);
@@ -519,6 +528,10 @@ impl WindowState {
             &self.theme,
             template.background_color.as_deref(),
         ));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: self.theme.appearance(),
+            ..Default::default()
+        });
         let terminal = Arc::new(Mutex::new(terminal));
 
         // Start PTY reader thread
@@ -539,6 +552,7 @@ impl WindowState {
 
         self.tabs.push(entry);
         self.active_tab_index = self.tabs.len() - 1;
+        self.set_window_visibility(self.window_visibility);
 
         // Update tab bar
         self.tab_bar.add_tab(tab_id, &template.name);
@@ -647,6 +661,10 @@ impl WindowState {
 
         let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
         terminal.set_base_palette(terminal_palette(&self.theme, None));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: self.theme.appearance(),
+            ..Default::default()
+        });
         let terminal = Arc::new(Mutex::new(terminal));
 
         let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
@@ -666,6 +684,7 @@ impl WindowState {
 
         self.tabs.push(entry);
         self.active_tab_index = self.tabs.len() - 1;
+        self.set_window_visibility(self.window_visibility);
 
         self.tab_bar.add_tab(tab_id, &title);
         self.tab_bar.set_active(tab_id);
@@ -704,12 +723,14 @@ impl WindowState {
             opts.pixel_height = pixel_height;
         }
         opts.base_palette = Some(terminal_palette(&self.theme, background_color.as_deref()));
+        opts.frontend_state.appearance = self.theme.appearance();
 
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
         terminal.set_base_palette(terminal_palette(&self.theme, background_color.as_deref()));
+        terminal.set_frontend_state(opts.frontend_state);
         terminal.resize_with_pixels(
             cols,
             rows,
@@ -741,6 +762,7 @@ impl WindowState {
 
         self.tabs.push(entry);
         self.active_tab_index = self.tabs.len() - 1;
+        self.set_window_visibility(self.window_visibility);
         self.tab_bar.add_tab(tab_id, &title);
         self.tab_bar.set_active(tab_id);
 
@@ -796,8 +818,13 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let base_palette = terminal_palette(&self.theme, None);
+        let frontend_state = cterm_core::FrontendState {
+            appearance: self.theme.appearance(),
+            ..Default::default()
+        };
         let mut terminal = Terminal::new(cols, rows, screen_config);
         terminal.set_base_palette(base_palette.clone());
+        terminal.set_frontend_state(frontend_state);
 
         // Apply screen snapshot if available
         if let Some(ref screen_data) = screen_snapshot {
@@ -845,6 +872,7 @@ impl WindowState {
 
         self.tabs.push(entry);
         self.active_tab_index = self.tabs.len() - 1;
+        self.set_window_visibility(self.window_visibility);
         self.tab_bar.add_tab(tab_id, &display_title);
         self.tab_bar.set_active(tab_id);
 
@@ -865,6 +893,7 @@ impl WindowState {
             cmd_rx,
             None, // local sessions only for now
             base_palette,
+            frontend_state,
         );
 
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -1026,6 +1055,7 @@ impl WindowState {
                 }
                 let new_active_id = self.tabs[self.active_tab_index].id;
                 self.tab_bar.set_active(new_active_id);
+                self.set_window_visibility(self.window_visibility);
             }
         }
     }
@@ -1038,6 +1068,7 @@ impl WindowState {
             self.tab_bar.set_active(tab_id);
             self.tab_bar.clear_bell(tab_id);
             self.tabs[index].has_bell = false;
+            self.set_window_visibility(self.window_visibility);
 
             // Apply per-tab background color override
             if let Some(ref mut renderer) = self.renderer {
@@ -1157,6 +1188,35 @@ impl WindowState {
                     pixel_width,
                     pixel_height,
                 });
+            }
+        }
+    }
+
+    /// Report Win32 show/minimize state to every terminal session in the window.
+    pub fn set_window_visibility(&mut self, visibility: cterm_core::WindowVisibility) {
+        self.window_visibility = visibility;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let visibility = if visibility == cterm_core::WindowVisibility::Visible
+                && index == self.active_tab_index
+            {
+                cterm_core::WindowVisibility::Visible
+            } else {
+                cterm_core::WindowVisibility::Hidden
+            };
+            let mut terminal = tab.terminal.lock().unwrap();
+            let mut state = terminal.screen().frontend_state();
+            if state.visibility == visibility {
+                continue;
+            }
+            state.visibility = visibility;
+            if tab.daemon_cmd_tx.is_some() {
+                let _ = terminal.set_frontend_state_collecting(state);
+            } else {
+                terminal.set_frontend_state(state);
+            }
+            drop(terminal);
+            if let Some(sender) = &tab.daemon_cmd_tx {
+                let _ = sender.send(DaemonCmd::SetFrontendState(state));
             }
         }
     }
@@ -2816,6 +2876,7 @@ fn start_daemon_attach_thread(
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCmd>,
     daemon_socket: Option<std::path::PathBuf>,
     base_palette: ColorPalette,
+    frontend_state: cterm_core::FrontendState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -2861,6 +2922,9 @@ fn start_daemon_attach_thread(
 
             if let Err(error) = session.set_base_palette(&base_palette).await {
                 log::warn!("Failed to synchronize frontend palette with daemon: {error}");
+            }
+            if let Err(error) = session.set_frontend_state(frontend_state).await {
+                log::warn!("Failed to synchronize frontend state with daemon: {error}");
             }
 
             run_daemon_io_loop(hwnd, tab_id, terminal, session, cmd_rx).await;
@@ -2961,6 +3025,11 @@ async fn run_daemon_io_loop(
                 DaemonCmd::SetTemplateName(name) => {
                     if let Err(e) = cmd_session.set_metadata(None, None, Some(&name)).await {
                         log::error!("Failed to set template name: {}", e);
+                    }
+                }
+                DaemonCmd::SetFrontendState(state) => {
+                    if let Err(error) = cmd_session.set_frontend_state(state).await {
+                        log::error!("Failed to update daemon frontend state: {error}");
                     }
                 }
             }
@@ -3132,10 +3201,24 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         }
 
         WM_SIZE => {
+            state.set_window_visibility(if wparam.0 as u32 == SIZE_MINIMIZED {
+                cterm_core::WindowVisibility::Hidden
+            } else {
+                cterm_core::WindowVisibility::Visible
+            });
             let width = (lparam.0 & 0xFFFF) as u32;
             let height = ((lparam.0 >> 16) & 0xFFFF) as u32;
             state.on_resize(width, height);
             LRESULT(0)
+        }
+
+        WM_SHOWWINDOW => {
+            state.set_window_visibility(if wparam.0 != 0 {
+                cterm_core::WindowVisibility::Visible
+            } else {
+                cterm_core::WindowVisibility::Hidden
+            });
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
         WM_DPICHANGED => {

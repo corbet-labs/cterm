@@ -247,6 +247,8 @@ pub struct CreateSessionOpts {
     pub ssh: Option<SshParams>,
     /// Active frontend palette for authoritative OSC color-query replies.
     pub base_palette: Option<cterm_core::ColorPalette>,
+    /// Native theme and window state for foot-compatible protocol reports.
+    pub frontend_state: cterm_core::FrontendState,
 }
 
 /// Connection to a ctermd instance
@@ -762,6 +764,8 @@ impl DaemonConnection {
 
     /// Create a new terminal session
     pub async fn create_session(&self, opts: CreateSessionOpts) -> Result<SessionHandle> {
+        let (theme_appearance, window_visibility) =
+            cterm_proto::convert::frontend_state_to_proto(opts.frontend_state);
         let response = self
             .client
             .lock()
@@ -781,6 +785,8 @@ impl DaemonConnection {
                     .base_palette
                     .as_ref()
                     .map(cterm_proto::convert::palette_to_proto),
+                theme_appearance,
+                window_visibility,
             })
             .await?;
 

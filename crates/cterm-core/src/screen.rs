@@ -74,6 +74,29 @@ const fn default_modify_other_keys() -> u8 {
     1
 }
 
+/// Visual theme class reported through foot's CSI ? 996 n extension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThemeAppearance {
+    #[default]
+    Dark,
+    Light,
+}
+
+/// Native window visibility reported through foot's CSI ? 998 n extension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowVisibility {
+    #[default]
+    Visible,
+    Hidden,
+}
+
+/// State owned by the native frontend but needed for terminal protocol replies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendState {
+    pub appearance: ThemeAppearance,
+    pub visibility: WindowVisibility,
+}
+
 /// Terminal modes that affect behavior
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalModes {
@@ -114,6 +137,12 @@ pub struct TerminalModes {
     /// Application synchronized updates (DEC private mode 2026)
     #[serde(default)]
     pub application_sync_updates: bool,
+    /// Report native theme changes (DEC private mode 2031).
+    #[serde(default)]
+    pub theme_change_reports: bool,
+    /// Report native window visibility changes (DEC private mode 2033).
+    #[serde(default)]
+    pub visibility_change_reports: bool,
     /// Focus events reporting
     pub focus_events: bool,
     /// Alternate screen buffer active
@@ -463,6 +492,8 @@ pub struct Screen {
     pending_color_queries: Vec<(ColorQuery, Option<Rgb>)>,
     /// Frontend theme used for authoritative OSC color-query replies.
     base_palette: ColorPalette,
+    /// Native frontend state used for theme and visibility protocol replies.
+    frontend_state: FrontendState,
     /// Application-provided overrides from OSC 10-12.
     dynamic_foreground: Option<Rgb>,
     dynamic_background: Option<Rgb>,
@@ -675,6 +706,7 @@ impl Screen {
             pending_clipboard_ops: Vec::new(),
             pending_color_queries: Vec::new(),
             base_palette: ColorPalette::default(),
+            frontend_state: FrontendState::default(),
             dynamic_foreground: None,
             dynamic_background: None,
             dynamic_cursor: None,
@@ -818,6 +850,51 @@ impl Screen {
     /// Set the frontend's configured palette for OSC query replies.
     pub fn set_base_palette(&mut self, palette: ColorPalette) {
         self.base_palette = palette;
+    }
+
+    /// Return the frontend-owned state used by terminal protocol reports.
+    pub fn frontend_state(&self) -> FrontendState {
+        self.frontend_state
+    }
+
+    /// Update the native theme class and report a change when requested.
+    pub fn set_theme_appearance(&mut self, appearance: ThemeAppearance) {
+        if self.frontend_state.appearance == appearance {
+            return;
+        }
+        self.frontend_state.appearance = appearance;
+        if self.modes.theme_change_reports {
+            self.queue_theme_report();
+        }
+    }
+
+    /// Update native visibility and report a change when requested.
+    pub fn set_window_visibility(&mut self, visibility: WindowVisibility) {
+        if self.frontend_state.visibility == visibility {
+            return;
+        }
+        self.frontend_state.visibility = visibility;
+        if self.modes.visibility_change_reports {
+            self.queue_visibility_report();
+        }
+    }
+
+    /// Queue foot's current-theme report (1 = dark, 2 = light).
+    pub fn queue_theme_report(&mut self) {
+        let value = match self.frontend_state.appearance {
+            ThemeAppearance::Dark => 1,
+            ThemeAppearance::Light => 2,
+        };
+        self.queue_response(format!("\x1b[?997;{value}n").into_bytes());
+    }
+
+    /// Queue foot's current-visibility report (1 = visible, 2 = hidden).
+    pub fn queue_visibility_report(&mut self) {
+        let value = match self.frontend_state.visibility {
+            WindowVisibility::Visible => 1,
+            WindowVisibility::Hidden => 2,
+        };
+        self.queue_response(format!("\x1b[?999;{value}n").into_bytes());
     }
 
     /// Set or reset an application-provided default color.

@@ -9,7 +9,7 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSMenu, NSMenuItem, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWindowTabbingMode,
+    NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask, NSWindowTabbingMode,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -78,6 +78,21 @@ define_class!(
             // Send focus out event if DECSET 1004 is enabled
             if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
                 terminal.send_focus_event(false);
+            }
+        }
+
+        #[unsafe(method(windowDidChangeOcclusionState:))]
+        fn window_did_change_occlusion_state(&self, _notification: &NSNotification) {
+            let visibility = if self
+                .occlusionState()
+                .contains(NSWindowOcclusionState::Visible)
+            {
+                cterm_core::WindowVisibility::Visible
+            } else {
+                cterm_core::WindowVisibility::Hidden
+            };
+            if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
+                terminal.set_window_visibility(visibility);
             }
         }
 
@@ -351,6 +366,15 @@ impl CtermWindow {
 
     /// Attach a terminal view to this window as content and store it
     fn attach_terminal_view(&self, terminal: Retained<TerminalView>) {
+        let visibility = if self
+            .occlusionState()
+            .contains(NSWindowOcclusionState::Visible)
+        {
+            cterm_core::WindowVisibility::Visible
+        } else {
+            cterm_core::WindowVisibility::Hidden
+        };
+        terminal.set_window_visibility(visibility);
         self.setContentView(Some(&terminal));
         let (cell_width, cell_height) = terminal.cell_size();
         self.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
@@ -422,6 +446,7 @@ impl CtermWindow {
         ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
+        opts.frontend_state.appearance = theme.appearance();
         let window_ptr = self as *const Self as usize;
 
         std::thread::spawn(move || {
@@ -605,6 +630,7 @@ impl CtermWindow {
         ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
+        opts.frontend_state.appearance = theme.appearance();
         // SAFETY: self is MainThreadOnly, we use the raw pointer only inside
         // dispatch2::Queue::main().exec_async() which runs on the main thread
         let window_ptr = self as *const Self as usize;

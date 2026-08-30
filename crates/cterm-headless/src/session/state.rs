@@ -92,6 +92,17 @@ impl SessionState {
         self.terminal.write().set_base_palette(palette);
     }
 
+    /// Update native frontend state and forward any enabled change reports.
+    pub fn set_frontend_state(&self, state: cterm_core::FrontendState) {
+        let responses = self.terminal.write().set_frontend_state_collecting(state);
+        self.send_terminal_responses(responses);
+    }
+
+    /// Current state last reported by the native frontend.
+    pub fn frontend_state(&self) -> cterm_core::FrontendState {
+        self.terminal.read().screen().frontend_state()
+    }
+
     /// Create a new session with the given configuration
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -603,23 +614,26 @@ impl SessionState {
             (events, responses)
         }; // terminal lock released here
 
-        if !responses.is_empty() {
-            let response = responses.concat();
-            match self.pty_writer.get() {
-                Some(writer) => {
-                    writer.send(&response);
-                }
-                None => {
-                    // No PTY writer yet: write responses directly (no-op without a PTY).
-                    let mut term = self.terminal.write();
-                    if let Err(e) = term.write(&response) {
-                        log::error!("Failed to send response to PTY: {e}");
-                    }
+        self.send_terminal_responses(responses);
+
+        events
+    }
+
+    fn send_terminal_responses(&self, responses: Vec<Vec<u8>>) {
+        if responses.is_empty() {
+            return;
+        }
+        let response = responses.concat();
+        match self.pty_writer.get() {
+            Some(writer) => writer.send(&response),
+            None => {
+                // No PTY writer yet: write responses directly (no-op without a PTY).
+                let mut term = self.terminal.write();
+                if let Err(error) = term.write(&response) {
+                    log::error!("Failed to send response to PTY: {error}");
                 }
             }
         }
-
-        events
     }
 
     /// Broadcast output data to subscribers

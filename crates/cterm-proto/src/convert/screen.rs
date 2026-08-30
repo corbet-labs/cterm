@@ -309,6 +309,8 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
         current_working_directory: screen
             .current_working_directory()
             .map(|path| path.to_string_lossy().into_owned()),
+        theme_change_reports: screen.modes.theme_change_reports,
+        visibility_change_reports: screen.modes.visibility_change_reports,
     }
 }
 
@@ -408,6 +410,8 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.modes.modify_other_keys = u8::try_from(modes.modify_other_keys)
             .unwrap_or(1)
             .clamp(1, 2);
+        screen.modes.theme_change_reports = modes.theme_change_reports;
+        screen.modes.visibility_change_reports = modes.visibility_change_reports;
         screen.set_current_working_directory(
             modes
                 .current_working_directory
@@ -546,6 +550,8 @@ mod tests {
         source.screen_mut().modes.reverse_video = true;
         source.screen_mut().modes.reverse_wrap = false;
         source.screen_mut().modes.modify_other_keys = 2;
+        source.screen_mut().modes.theme_change_reports = true;
+        source.screen_mut().modes.visibility_change_reports = true;
         source
             .screen_mut()
             .set_dynamic_color(ColorQuery::Foreground, Some(cterm_core::Rgb::new(4, 5, 6)));
@@ -575,6 +581,8 @@ mod tests {
         assert!(restored.screen().modes.reverse_video);
         assert!(!restored.screen().modes.reverse_wrap);
         assert_eq!(restored.screen().modes.modify_other_keys, 2);
+        assert!(restored.screen().modes.theme_change_reports);
+        assert!(restored.screen().modes.visibility_change_reports);
         assert_eq!(
             restored.screen().dynamic_color(ColorQuery::Foreground),
             Some(cterm_core::Rgb::new(4, 5, 6))

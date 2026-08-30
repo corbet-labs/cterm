@@ -367,6 +367,15 @@ so startup queries cannot be lost while a native window is still attaching.
 | XTPOPCOLORS (`CSI # Q`) | Restore a saved dynamic palette |
 | XTREPORTCOLORS (`CSI # R`) | Report the current palette-stack slot and allocated stack size |
 
+### Supported Theme and Visibility Reports
+
+cterm follows foot's native-state reporting extension. `CSI ? 996 n` reports a
+dark or light frontend as `CSI ? 997 ; 1 n` or `CSI ? 997 ; 2 n`; `CSI ? 998 n`
+reports a visible or hidden/minimized window as `CSI ? 999 ; 1 n` or
+`CSI ? 999 ; 2 n`. DEC private modes 2031 and 2033 enable change reports and
+support DECRQM, XTSAVE, and XTRESTORE. GTK/Wayland, Cocoa, and Win32 feed their
+native window state to the daemon, which remains the single PTY reply authority.
+
 ### Supported DEC Rectangular Editing
 
 | Sequence | Description |

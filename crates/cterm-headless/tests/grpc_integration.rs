@@ -398,6 +398,8 @@ async fn test_create_and_list_sessions() {
             pixel_width: 0,
             pixel_height: 0,
             base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
         })
         .await
         .expect("create_session failed");
@@ -452,6 +454,8 @@ async fn test_get_session() {
             pixel_width: 0,
             pixel_height: 0,
             base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
         })
         .await
         .expect("create_session failed");
@@ -471,6 +475,26 @@ async fn test_get_session() {
     assert_eq!(session.cols, 100);
     assert_eq!(session.rows, 30);
     assert!(session.running);
+
+    let response = client
+        .set_session_frontend_state(SetSessionFrontendStateRequest {
+            session_id: session_id.clone(),
+            theme_appearance: Some(FrontendTheme::Light as i32),
+            window_visibility: Some(FrontendVisibility::Hidden as i32),
+        })
+        .await
+        .expect("set_session_frontend_state failed");
+    assert!(response.get_ref().success);
+
+    let error = client
+        .set_session_frontend_state(SetSessionFrontendStateRequest {
+            session_id: session_id.clone(),
+            theme_appearance: None,
+            window_visibility: None,
+        })
+        .await
+        .expect_err("empty frontend state update should fail");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
 
     // Cleanup
     let _ = client
@@ -503,6 +527,8 @@ async fn test_write_input_and_get_screen() {
             pixel_width: 0,
             pixel_height: 0,
             base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
         })
         .await
         .expect("create_session failed");
@@ -573,6 +599,8 @@ async fn test_resize() {
             pixel_width: 640,
             pixel_height: 384,
             base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
         })
         .await
         .expect("create_session failed");
@@ -633,6 +661,8 @@ async fn test_get_cursor() {
             pixel_width: 0,
             pixel_height: 0,
             base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
         })
         .await
         .expect("create_session failed");
@@ -682,6 +712,8 @@ async fn test_get_screen_full() {
             pixel_width: 0,
             pixel_height: 0,
             base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
         })
         .await
         .expect("create_session failed");
@@ -737,6 +769,8 @@ async fn test_multiple_sessions() {
                 pixel_width: 0,
                 pixel_height: 0,
                 base_palette: None,
+                theme_appearance: 0,
+                window_visibility: 0,
             })
             .await
             .expect("create_session failed");

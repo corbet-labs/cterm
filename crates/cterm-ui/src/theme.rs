@@ -3,6 +3,7 @@
 //! Defines the theme structure for customizing terminal appearance.
 
 use cterm_core::color::{ColorPalette, Rgb};
+use cterm_core::ThemeAppearance;
 use serde::{Deserialize, Serialize};
 
 /// Complete terminal theme
@@ -27,6 +28,19 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// Classify the terminal background for foot-compatible theme reports.
+    pub fn appearance(&self) -> ThemeAppearance {
+        let background = self.colors.background;
+        let luma = u32::from(background.r) * 299
+            + u32::from(background.g) * 587
+            + u32::from(background.b) * 114;
+        if luma >= 128_000 {
+            ThemeAppearance::Light
+        } else {
+            ThemeAppearance::Dark
+        }
+    }
+
     /// Create a dark theme
     pub fn dark() -> Self {
         Self {
@@ -342,5 +356,19 @@ impl FontConfig {
             family: "Cascadia Code".into(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appearance_follows_background_luminance() {
+        assert_eq!(Theme::dark().appearance(), ThemeAppearance::Dark);
+        assert_eq!(Theme::light().appearance(), ThemeAppearance::Light);
+        assert_eq!(Theme::tokyo_night().appearance(), ThemeAppearance::Dark);
+        assert_eq!(Theme::dracula().appearance(), ThemeAppearance::Dark);
+        assert_eq!(Theme::nord().appearance(), ThemeAppearance::Dark);
     }
 }

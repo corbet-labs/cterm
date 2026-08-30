@@ -971,6 +971,12 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // foot theme and native-window visibility queries.
+            ('n', [b'?']) => match first_param(&params_vec, 0) {
+                996 => self.screen.queue_theme_report(),
+                998 => self.screen.queue_visibility_report(),
+                mode => log::trace!("Unknown private DSR mode: {mode}"),
+            },
             // Primary Device Attributes (DA1). Advertise only capabilities
             // implemented end to end: Sixel, ANSI color, rectangular editing,
             // and OSC 52.
@@ -2009,6 +2015,16 @@ impl ScreenPerformer<'_> {
             2004 => self.screen.modes.bracketed_paste = set,
             // Application synchronized updates
             2026 => self.screen.set_application_sync_updates(set),
+            // Report frontend theme changes.
+            2031 => self.screen.modes.theme_change_reports = set,
+            // Report frontend visibility changes. foot immediately reports the
+            // current state when this mode is enabled.
+            2033 => {
+                self.screen.modes.visibility_change_reports = set;
+                if set {
+                    self.screen.queue_visibility_report();
+                }
+            }
             // xterm Sixel Cursor Right of Graphics
             8452 => self.screen.modes.sixel_cursor_right = set,
             _ => {
@@ -2043,6 +2059,8 @@ impl ScreenPerformer<'_> {
             1007 => self.screen.modes.alternate_scroll,
             2004 => self.screen.modes.bracketed_paste,
             2026 => self.screen.modes.application_sync_updates,
+            2031 => self.screen.modes.theme_change_reports,
+            2033 => self.screen.modes.visibility_change_reports,
             8452 => self.screen.modes.sixel_cursor_right,
             // Recognized legacy encodings which cterm deliberately never uses.
             67 | 1001 | 1005 => return 4,
