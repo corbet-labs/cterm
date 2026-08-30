@@ -36,13 +36,21 @@ take_screenshot() {
 
 send_keys() {
     local text="$1"
+    focus_cterm
     # Use AppleScript to send keystrokes to the frontmost application
     osascript -e "tell application \"System Events\" to keystroke \"$text\""
+}
+
+focus_cterm() {
+    osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $CTERM_PID) to true"
+    sleep 0.15
 }
 
 send_key() {
     local key="$1"
     local modifiers="${2:-}"
+
+    focus_cterm
 
     case "$key" in
         "Return"|"return"|"enter")
@@ -87,6 +95,11 @@ send_key() {
 send_pane_shortcut() {
     local key_code="$1"
     local modifiers="$2"
+
+    # AppleScript keystrokes otherwise follow whichever process most recently
+    # took focus. Screenshot capture and asynchronous native-tab creation can
+    # temporarily resign cterm on hosted runners.
+    focus_cterm
 
     case "$modifiers" in
         "ctrl+shift")
