@@ -22,7 +22,10 @@ use crate::screen::{
     ClearMode, ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle,
     DesktopNotification, LineClearMode, MouseEncoding, MouseMode, NotificationUrgency, Screen,
 };
-use crate::sixel::{SixelDecoder, SixelImage};
+use crate::sixel::{
+    SixelDecoder, SixelDecoderConfig, SixelImage, DEFAULT_SIXEL_MAX_BYTES, MAX_SIXEL_COLORS,
+    MAX_SIXEL_DIMENSION,
+};
 use crate::streaming_file::StreamingFileReceiver;
 
 /// DCS (Device Control String) state for handling multi-byte sequences
@@ -34,6 +37,7 @@ enum DcsState {
         decoder: Box<SixelDecoder>,
         start_col: usize,
         start_row: usize,
+        shared_palette: bool,
     },
     /// DECDLD (soft font download) in progress
     Decdld { decoder: DecdldDecoder },
@@ -46,6 +50,46 @@ enum DcsState {
 const XTGETTCAP_MAX_REQUEST_SIZE: usize = 64 * 1024;
 const MAX_NOTIFICATION_TITLE_BYTES: usize = 1024;
 const MAX_NOTIFICATION_BODY_BYTES: usize = 4096;
+
+#[derive(Debug)]
+struct SixelSessionState {
+    palette_size: usize,
+    shared_palette: Vec<[u8; 4]>,
+    max_width: usize,
+    max_height: usize,
+}
+
+impl Default for SixelSessionState {
+    fn default() -> Self {
+        Self {
+            palette_size: MAX_SIXEL_COLORS,
+            shared_palette: SixelDecoder::default_palette(MAX_SIXEL_COLORS),
+            max_width: MAX_SIXEL_DIMENSION,
+            max_height: MAX_SIXEL_DIMENSION,
+        }
+    }
+}
+
+impl SixelSessionState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn set_palette_size(&mut self, size: usize) {
+        self.palette_size = size.clamp(2, MAX_SIXEL_COLORS);
+        self.shared_palette = SixelDecoder::default_palette(self.palette_size);
+    }
+
+    fn decoder_config(&self) -> SixelDecoderConfig {
+        SixelDecoderConfig {
+            max_width: self.max_width,
+            max_height: self.max_height,
+            max_bytes: DEFAULT_SIXEL_MAX_BYTES,
+            palette_size: self.palette_size,
+            ..SixelDecoderConfig::default()
+        }
+    }
+}
 
 #[derive(Debug)]
 struct KittyNotificationBuilder {
@@ -118,6 +162,8 @@ pub struct Parser {
     kitty_notification: KittyNotificationBuilder,
     /// Optimistically active Kitty notification identifiers for p=alive.
     active_notification_ids: HashSet<String>,
+    /// Palette and resource limits shared by Sixel protocol sequences.
+    sixel: SixelSessionState,
 }
 
 impl Default for Parser {
@@ -137,6 +183,7 @@ impl Parser {
             osc_1337_terminated: false,
             kitty_notification: KittyNotificationBuilder::default(),
             active_notification_ids: HashSet::new(),
+            sixel: SixelSessionState::default(),
         }
     }
 
@@ -164,6 +211,7 @@ impl Parser {
                 saved_dec_modes: &mut self.saved_dec_modes,
                 kitty_notification: &mut self.kitty_notification,
                 active_notification_ids: &mut self.active_notification_ids,
+                sixel: &mut self.sixel,
             };
             self.state_machine.advance(&mut performer, byte);
         }
@@ -423,6 +471,7 @@ struct ScreenPerformer<'a> {
     saved_dec_modes: &'a mut HashMap<usize, bool>,
     kitty_notification: &'a mut KittyNotificationBuilder,
     active_notification_ids: &'a mut HashSet<String>,
+    sixel: &'a mut SixelSessionState,
 }
 
 impl vte::Perform for ScreenPerformer<'_> {
@@ -490,10 +539,23 @@ impl vte::Perform for ScreenPerformer<'_> {
             'q' if intermediates.is_empty() => {
                 log::debug!("Starting Sixel graphics sequence, params: {:?}", params_vec);
 
+                let shared_palette = !self.screen.modes.sixel_private_palette;
+                let config = self.sixel.decoder_config();
+                let decoder = if shared_palette {
+                    SixelDecoder::with_config_and_palette(
+                        &params_vec,
+                        config,
+                        &self.sixel.shared_palette,
+                    )
+                } else {
+                    SixelDecoder::with_config(&params_vec, config)
+                };
+
                 *self.dcs_state = DcsState::Sixel {
-                    decoder: Box::new(SixelDecoder::with_params(&params_vec)),
+                    decoder: Box::new(decoder),
                     start_col: self.screen.cursor.col,
                     start_row: self.screen.cursor.row,
+                    shared_palette,
                 };
             }
             // Legacy application synchronized-update protocol.  Mode 2026 is
@@ -569,8 +631,16 @@ impl vte::Perform for ScreenPerformer<'_> {
                 decoder,
                 start_col,
                 start_row,
+                shared_palette,
             } => {
-                if let Some(image) = decoder.finish() {
+                let result = decoder.finish_with_palette();
+                if shared_palette {
+                    self.sixel.shared_palette = result.palette;
+                }
+                if result.truncated {
+                    log::warn!("Sixel input exceeded the configured image resource limit");
+                }
+                if let Some(image) = result.image {
                     // Determine image position based on DECSDM mode
                     let (img_col, img_row) = if self.screen.modes.sixel_scrolling {
                         // Scrolling enabled: image at cursor position
@@ -938,6 +1008,9 @@ impl vte::Perform for ScreenPerformer<'_> {
                 let n = first_param(&params_vec, 1);
                 self.screen.delete_chars(n);
             }
+            // DEC Sixel resource management. Match foot's replies while
+            // reporting cterm's active palette and geometry limits honestly.
+            ('S', [b'?']) => self.handle_sixel_management(&params_vec),
             // Scroll Up (SU)
             ('S', []) => {
                 let n = first_param(&params_vec, 1);
@@ -1387,6 +1460,7 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Reset (RIS)
             (b'c', []) => {
                 self.screen.reset();
+                self.sixel.reset();
             }
             // Save Cursor (DECSC)
             (b'7', []) => {
@@ -2187,6 +2261,96 @@ impl ScreenPerformer<'_> {
         }
     }
 
+    fn handle_sixel_management(&mut self, params: &[usize]) {
+        let target = params.first().copied().unwrap_or(0);
+        let operation = params.get(1).copied().unwrap_or(0);
+
+        match (target, operation) {
+            // Report current number of addressable colors.
+            (1, 1) => self.queue_sixel_color_report(self.sixel.palette_size),
+            // Reset color capacity and both palette scopes.
+            (1, 2) => {
+                self.sixel.set_palette_size(MAX_SIXEL_COLORS);
+                self.queue_sixel_color_report(self.sixel.palette_size);
+            }
+            // Set color capacity, clamped to Foot's supported 2..=1024 range.
+            (1, 3) => {
+                let requested = params.get(2).copied().unwrap_or(0);
+                self.sixel.set_palette_size(requested);
+                self.queue_sixel_color_report(self.sixel.palette_size);
+            }
+            // Report implementation maximum.
+            (1, 4) => self.queue_sixel_color_report(MAX_SIXEL_COLORS),
+            // Report the usable viewport, capped by configured decoder limits.
+            (2, 1) => {
+                let cell_width = self.screen.cell_width_hint().round().max(1.0) as usize;
+                let cell_height = self.screen.cell_height_hint().round().max(1.0) as usize;
+                let width = self
+                    .screen
+                    .width()
+                    .saturating_mul(cell_width)
+                    .min(self.sixel.max_width);
+                let height = self
+                    .screen
+                    .height()
+                    .saturating_mul(cell_height)
+                    .min(self.sixel.max_height);
+                self.queue_sixel_geometry_report(width, height);
+            }
+            // Reset geometry limits.
+            (2, 2) => {
+                self.sixel.max_width = MAX_SIXEL_DIMENSION;
+                self.sixel.max_height = MAX_SIXEL_DIMENSION;
+                self.report_current_sixel_geometry();
+            }
+            // Set geometry limits. A zero-sized decoder is not useful, so the
+            // supported range is one through Foot's 10,000-pixel maximum.
+            (2, 3) => {
+                self.sixel.max_width = params
+                    .get(2)
+                    .copied()
+                    .unwrap_or(0)
+                    .clamp(1, MAX_SIXEL_DIMENSION);
+                self.sixel.max_height = params
+                    .get(3)
+                    .copied()
+                    .unwrap_or(0)
+                    .clamp(1, MAX_SIXEL_DIMENSION);
+                self.report_current_sixel_geometry();
+            }
+            // Foot reports the active maximum here, including a restriction
+            // installed by operation 3.
+            (2, 4) => self.queue_sixel_geometry_report(self.sixel.max_width, self.sixel.max_height),
+            _ => {}
+        }
+    }
+
+    fn report_current_sixel_geometry(&mut self) {
+        let cell_width = self.screen.cell_width_hint().round().max(1.0) as usize;
+        let cell_height = self.screen.cell_height_hint().round().max(1.0) as usize;
+        let width = self
+            .screen
+            .width()
+            .saturating_mul(cell_width)
+            .min(self.sixel.max_width);
+        let height = self
+            .screen
+            .height()
+            .saturating_mul(cell_height)
+            .min(self.sixel.max_height);
+        self.queue_sixel_geometry_report(width, height);
+    }
+
+    fn queue_sixel_color_report(&mut self, count: usize) {
+        self.screen
+            .queue_response(format!("\x1b[?1;0;{count}S").into_bytes());
+    }
+
+    fn queue_sixel_geometry_report(&mut self, width: usize, height: usize) {
+        self.screen
+            .queue_response(format!("\x1b[?2;0;{width};{height}S").into_bytes());
+    }
+
     /// Handle DEC private mode set/reset
     fn handle_dec_mode(&mut self, mode: usize, set: bool) {
         match mode {
@@ -2271,6 +2435,9 @@ impl ScreenPerformer<'_> {
             2004 => self.screen.modes.bracketed_paste = set,
             // Application synchronized updates
             2026 => self.screen.set_application_sync_updates(set),
+            // Use a fresh palette for every Sixel image. Resetting this mode
+            // preserves definitions in a session-wide shared palette.
+            1070 => self.screen.modes.sixel_private_palette = set,
             // Report frontend theme changes.
             2031 => self.screen.modes.theme_change_reports = set,
             // Report frontend visibility changes. foot immediately reports the
@@ -2314,6 +2481,7 @@ impl ScreenPerformer<'_> {
             1007 => self.screen.modes.alternate_scroll,
             1015 => self.screen.modes.mouse_encoding == MouseEncoding::Urxvt,
             1016 => self.screen.modes.mouse_encoding == MouseEncoding::SgrPixels,
+            1070 => self.screen.modes.sixel_private_palette,
             2004 => self.screen.modes.bracketed_paste,
             2026 => self.screen.modes.application_sync_updates,
             2031 => self.screen.modes.theme_change_reports,
@@ -3449,5 +3617,72 @@ mod tests {
 
         parser.parse(&mut screen, b"\x1b[?8452$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?8452;1$y"]);
+    }
+
+    #[test]
+    fn test_sixel_private_palette_mode_is_queryable_and_restorable() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b[?1070$p\x1b[?1070s\x1b[?1070l\x1b[?1070$p",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[?1070;1$y", b"\x1b[?1070;2$y"]
+        );
+        assert!(!screen.modes.sixel_private_palette);
+
+        parser.parse(&mut screen, b"\x1b[?1070r\x1b[?1070$p");
+        assert!(screen.modes.sixel_private_palette);
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?1070;1$y"]);
+    }
+
+    #[test]
+    fn test_sixel_palette_can_be_shared_between_images() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b[?1070l\x1bP7;1q#42;2;100;0;0~\x1b\\\x1bP7;1q#42~\x1b\\",
+        );
+
+        let images = screen.images();
+        assert_eq!(images.len(), 2);
+        assert_eq!(&images[0].data[..4], &[255, 0, 0, 255]);
+        assert_eq!(&images[1].data[..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn test_sixel_resource_management_matches_foot_replies() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            concat!(
+                "\x1b[?1;1S",
+                "\x1b[?1;3;64S",
+                "\x1b[?1;4S",
+                "\x1b[?2;1S",
+                "\x1b[?2;3;320;200S",
+                "\x1b[?2;4S",
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[?1;0;1024S".to_vec(),
+                b"\x1b[?1;0;64S".to_vec(),
+                b"\x1b[?1;0;1024S".to_vec(),
+                b"\x1b[?2;0;640;384S".to_vec(),
+                b"\x1b[?2;0;320;200S".to_vec(),
+                b"\x1b[?2;0;320;200S".to_vec(),
+            ]
+        );
     }
 }

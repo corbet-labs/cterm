@@ -1,194 +1,301 @@
-//! Sixel graphics decoder
+//! Sixel graphics decoder.
 //!
-//! Implements the DEC Sixel graphics protocol for inline bitmap images.
-//! Sixel is a format where each character (63-126) represents 6 vertical pixels.
+//! Sixel encodes six vertical pixels in each data byte. The decoder keeps
+//! the DEC pixel aspect ratio and raster attributes in pixel space so the
+//! resulting image can be handed directly to a renderer.
 
-/// Decoded sixel image as RGBA pixels
+/// Maximum palette size implemented by current versions of foot.
+pub const MAX_SIXEL_COLORS: usize = 1024;
+
+/// Maximum configurable image dimension implemented by current foot.
+pub const MAX_SIXEL_DIMENSION: usize = 10_000;
+
+/// Default allocation budget for one decoded image (64 MiB of RGBA data).
+///
+/// The dimension limit deliberately matches foot, but a 10,000 x 10,000
+/// RGBA image would consume 400 MB. The independent byte budget makes the
+/// default safe for untrusted terminal output. Applications may raise it
+/// explicitly when they also enforce an aggregate image-cache budget.
+pub const DEFAULT_SIXEL_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+const BYTES_PER_PIXEL: usize = 4;
+const DEFAULT_MAX_REPEAT: usize = MAX_SIXEL_DIMENSION;
+
+/// Decoded sixel image as RGBA pixels.
 #[derive(Debug, Clone)]
 pub struct SixelImage {
-    /// RGBA pixel data (4 bytes per pixel)
+    /// RGBA pixel data (4 bytes per pixel).
     pub data: Vec<u8>,
-    /// Image width in pixels
+    /// Image width in pixels.
     pub width: usize,
-    /// Image height in pixels
+    /// Image height in pixels.
     pub height: usize,
 }
 
-/// Parse state for color/repeat parsing
+/// Resource and palette limits for a Sixel decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParseState {
-    /// Normal sixel data mode
-    Normal,
-    /// Parsing repeat count (after '!')
-    Repeat,
-    /// Parsing color number (after '#')
-    Color,
-    /// Parsing color definition (after '#n;')
-    ColorDef,
+pub struct SixelDecoderConfig {
+    /// Maximum decoded width. Values above 10,000 are clamped.
+    pub max_width: usize,
+    /// Maximum decoded height. Values above 10,000 are clamped.
+    pub max_height: usize,
+    /// Maximum bytes allocated for the RGBA backing image.
+    pub max_bytes: usize,
+    /// Number of addressable palette entries (2 through 1024).
+    pub palette_size: usize,
+    /// Maximum source repetitions accepted from one DECGRI sequence.
+    pub max_repeat: usize,
 }
 
-/// Maximum sixel image dimension (width or height) in pixels.
-/// Prevents excessive memory allocation from malicious input.
-/// 4096 x 4096 x 4 bytes = 64MB which is a reasonable upper bound.
-const MAX_SIXEL_DIMENSION: usize = 4096;
+impl Default for SixelDecoderConfig {
+    fn default() -> Self {
+        Self {
+            max_width: MAX_SIXEL_DIMENSION,
+            max_height: MAX_SIXEL_DIMENSION,
+            max_bytes: DEFAULT_SIXEL_MAX_BYTES,
+            palette_size: MAX_SIXEL_COLORS,
+            max_repeat: DEFAULT_MAX_REPEAT,
+        }
+    }
+}
 
-/// Sixel decoder
+impl SixelDecoderConfig {
+    fn normalized(self) -> Self {
+        Self {
+            max_width: self.max_width.clamp(1, MAX_SIXEL_DIMENSION),
+            max_height: self.max_height.clamp(1, MAX_SIXEL_DIMENSION),
+            max_bytes: self.max_bytes.max(BYTES_PER_PIXEL),
+            palette_size: self.palette_size.clamp(2, MAX_SIXEL_COLORS),
+            max_repeat: self.max_repeat.clamp(1, MAX_SIXEL_DIMENSION),
+        }
+    }
+}
+
+/// Decoder output including the final palette.
+///
+/// Returning the palette separately allows the parser to implement DEC mode
+/// 1070 (shared Sixel palettes) without exposing decoder internals.
+#[derive(Debug, Clone)]
+pub struct SixelDecodeResult {
+    /// Decoded image, if the stream established a non-empty image.
+    pub image: Option<SixelImage>,
+    /// Palette after applying all color definitions in this stream.
+    pub palette: Vec<[u8; 4]>,
+    /// Whether input was clipped or ignored because a configured limit was
+    /// reached or an allocation failed.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseState {
+    Normal,
+    Repeat,
+    Color,
+    ColorDef,
+    Raster,
+}
+
+/// Streaming Sixel decoder.
 pub struct SixelDecoder {
-    /// Color palette (RGBA)
-    palette: [[u8; 4]; 256],
-    /// Currently selected color index
-    current_color: u8,
-    /// Whether background should be transparent
+    palette: Vec<[u8; 4]>,
+    current_color: usize,
     transparent_bg: bool,
-    /// Current X position
+    /// Vertical pixel multiplier (Pan).
+    pan: usize,
+    /// Horizontal pixel multiplier (Pad).
+    pad: usize,
     x: usize,
-    /// Current 6-pixel band Y position
+    /// Current band position in output pixels.
     band_y: usize,
-    /// Pixel data buffer (RGBA)
+    /// RGBA buffer using `allocated_width` as its stride.
     pixels: Vec<u8>,
-    /// Maximum X position seen (determines width)
-    max_x: usize,
-    /// Repeat count for next sixel character
+    allocated_width: usize,
+    allocated_height: usize,
+    /// Logical image extent, including raster-attribute background.
+    image_width: usize,
+    image_height: usize,
     repeat_count: usize,
-    /// Current parse state
     parse_state: ParseState,
-    /// Accumulated number during parsing
     accum: usize,
-    /// Color definition parameters
     color_params: [usize; 5],
-    /// Current color parameter index
     color_param_idx: usize,
+    raster_params: [usize; 4],
+    raster_param_idx: usize,
+    config: SixelDecoderConfig,
+    truncated: bool,
+    #[cfg(test)]
+    allocation_count: usize,
 }
 
 impl SixelDecoder {
-    /// Create a new sixel decoder
+    /// Create a decoder with DEC defaults.
     pub fn new() -> Self {
+        Self::with_params(&[])
+    }
+
+    /// Create a decoder from DCS `P1;P2;P3` parameters.
+    pub fn with_params(params: &[u16]) -> Self {
+        Self::with_config(params, SixelDecoderConfig::default())
+    }
+
+    /// Create a decoder with explicit resource limits.
+    pub fn with_config(params: &[u16], config: SixelDecoderConfig) -> Self {
+        Self::with_config_and_palette(params, config, &[])
+    }
+
+    /// Create a decoder seeded with a caller-owned palette.
+    ///
+    /// At most `config.palette_size` entries are copied. Missing entries use
+    /// the VT340-compatible default palette. The updated palette is available
+    /// through [`Self::finish_with_palette`].
+    pub fn with_config_and_palette(
+        params: &[u16],
+        config: SixelDecoderConfig,
+        initial_palette: &[[u8; 4]],
+    ) -> Self {
+        let config = config.normalized();
+        let mut palette = Self::default_palette(config.palette_size);
+        let copy_count = palette.len().min(initial_palette.len());
+        palette[..copy_count].copy_from_slice(&initial_palette[..copy_count]);
+
+        // P1 defaults to 0, whose DEC aspect ratio is 2:1. P2=1 makes
+        // untouched pixels transparent. P3 is intentionally ignored.
+        let p1 = params.first().copied().unwrap_or(0);
+        let pan = match p1 {
+            2 => 5,
+            3 | 4 => 3,
+            7..=9 => 1,
+            _ => 2,
+        };
+        let transparent_bg = params.get(1).copied().unwrap_or(0) == 1;
+
         Self {
-            palette: Self::default_palette(),
+            palette,
             current_color: 0,
-            transparent_bg: false,
+            transparent_bg,
+            pan,
+            pad: 1,
             x: 0,
             band_y: 0,
             pixels: Vec::new(),
-            max_x: 0,
+            allocated_width: 0,
+            allocated_height: 0,
+            image_width: 0,
+            image_height: 0,
             repeat_count: 1,
             parse_state: ParseState::Normal,
             accum: 0,
             color_params: [0; 5],
             color_param_idx: 0,
+            raster_params: [0; 4],
+            raster_param_idx: 0,
+            config,
+            truncated: false,
+            #[cfg(test)]
+            allocation_count: 0,
         }
     }
 
-    /// Create a new sixel decoder with parameters from DCS
-    pub fn with_params(params: &[u16]) -> Self {
-        let mut decoder = Self::new();
+    /// Current palette. This is primarily useful for shared-palette mode.
+    pub fn palette(&self) -> &[[u8; 4]] {
+        &self.palette
+    }
 
-        // Parse DCS parameters:
-        // Pn1 : pixel aspect ratio (ignored, we use 1:1)
-        // Pn2 : background select (0=device default, 1=no change, 2=set to 0)
-        // Pn3 : horizontal grid size (ignored)
-        if params.len() > 1 {
-            match params[1] {
-                2 => decoder.transparent_bg = false, // Background set to color 0
-                1 => decoder.transparent_bg = true,  // No change (transparent)
-                _ => decoder.transparent_bg = false, // Device default
+    /// Whether any data has been clipped by a configured safety limit.
+    pub fn was_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Initialize the VT340-compatible palette at the requested size.
+    pub fn default_palette(size: usize) -> Vec<[u8; 4]> {
+        let size = size.clamp(2, MAX_SIXEL_COLORS);
+        let mut palette = vec![[0, 0, 0, 255]; size];
+
+        const VT340: [[u8; 4]; 16] = [
+            [0, 0, 0, 255],
+            [51, 51, 204, 255],
+            [204, 33, 33, 255],
+            [51, 204, 51, 255],
+            [204, 51, 204, 255],
+            [51, 204, 204, 255],
+            [204, 204, 51, 255],
+            [135, 135, 135, 255],
+            [66, 66, 66, 255],
+            [84, 84, 153, 255],
+            [153, 66, 66, 255],
+            [84, 153, 84, 255],
+            [153, 84, 153, 255],
+            [84, 153, 153, 255],
+            [153, 153, 84, 255],
+            [204, 204, 204, 255],
+        ];
+        let copy_count = size.min(VT340.len());
+        palette[..copy_count].copy_from_slice(&VT340[..copy_count]);
+
+        // Preserve cterm's deterministic extended grayscale defaults.
+        let extended = size.saturating_sub(VT340.len());
+        if extended > 0 {
+            let denominator = extended.saturating_sub(1).max(1);
+            for (offset, color) in palette.iter_mut().skip(VT340.len()).enumerate() {
+                let gray = (offset * 255 / denominator) as u8;
+                *color = [gray, gray, gray, 255];
             }
-        }
-
-        decoder
-    }
-
-    /// Initialize the VT340-compatible 16-color palette
-    fn default_palette() -> [[u8; 4]; 256] {
-        let mut palette = [[0, 0, 0, 255]; 256];
-
-        // VT340 default 16 colors
-        palette[0] = [0, 0, 0, 255]; // Black
-        palette[1] = [51, 51, 204, 255]; // Blue
-        palette[2] = [204, 51, 51, 255]; // Red
-        palette[3] = [51, 204, 51, 255]; // Green
-        palette[4] = [204, 51, 204, 255]; // Magenta
-        palette[5] = [51, 204, 204, 255]; // Cyan
-        palette[6] = [204, 204, 51, 255]; // Yellow
-        palette[7] = [204, 204, 204, 255]; // White
-        palette[8] = [51, 51, 51, 255]; // Bright Black (Gray)
-        palette[9] = [102, 102, 255, 255]; // Bright Blue
-        palette[10] = [255, 102, 102, 255]; // Bright Red
-        palette[11] = [102, 255, 102, 255]; // Bright Green
-        palette[12] = [255, 102, 255, 255]; // Bright Magenta
-        palette[13] = [102, 255, 255, 255]; // Bright Cyan
-        palette[14] = [255, 255, 102, 255]; // Bright Yellow
-        palette[15] = [255, 255, 255, 255]; // Bright White
-
-        // Initialize remaining colors to a basic pattern
-        for (i, color) in palette.iter_mut().enumerate().skip(16) {
-            let gray = ((i - 16) * 255 / 240) as u8;
-            *color = [gray, gray, gray, 255];
         }
 
         palette
     }
 
-    /// Process a byte of sixel data
+    /// Process one byte of Sixel payload.
     pub fn put(&mut self, byte: u8) {
         match self.parse_state {
             ParseState::Normal => self.put_normal(byte),
             ParseState::Repeat => self.put_repeat(byte),
             ParseState::Color => self.put_color(byte),
             ParseState::ColorDef => self.put_color_def(byte),
+            ParseState::Raster => self.put_raster(byte),
         }
     }
 
-    /// Process bytes in normal mode
     fn put_normal(&mut self, byte: u8) {
         match byte {
-            // Repeat introducer
             b'!' => {
                 self.parse_state = ParseState::Repeat;
                 self.accum = 0;
             }
-            // Color introducer
             b'#' => {
                 self.parse_state = ParseState::Color;
                 self.accum = 0;
                 self.color_param_idx = 0;
                 self.color_params = [0; 5];
             }
-            // Carriage return (go to start of band)
-            b'$' => {
-                self.x = 0;
+            b'"' => {
+                self.parse_state = ParseState::Raster;
+                self.accum = 0;
+                self.raster_param_idx = 0;
+                self.raster_params = [0; 4];
             }
-            // Line feed (next 6-pixel band)
+            b'$' => self.x = 0,
             b'-' => {
                 self.x = 0;
-                self.band_y += 1;
+                self.band_y = self.band_y.saturating_add(6usize.saturating_mul(self.pan));
             }
-            // Sixel data (63-126 = '?' to '~')
-            63..=126 => {
-                self.draw_sixel(byte - 63);
-            }
-            // Ignore other bytes
+            63..=126 => self.draw_sixel(byte - 63),
             _ => {}
         }
     }
 
-    /// Process bytes in repeat mode
     fn put_repeat(&mut self, byte: u8) {
         match byte {
-            b'0'..=b'9' => {
-                self.accum = self
-                    .accum
-                    .saturating_mul(10)
-                    .saturating_add((byte - b'0') as usize);
-            }
-            // Sixel data ends repeat mode
+            b'0'..=b'9' => self.push_digit(byte),
             63..=126 => {
-                self.repeat_count = self.accum.max(1);
+                self.repeat_count = self.accum.max(1).min(self.config.max_repeat);
+                if self.accum > self.config.max_repeat {
+                    self.truncated = true;
+                }
                 self.draw_sixel(byte - 63);
                 self.repeat_count = 1;
                 self.parse_state = ParseState::Normal;
             }
-            // Any other byte resets to normal
             _ => {
                 self.parse_state = ParseState::Normal;
                 self.put_normal(byte);
@@ -196,121 +303,141 @@ impl SixelDecoder {
         }
     }
 
-    /// Process bytes in color selection/definition mode
     fn put_color(&mut self, byte: u8) {
         match byte {
-            b'0'..=b'9' => {
-                self.accum = self
-                    .accum
-                    .saturating_mul(10)
-                    .saturating_add((byte - b'0') as usize);
-            }
+            b'0'..=b'9' => self.push_digit(byte),
             b';' => {
-                // Store accumulated value and switch to color definition mode
-                self.color_params[self.color_param_idx] = self.accum;
-                self.color_param_idx += 1;
-                self.accum = 0;
-                if self.color_param_idx == 1 {
-                    self.parse_state = ParseState::ColorDef;
-                }
+                self.store_color_param();
+                self.parse_state = ParseState::ColorDef;
             }
-            // Any other byte: just select the color and return to normal
             _ => {
-                self.current_color = (self.accum % 256) as u8;
+                self.select_color(self.accum);
                 self.parse_state = ParseState::Normal;
-                // Process this byte as normal
-                if byte != b'#' {
-                    self.put_normal(byte);
-                } else {
-                    // Start new color sequence
-                    self.accum = 0;
-                    self.color_param_idx = 0;
-                    self.color_params = [0; 5];
-                    self.parse_state = ParseState::Color;
-                }
+                self.put_normal(byte);
             }
         }
     }
 
-    /// Process bytes in color definition mode
     fn put_color_def(&mut self, byte: u8) {
         match byte {
-            b'0'..=b'9' => {
-                self.accum = self
-                    .accum
-                    .saturating_mul(10)
-                    .saturating_add((byte - b'0') as usize);
-            }
-            b';' => {
-                if self.color_param_idx < 5 {
-                    self.color_params[self.color_param_idx] = self.accum;
-                    self.color_param_idx += 1;
-                }
-                self.accum = 0;
-            }
-            // Any other byte ends color definition
+            b'0'..=b'9' => self.push_digit(byte),
+            b';' => self.store_color_param(),
             _ => {
-                // Store final accumulated value
-                if self.color_param_idx < 5 {
-                    self.color_params[self.color_param_idx] = self.accum;
-                    self.color_param_idx += 1;
-                }
-
-                // Define the color
+                self.store_color_param();
                 self.define_color();
-
                 self.parse_state = ParseState::Normal;
-                // Process this byte as normal
-                if byte != b'#' {
-                    self.put_normal(byte);
-                } else {
-                    // Start new color sequence
-                    self.accum = 0;
-                    self.color_param_idx = 0;
-                    self.color_params = [0; 5];
-                    self.parse_state = ParseState::Color;
-                }
+                self.put_normal(byte);
             }
         }
     }
 
-    /// Define a color in the palette
+    fn put_raster(&mut self, byte: u8) {
+        match byte {
+            b'0'..=b'9' => self.push_digit(byte),
+            b';' => self.store_raster_param(),
+            _ => {
+                self.store_raster_param();
+                self.apply_raster_attributes();
+                self.parse_state = ParseState::Normal;
+                self.put_normal(byte);
+            }
+        }
+    }
+
+    fn push_digit(&mut self, byte: u8) {
+        self.accum = self
+            .accum
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as usize);
+    }
+
+    fn store_color_param(&mut self) {
+        if self.color_param_idx < self.color_params.len() {
+            self.color_params[self.color_param_idx] = self.accum;
+            self.color_param_idx += 1;
+        }
+        self.accum = 0;
+    }
+
+    fn store_raster_param(&mut self) {
+        if self.raster_param_idx < self.raster_params.len() {
+            self.raster_params[self.raster_param_idx] = self.accum;
+            self.raster_param_idx += 1;
+        }
+        self.accum = 0;
+    }
+
+    fn select_color(&mut self, requested: usize) {
+        self.current_color = requested.min(self.palette.len() - 1);
+    }
+
     fn define_color(&mut self) {
-        // params[0] = color number
-        // params[1] = color coordinate system (1=HLS, 2=RGB)
-        // params[2..4] = color values
+        self.select_color(self.color_params[0]);
+        if self.color_param_idx < 5 {
+            return;
+        }
 
-        let color_idx = (self.color_params[0] % 256) as u8;
-        let color_system = self.color_params[1];
-
-        match color_system {
-            // RGB (values are 0-100)
+        match self.color_params[1] {
+            // Sixel HLS primary hues are blue=0, red=120 and green=240.
+            1 => {
+                let hue = self.color_params[2].min(360);
+                let lightness = self.color_params[3].min(100);
+                let saturation = self.color_params[4].min(100);
+                let rotated_hue = (hue + 240) % 360;
+                let (r, g, b) = Self::hls_to_rgb(rotated_hue, lightness, saturation);
+                self.palette[self.current_color] = [r, g, b, 255];
+            }
             2 => {
                 let r = ((self.color_params[2].min(100) * 255) / 100) as u8;
                 let g = ((self.color_params[3].min(100) * 255) / 100) as u8;
                 let b = ((self.color_params[4].min(100) * 255) / 100) as u8;
-                self.palette[color_idx as usize] = [r, g, b, 255];
+                self.palette[self.current_color] = [r, g, b, 255];
             }
-            // HLS (hue 0-360, lightness 0-100, saturation 0-100)
-            1 => {
-                let h = self.color_params[2] % 360;
-                let l = self.color_params[3].min(100);
-                let s = self.color_params[4].min(100);
-                let (r, g, b) = Self::hls_to_rgb(h, l, s);
-                self.palette[color_idx as usize] = [r, g, b, 255];
-            }
-            _ => {
-                // Unknown color system, ignore
-            }
+            _ => {}
         }
-
-        // Select this color
-        self.current_color = color_idx;
     }
 
-    /// Convert HLS to RGB (H: 0-360, L: 0-100, S: 0-100)
+    fn apply_raster_attributes(&mut self) {
+        let pan = self.raster_params[0].clamp(1, 5);
+        let pad = self.raster_params[1].clamp(1, 5);
+
+        // Like foot, retain the original ratio if output already exists.
+        if self.image_width == 0 && self.image_height == 0 {
+            self.pan = pan;
+            self.pad = pad;
+        }
+
+        let width = match self.raster_params[2].checked_mul(self.pad) {
+            Some(width) => width,
+            None => {
+                self.truncated = true;
+                return;
+            }
+        };
+        let height = match self.raster_params[3].checked_mul(self.pan) {
+            Some(height) => height,
+            None => {
+                self.truncated = true;
+                return;
+            }
+        };
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let requested_width = self.image_width.max(width);
+        let requested_height = self.image_height.max(height);
+        if self.ensure_size(requested_width, requested_height) {
+            self.image_width = requested_width;
+            self.image_height = requested_height;
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    /// Convert standard HSL to RGB (H: 0-359, L/S: 0-100).
     fn hls_to_rgb(h: usize, l: usize, s: usize) -> (u8, u8, u8) {
-        let h = h as f64;
+        let h = h as f64 / 360.0;
         let l = l as f64 / 100.0;
         let s = s as f64 / 100.0;
 
@@ -326,8 +453,6 @@ impl SixelDecoder {
         };
         let p = 2.0 * l - q;
 
-        let h_norm = h / 360.0;
-
         fn hue_to_rgb(p: f64, q: f64, mut t: f64) -> f64 {
             if t < 0.0 {
                 t += 1.0;
@@ -336,127 +461,258 @@ impl SixelDecoder {
                 t -= 1.0;
             }
             if t < 1.0 / 6.0 {
-                return p + (q - p) * 6.0 * t;
+                p + (q - p) * 6.0 * t
+            } else if t < 1.0 / 2.0 {
+                q
+            } else if t < 2.0 / 3.0 {
+                p + (q - p) * (2.0 / 3.0 - t) * 6.0
+            } else {
+                p
             }
-            if t < 1.0 / 2.0 {
-                return q;
-            }
-            if t < 2.0 / 3.0 {
-                return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
-            }
-            p
         }
 
-        let r = (hue_to_rgb(p, q, h_norm + 1.0 / 3.0) * 255.0) as u8;
-        let g = (hue_to_rgb(p, q, h_norm) * 255.0) as u8;
-        let b = (hue_to_rgb(p, q, h_norm - 1.0 / 3.0) * 255.0) as u8;
-
+        let r = (hue_to_rgb(p, q, h + 1.0 / 3.0) * 255.0) as u8;
+        let g = (hue_to_rgb(p, q, h) * 255.0) as u8;
+        let b = (hue_to_rgb(p, q, h - 1.0 / 3.0) * 255.0) as u8;
         (r, g, b)
     }
 
-    /// Draw a sixel character (6 vertical pixels)
     fn draw_sixel(&mut self, sixel: u8) {
-        let color = self.palette[self.current_color as usize];
-
-        for _ in 0..self.repeat_count {
-            // Ensure we have enough space in the pixel buffer
-            let required_height = (self.band_y + 1) * 6;
-            let required_width = self.x + 1;
-
-            // Expand buffer if needed
-            self.ensure_size(required_width, required_height);
-
-            // Draw 6 vertical pixels
-            for bit in 0..6 {
-                if (sixel >> bit) & 1 != 0 {
-                    let y = self.band_y * 6 + bit;
-                    self.set_pixel(self.x, y, color);
-                }
-            }
-
-            self.x += 1;
-            if self.x > self.max_x {
-                self.max_x = self.x;
-            }
+        let stripe_height = 6usize.saturating_mul(self.pan);
+        let required_height = self.band_y.saturating_add(stripe_height);
+        if required_height > self.config.max_height || required_height == 0 {
+            self.truncated = true;
+            return;
         }
-    }
 
-    /// Ensure the pixel buffer is large enough
-    fn ensure_size(&mut self, width: usize, height: usize) {
-        let current_width = self.max_x.max(1);
-        let current_height = self.pixels.len() / (current_width * 4);
+        // Bound repeats before iterating. The byte budget can impose a width
+        // smaller than max_width for tall images.
+        let budget_pixels = self.config.max_bytes / BYTES_PER_PIXEL;
+        let budget_width = budget_pixels / required_height;
+        let effective_max_width = self.config.max_width.min(budget_width);
+        let repetitions_available = effective_max_width.saturating_sub(self.x) / self.pad;
+        let repetitions = self.repeat_count.min(repetitions_available);
 
-        if width > current_width || height > current_height {
-            let new_width = width.max(current_width).min(MAX_SIXEL_DIMENSION);
-            let new_height = height.max(current_height).min(MAX_SIXEL_DIMENSION);
+        if repetitions < self.repeat_count {
+            self.truncated = true;
+        }
+        if repetitions == 0 {
+            return;
+        }
 
-            // Reject if dimensions exceed limit
-            if width > MAX_SIXEL_DIMENSION || height > MAX_SIXEL_DIMENSION {
-                return;
-            }
+        let Some(required_width) = repetitions
+            .checked_mul(self.pad)
+            .and_then(|width| self.x.checked_add(width))
+        else {
+            self.truncated = true;
+            return;
+        };
+        if !self.ensure_size(required_width, required_height) {
+            self.truncated = true;
+            return;
+        }
 
-            // Create new buffer
-            let mut new_pixels = if self.transparent_bg {
-                vec![0u8; new_width * new_height * 4]
-            } else {
-                // Fill with background color (color 0)
-                let bg = self.palette[0];
-                let mut buf = Vec::with_capacity(new_width * new_height * 4);
-                for _ in 0..(new_width * new_height) {
-                    buf.extend_from_slice(&bg);
-                }
-                buf
-            };
-
-            // Copy existing data
-            for y in 0..current_height {
-                for x in 0..current_width {
-                    let old_idx = (y * current_width + x) * 4;
-                    let new_idx = (y * new_width + x) * 4;
-                    if old_idx + 4 <= self.pixels.len() && new_idx + 4 <= new_pixels.len() {
-                        new_pixels[new_idx..new_idx + 4]
-                            .copy_from_slice(&self.pixels[old_idx..old_idx + 4]);
+        let color = self.palette[self.current_color];
+        for _ in 0..repetitions {
+            for column in 0..self.pad {
+                for bit in 0..6 {
+                    if (sixel >> bit) & 1 != 0 {
+                        let first_y = self.band_y + bit * self.pan;
+                        for row in 0..self.pan {
+                            self.set_pixel(self.x + column, first_y + row, color);
+                        }
                     }
                 }
             }
-
-            self.pixels = new_pixels;
-            self.max_x = new_width;
+            self.x += self.pad;
         }
+
+        self.image_width = self.image_width.max(required_width);
+        self.image_height = self.image_height.max(required_height);
     }
 
-    /// Set a pixel in the buffer
+    fn ensure_size(&mut self, width: usize, height: usize) -> bool {
+        if width == 0 || height == 0 || !self.allocation_allowed(width, height) {
+            return false;
+        }
+        if width <= self.allocated_width && height <= self.allocated_height {
+            return true;
+        }
+
+        let base_width = width.max(self.allocated_width);
+        let base_height = height.max(self.allocated_height);
+        let grown_width = Self::grown_dimension(self.allocated_width, width, self.config.max_width);
+        let grown_height =
+            Self::grown_dimension(self.allocated_height, height, self.config.max_height);
+
+        // Prefer geometric growth. Near the budget retain slack in the axis
+        // currently growing before falling back to the exact required extent.
+        let candidates = [
+            (grown_width, grown_height),
+            (grown_width, base_height),
+            (base_width, grown_height),
+            (base_width, base_height),
+        ];
+        for (new_width, new_height) in candidates {
+            if new_width < width
+                || new_height < height
+                || new_width < self.allocated_width
+                || new_height < self.allocated_height
+                || !self.allocation_allowed(new_width, new_height)
+            {
+                continue;
+            }
+            return self.reallocate(new_width, new_height);
+        }
+        false
+    }
+
+    fn allocation_allowed(&self, width: usize, height: usize) -> bool {
+        if width > self.config.max_width || height > self.config.max_height {
+            return false;
+        }
+        width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+            .is_some_and(|bytes| bytes <= self.config.max_bytes)
+    }
+
+    fn grown_dimension(current: usize, required: usize, limit: usize) -> usize {
+        let geometric = if current == 0 {
+            16
+        } else {
+            current.saturating_mul(2)
+        };
+        required.max(geometric).min(limit)
+    }
+
+    fn reallocate(&mut self, new_width: usize, new_height: usize) -> bool {
+        let Some(new_len) = new_width
+            .checked_mul(new_height)
+            .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+        else {
+            return false;
+        };
+
+        let mut new_pixels = Vec::new();
+        if new_pixels.try_reserve_exact(new_len).is_err() {
+            return false;
+        }
+        new_pixels.resize(new_len, 0);
+        if !self.transparent_bg {
+            let background = self.palette[0];
+            for pixel in new_pixels.chunks_exact_mut(BYTES_PER_PIXEL) {
+                pixel.copy_from_slice(&background);
+            }
+        }
+
+        if self.allocated_width > 0 {
+            let old_row_bytes = self.allocated_width * BYTES_PER_PIXEL;
+            let new_row_bytes = new_width * BYTES_PER_PIXEL;
+            let rows = self.allocated_height.min(new_height);
+            for row in 0..rows {
+                let old_start = row * old_row_bytes;
+                let new_start = row * new_row_bytes;
+                new_pixels[new_start..new_start + old_row_bytes]
+                    .copy_from_slice(&self.pixels[old_start..old_start + old_row_bytes]);
+            }
+        }
+
+        self.pixels = new_pixels;
+        self.allocated_width = new_width;
+        self.allocated_height = new_height;
+        #[cfg(test)]
+        {
+            self.allocation_count += 1;
+        }
+        true
+    }
+
     fn set_pixel(&mut self, x: usize, y: usize, color: [u8; 4]) {
-        let width = self.max_x.max(1);
-        let idx = (y * width + x) * 4;
-        if idx + 4 <= self.pixels.len() {
-            self.pixels[idx..idx + 4].copy_from_slice(&color);
+        debug_assert!(x < self.allocated_width);
+        debug_assert!(y < self.allocated_height);
+        let Some(index) = y
+            .checked_mul(self.allocated_width)
+            .and_then(|offset| offset.checked_add(x))
+            .and_then(|offset| offset.checked_mul(BYTES_PER_PIXEL))
+        else {
+            self.truncated = true;
+            return;
+        };
+        if let Some(pixel) = self.pixels.get_mut(index..index + BYTES_PER_PIXEL) {
+            pixel.copy_from_slice(&color);
+        } else {
+            self.truncated = true;
         }
     }
 
-    /// Finalize decoding and return the image
+    fn finish_pending_sequence(&mut self) {
+        match self.parse_state {
+            ParseState::Color => self.select_color(self.accum),
+            ParseState::ColorDef => {
+                self.store_color_param();
+                self.define_color();
+            }
+            ParseState::Raster => {
+                self.store_raster_param();
+                self.apply_raster_attributes();
+            }
+            ParseState::Normal | ParseState::Repeat => {}
+        }
+        self.parse_state = ParseState::Normal;
+    }
+
+    /// Finalize decoding and return both the image and updated palette.
+    pub fn finish_with_palette(mut self) -> SixelDecodeResult {
+        self.finish_pending_sequence();
+
+        let image = if self.image_width == 0 || self.image_height == 0 {
+            None
+        } else if self.image_width > self.allocated_width
+            || self.image_height > self.allocated_height
+            || self
+                .image_width
+                .checked_mul(self.image_height)
+                .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
+                .is_none_or(|bytes| bytes > self.pixels.len())
+        {
+            // All extent changes normally go through ensure_size(). Keep the
+            // consuming API defensive so a rejected hint or future parser
+            // change can never turn an allocation failure into a panic.
+            self.truncated = true;
+            None
+        } else {
+            let width = self.image_width;
+            let height = self.image_height;
+            let row_bytes = width * BYTES_PER_PIXEL;
+
+            // Compact the geometric backing stride in place. Top-to-bottom is
+            // safe because each destination begins before its source.
+            for row in 1..height {
+                let source = row * self.allocated_width * BYTES_PER_PIXEL;
+                let destination = row * row_bytes;
+                self.pixels
+                    .copy_within(source..source + row_bytes, destination);
+            }
+            self.pixels.truncate(row_bytes * height);
+
+            Some(SixelImage {
+                data: self.pixels,
+                width,
+                height,
+            })
+        };
+
+        SixelDecodeResult {
+            image,
+            palette: self.palette,
+            truncated: self.truncated,
+        }
+    }
+
+    /// Finalize decoding and return only the image.
     pub fn finish(self) -> Option<SixelImage> {
-        if self.max_x == 0 {
-            return None;
-        }
-
-        let width = self.max_x;
-        let height = (self.band_y + 1) * 6;
-        let expected_size = width * height * 4;
-
-        // Ensure correct size
-        let mut data = self.pixels;
-        if data.len() < expected_size {
-            data.resize(expected_size, 0);
-        } else if data.len() > expected_size {
-            data.truncate(expected_size);
-        }
-
-        Some(SixelImage {
-            data,
-            width,
-            height,
-        })
+        self.finish_with_palette().image
     }
 }
 
@@ -470,102 +726,185 @@ impl Default for SixelDecoder {
 mod tests {
     use super::*;
 
+    fn put_all(decoder: &mut SixelDecoder, bytes: &[u8]) {
+        for &byte in bytes {
+            decoder.put(byte);
+        }
+    }
+
+    fn one_to_one() -> SixelDecoder {
+        SixelDecoder::with_params(&[7])
+    }
+
     #[test]
-    fn test_simple_sixel() {
+    fn dec_default_aspect_ratio_is_two_to_one() {
         let mut decoder = SixelDecoder::new();
-
-        // Draw a simple pattern: all 6 pixels on (character '~' = 63)
-        // '~' - 63 = 63 = 0b111111 (all 6 bits set)
         decoder.put(b'~');
-
         let image = decoder.finish().unwrap();
-        assert_eq!(image.width, 1);
-        assert_eq!(image.height, 6);
-
-        // Check that pixels are set (not transparent/black)
-        for y in 0..6 {
-            let idx = y * 4;
-            // Should be the default color (black from palette[0])
-            assert_eq!(image.data[idx + 3], 255); // Alpha should be 255
+        assert_eq!((image.width, image.height), (1, 12));
+        for pixel in image.data.chunks_exact(4) {
+            assert_eq!(pixel[3], 255);
         }
     }
 
     #[test]
-    fn test_repeat() {
-        let mut decoder = SixelDecoder::new();
-
-        // Repeat '~' 5 times: "!5~"
-        decoder.put(b'!');
-        decoder.put(b'5');
-        decoder.put(b'~');
-
-        let image = decoder.finish().unwrap();
-        assert_eq!(image.width, 5);
-        assert_eq!(image.height, 6);
-    }
-
-    #[test]
-    fn test_color_select() {
-        let mut decoder = SixelDecoder::new();
-
-        // Select color 1 (blue) and draw
-        decoder.put(b'#');
-        decoder.put(b'1');
-        decoder.put(b'~');
-
-        let image = decoder.finish().unwrap();
-
-        // First pixel should be blue-ish
-        assert_eq!(image.data[0], 51); // R
-        assert_eq!(image.data[1], 51); // G
-        assert_eq!(image.data[2], 204); // B
-    }
-
-    #[test]
-    fn test_color_define_rgb() {
-        let mut decoder = SixelDecoder::new();
-
-        // Define color 5 as RGB(100, 50, 0) and draw
-        // #5;2;100;50;0
-        for byte in b"#5;2;100;50;0~" {
-            decoder.put(*byte);
+    fn dcs_p1_matches_dec_pixel_aspect_ratios() {
+        for (p1, expected_pan) in [
+            (0, 2),
+            (1, 2),
+            (2, 5),
+            (3, 3),
+            (4, 3),
+            (5, 2),
+            (6, 2),
+            (7, 1),
+            (8, 1),
+            (9, 1),
+            (10, 2),
+        ] {
+            let mut decoder = SixelDecoder::with_params(&[p1]);
+            decoder.put(b'~');
+            let image = decoder.finish().unwrap();
+            assert_eq!(image.height, 6 * expected_pan, "P1={p1}");
         }
-
-        let image = decoder.finish().unwrap();
-
-        // First pixel should be the defined color
-        assert_eq!(image.data[0], 255); // R (100% = 255)
-        assert_eq!(image.data[1], 127); // G (50% ≈ 127)
-        assert_eq!(image.data[2], 0); // B (0% = 0)
     }
 
     #[test]
-    fn test_line_feed() {
-        let mut decoder = SixelDecoder::new();
-
-        // Draw on first band, then move to second band
-        decoder.put(b'~');
-        decoder.put(b'-'); // Line feed
-        decoder.put(b'~');
-
-        let image = decoder.finish().unwrap();
-        assert_eq!(image.width, 1);
-        assert_eq!(image.height, 12); // 2 bands * 6 pixels
+    fn repeat_is_applied_and_bounded() {
+        let config = SixelDecoderConfig {
+            max_width: 32,
+            max_height: 64,
+            max_bytes: 32 * 64 * 4,
+            ..SixelDecoderConfig::default()
+        };
+        let mut decoder = SixelDecoder::with_config(&[7], config);
+        put_all(&mut decoder, b"!999999999999999999999999999999~");
+        let result = decoder.finish_with_palette();
+        assert_eq!(result.image.unwrap().width, 32);
+        assert!(result.truncated);
     }
 
     #[test]
-    fn test_carriage_return() {
-        let mut decoder = SixelDecoder::new();
+    fn color_select_uses_extended_palette() {
+        let config = SixelDecoderConfig {
+            palette_size: 1024,
+            ..SixelDecoderConfig::default()
+        };
+        let mut palette = SixelDecoder::default_palette(1024);
+        palette[700] = [12, 34, 56, 255];
+        let mut decoder = SixelDecoder::with_config_and_palette(&[7], config, &palette);
+        put_all(&mut decoder, b"#700~");
+        let image = decoder.finish().unwrap();
+        assert_eq!(&image.data[..4], &[12, 34, 56, 255]);
+    }
 
-        // Draw 3 pixels, carriage return, draw 2 more (overwrites first 2)
-        decoder.put(b'~');
-        decoder.put(b'~');
-        decoder.put(b'~');
-        decoder.put(b'$'); // Carriage return
-        decoder.put(b'?'); // Empty sixel (0 bits)
+    #[test]
+    fn color_definition_is_returned_for_shared_palette_mode() {
+        let mut decoder = one_to_one();
+        put_all(&mut decoder, b"#1023;2;100;50;0~");
+        let result = decoder.finish_with_palette();
+        assert_eq!(result.palette.len(), 1024);
+        assert_eq!(result.palette[1023], [255, 127, 0, 255]);
+        assert_eq!(&result.image.unwrap().data[..4], &[255, 127, 0, 255]);
+    }
+
+    #[test]
+    fn sixel_hls_uses_dec_hue_rotation() {
+        for (hue, expected) in [
+            (0, [0, 0, 255, 255]),
+            (120, [255, 0, 0, 255]),
+            (240, [0, 255, 0, 255]),
+        ] {
+            let mut decoder = one_to_one();
+            put_all(&mut decoder, format!("#1;1;{hue};50;100~").as_bytes());
+            let image = decoder.finish().unwrap();
+            assert_eq!(&image.data[..4], &expected, "DEC hue {hue}");
+        }
+    }
+
+    #[test]
+    fn raster_attributes_set_aspect_and_geometry() {
+        let mut decoder = one_to_one();
+        // Pan=2, Pad=3, Ph=4, Pv=5 => 12x10 output pixels.
+        put_all(&mut decoder, b"\"2;3;4;5");
+        let image = decoder.finish().unwrap();
+        assert_eq!((image.width, image.height), (12, 10));
+        assert_eq!(image.data.len(), 12 * 10 * 4);
+        assert!(image
+            .data
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn raster_hint_expands_for_printed_sixels() {
+        let mut decoder = one_to_one();
+        put_all(&mut decoder, b"\"2;3;4;5~");
+        // The hint is 12x10, but one sixel at Pan=2 is 12 pixels tall.
+        let image = decoder.finish().unwrap();
+        assert_eq!((image.width, image.height), (12, 12));
+        for y in 0..12 {
+            for x in 0..3 {
+                assert_eq!(image.data[(y * 12 + x) * 4 + 3], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn raster_attributes_do_not_change_aspect_after_output() {
+        let mut decoder = one_to_one();
+        put_all(&mut decoder, b"~\"5;5;0;0~");
+        let image = decoder.finish().unwrap();
+        assert_eq!((image.width, image.height), (2, 6));
+    }
+
+    #[test]
+    fn byte_budget_rejects_large_raster_but_keeps_decoding() {
+        let config = SixelDecoderConfig {
+            max_width: 10_000,
+            max_height: 10_000,
+            max_bytes: 1024,
+            ..SixelDecoderConfig::default()
+        };
+        let mut decoder = SixelDecoder::with_config(&[7], config);
+        put_all(&mut decoder, b"\"1;1;100;100~");
+        let result = decoder.finish_with_palette();
+        assert!(result.truncated);
+        let image = result.image.unwrap();
+        assert_eq!((image.width, image.height), (1, 6));
+        assert!(image.data.len() <= config.max_bytes);
+    }
+
+    #[test]
+    fn geometric_growth_avoids_per_pixel_reallocation() {
+        let mut decoder = one_to_one();
+        for _ in 0..1000 {
+            decoder.put(b'~');
+        }
+        assert!(decoder.allocated_width >= 1000);
+        assert!(
+            decoder.allocation_count <= 8,
+            "{}",
+            decoder.allocation_count
+        );
+        let image = decoder.finish().unwrap();
+        assert_eq!((image.width, image.height), (1000, 6));
+    }
+
+    #[test]
+    fn transparent_background_remains_transparent() {
+        let mut decoder = SixelDecoder::with_params(&[7, 1]);
         decoder.put(b'?');
-
         let image = decoder.finish().unwrap();
-        assert_eq!(image.width, 3); // Max width is still 3
+        assert_eq!((image.width, image.height), (1, 6));
+        assert!(image.data.iter().all(|&component| component == 0));
+    }
+
+    #[test]
+    fn line_feed_and_carriage_return_preserve_extent() {
+        let mut decoder = one_to_one();
+        put_all(&mut decoder, b"~~~$??-~");
+        let image = decoder.finish().unwrap();
+        assert_eq!((image.width, image.height), (3, 12));
     }
 }

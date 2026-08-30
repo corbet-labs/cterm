@@ -1114,7 +1114,7 @@ mod tests {
 
         let images = term.screen().visible_images();
         assert_eq!(images.len(), 1);
-        assert_eq!((images[0].pixel_width, images[0].pixel_height), (1, 6));
+        assert_eq!((images[0].pixel_width, images[0].pixel_height), (1, 12));
     }
 
     #[test]

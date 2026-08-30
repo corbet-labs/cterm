@@ -159,6 +159,10 @@ pub struct TerminalModes {
     /// instead of at the image's left edge on the following text row.
     #[serde(default)]
     pub sixel_cursor_right: bool,
+    /// Give every Sixel image a fresh palette (DEC private mode 1070).
+    /// Resetting the mode shares palette definitions between images.
+    #[serde(default = "default_enabled")]
+    pub sixel_private_palette: bool,
     /// G0 character set designator (None = standard ASCII)
     pub charset_g0: Option<String>,
     /// G1 character set designator (None = standard)
@@ -774,7 +778,8 @@ impl Screen {
             auto_wrap: true,
             reverse_wrap: true,
             show_cursor: true,
-            sixel_scrolling: true,  // Sixel scrolling enabled by default
+            sixel_scrolling: true, // Sixel scrolling enabled by default
+            sixel_private_palette: true,
             alternate_scroll: true, // Alternate-screen wheel-to-arrows enabled by default
             modify_other_keys: 1,
             ..Default::default()
@@ -2271,6 +2276,7 @@ impl Screen {
             reverse_wrap: true,
             show_cursor: true,
             sixel_scrolling: true,
+            sixel_private_palette: true,
             alternate_scroll: true,
             modify_other_keys: 1,
             ..Default::default()
