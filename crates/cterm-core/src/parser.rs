@@ -890,7 +890,7 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             // SGR - Select Graphic Rendition
             ('m', []) => {
-                self.handle_sgr(&params_vec);
+                self.handle_sgr(params);
             }
             // Set xterm modifyOtherKeys. foot treats every value except 2 as
             // its backwards-compatible level 1.
@@ -1638,7 +1638,7 @@ impl ScreenPerformer<'_> {
     }
 
     /// Handle SGR (Select Graphic Rendition) sequences
-    fn handle_sgr(&mut self, params: &[usize]) {
+    fn handle_sgr(&mut self, params: &Params) {
         if params.is_empty() {
             // Reset all attributes
             self.screen.style.reset();
@@ -1647,163 +1647,130 @@ impl ScreenPerformer<'_> {
 
         let mut iter = params.iter().peekable();
 
-        while let Some(&param) = iter.next() {
+        while let Some(param) = iter.next() {
             match param {
                 // Reset
-                0 => self.screen.style.reset(),
+                [0] => self.screen.style.reset(),
                 // Bold
-                1 => self.screen.style.attrs.insert(CellAttrs::BOLD),
+                [1] => self.screen.style.attrs.insert(CellAttrs::BOLD),
                 // Dim/faint
-                2 => self.screen.style.attrs.insert(CellAttrs::DIM),
+                [2] => self.screen.style.attrs.insert(CellAttrs::DIM),
                 // Italic
-                3 => self.screen.style.attrs.insert(CellAttrs::ITALIC),
+                [3] => self.screen.style.attrs.insert(CellAttrs::ITALIC),
                 // Underline
-                4 => {
-                    // Check for extended underline
-                    if let Some(&&sub) = iter.peek() {
-                        match sub {
-                            0 => {
-                                iter.next();
-                                self.screen.style.attrs.clear_underline();
-                            }
-                            1 => {
-                                iter.next();
-                                self.screen.style.attrs.clear_underline();
-                                self.screen.style.attrs.insert(CellAttrs::UNDERLINE);
-                            }
-                            2 => {
-                                iter.next();
-                                self.screen.style.attrs.clear_underline();
-                                self.screen.style.attrs.insert(CellAttrs::DOUBLE_UNDERLINE);
-                            }
-                            3 => {
-                                iter.next();
-                                self.screen.style.attrs.clear_underline();
-                                self.screen.style.attrs.insert(CellAttrs::CURLY_UNDERLINE);
-                            }
-                            4 => {
-                                iter.next();
-                                self.screen.style.attrs.clear_underline();
-                                self.screen.style.attrs.insert(CellAttrs::DOTTED_UNDERLINE);
-                            }
-                            5 => {
-                                iter.next();
-                                self.screen.style.attrs.clear_underline();
-                                self.screen.style.attrs.insert(CellAttrs::DASHED_UNDERLINE);
-                            }
-                            _ => {
-                                self.screen.style.attrs.insert(CellAttrs::UNDERLINE);
-                            }
-                        }
-                    } else {
-                        self.screen.style.attrs.insert(CellAttrs::UNDERLINE);
+                [4, style @ ..] => {
+                    self.screen.style.attrs.clear_underline();
+                    match style.first().copied().unwrap_or(1) {
+                        0 => {}
+                        2 => self.screen.style.attrs.insert(CellAttrs::DOUBLE_UNDERLINE),
+                        3 => self.screen.style.attrs.insert(CellAttrs::CURLY_UNDERLINE),
+                        4 => self.screen.style.attrs.insert(CellAttrs::DOTTED_UNDERLINE),
+                        5 => self.screen.style.attrs.insert(CellAttrs::DASHED_UNDERLINE),
+                        _ => self.screen.style.attrs.insert(CellAttrs::UNDERLINE),
                     }
                 }
                 // Blink
-                5 | 6 => self.screen.style.attrs.insert(CellAttrs::BLINK),
+                [5] | [6] => self.screen.style.attrs.insert(CellAttrs::BLINK),
                 // Inverse
-                7 => self.screen.style.attrs.insert(CellAttrs::INVERSE),
+                [7] => self.screen.style.attrs.insert(CellAttrs::INVERSE),
                 // Hidden
-                8 => self.screen.style.attrs.insert(CellAttrs::HIDDEN),
+                [8] => self.screen.style.attrs.insert(CellAttrs::HIDDEN),
                 // Strikethrough
-                9 => self.screen.style.attrs.insert(CellAttrs::STRIKETHROUGH),
+                [9] => self.screen.style.attrs.insert(CellAttrs::STRIKETHROUGH),
                 // Normal intensity (not bold or dim)
-                22 => {
+                [22] => {
                     self.screen.style.attrs.remove(CellAttrs::BOLD);
                     self.screen.style.attrs.remove(CellAttrs::DIM);
                 }
                 // Not italic
-                23 => self.screen.style.attrs.remove(CellAttrs::ITALIC),
+                [23] => self.screen.style.attrs.remove(CellAttrs::ITALIC),
                 // Not underlined
-                24 => self.screen.style.attrs.clear_underline(),
+                [24] => self.screen.style.attrs.clear_underline(),
                 // Not blinking
-                25 => self.screen.style.attrs.remove(CellAttrs::BLINK),
+                [25] => self.screen.style.attrs.remove(CellAttrs::BLINK),
                 // Not inverse
-                27 => self.screen.style.attrs.remove(CellAttrs::INVERSE),
+                [27] => self.screen.style.attrs.remove(CellAttrs::INVERSE),
                 // Not hidden
-                28 => self.screen.style.attrs.remove(CellAttrs::HIDDEN),
+                [28] => self.screen.style.attrs.remove(CellAttrs::HIDDEN),
                 // Not strikethrough
-                29 => self.screen.style.attrs.remove(CellAttrs::STRIKETHROUGH),
+                [29] => self.screen.style.attrs.remove(CellAttrs::STRIKETHROUGH),
                 // Foreground colors (30-37)
-                30..=37 => {
-                    if let Some(color) = AnsiColor::from_index((param - 30) as u8) {
+                [param @ 30..=37] => {
+                    if let Some(color) = AnsiColor::from_index((*param - 30) as u8) {
                         self.screen.style.fg = Color::Ansi(color);
                     }
                 }
-                // Extended foreground color
-                38 => {
-                    if let Some(color) = self.parse_extended_color(&mut iter) {
+                // Extended foreground color, semicolon form.
+                [38] => {
+                    let mut color_params = iter.by_ref().map(|param| param[0]);
+                    if let Some(color) = parse_sgr_color(&mut color_params) {
+                        self.screen.style.fg = color;
+                    }
+                }
+                // Extended foreground color, colon form.
+                [38, color_params @ ..] => {
+                    if let Some(color) = parse_colon_sgr_color(color_params) {
                         self.screen.style.fg = color;
                     }
                 }
                 // Default foreground
-                39 => self.screen.style.fg = Color::Default,
+                [39] => self.screen.style.fg = Color::Default,
                 // Background colors (40-47)
-                40..=47 => {
-                    if let Some(color) = AnsiColor::from_index((param - 40) as u8) {
+                [param @ 40..=47] => {
+                    if let Some(color) = AnsiColor::from_index((*param - 40) as u8) {
                         self.screen.style.bg = Color::Ansi(color);
                     }
                 }
-                // Extended background color
-                48 => {
-                    if let Some(color) = self.parse_extended_color(&mut iter) {
+                // Extended background color, semicolon form.
+                [48] => {
+                    let mut color_params = iter.by_ref().map(|param| param[0]);
+                    if let Some(color) = parse_sgr_color(&mut color_params) {
+                        self.screen.style.bg = color;
+                    }
+                }
+                // Extended background color, colon form.
+                [48, color_params @ ..] => {
+                    if let Some(color) = parse_colon_sgr_color(color_params) {
                         self.screen.style.bg = color;
                     }
                 }
                 // Default background
-                49 => self.screen.style.bg = Color::Default,
+                [49] => self.screen.style.bg = Color::Default,
                 // Overline
-                53 => self.screen.style.attrs.insert(CellAttrs::OVERLINE),
+                [53] => self.screen.style.attrs.insert(CellAttrs::OVERLINE),
                 // Not overline
-                55 => self.screen.style.attrs.remove(CellAttrs::OVERLINE),
-                // Underline color
-                58 => {
-                    if let Some(color) = self.parse_extended_color(&mut iter) {
+                [55] => self.screen.style.attrs.remove(CellAttrs::OVERLINE),
+                // Underline color, semicolon form.
+                [58] => {
+                    let mut color_params = iter.by_ref().map(|param| param[0]);
+                    if let Some(color) = parse_sgr_color(&mut color_params) {
+                        self.screen.style.underline_color = Some(color);
+                    }
+                }
+                // Underline color, colon form.
+                [58, color_params @ ..] => {
+                    if let Some(color) = parse_colon_sgr_color(color_params) {
                         self.screen.style.underline_color = Some(color);
                     }
                 }
                 // Default underline color
-                59 => self.screen.style.underline_color = None,
+                [59] => self.screen.style.underline_color = None,
                 // Bright foreground colors (90-97)
-                90..=97 => {
-                    if let Some(color) = AnsiColor::from_index((param - 90 + 8) as u8) {
+                [param @ 90..=97] => {
+                    if let Some(color) = AnsiColor::from_index((*param - 90 + 8) as u8) {
                         self.screen.style.fg = Color::Ansi(color);
                     }
                 }
                 // Bright background colors (100-107)
-                100..=107 => {
-                    if let Some(color) = AnsiColor::from_index((param - 100 + 8) as u8) {
+                [param @ 100..=107] => {
+                    if let Some(color) = AnsiColor::from_index((*param - 100 + 8) as u8) {
                         self.screen.style.bg = Color::Ansi(color);
                     }
                 }
                 _ => {
-                    log::trace!("Unknown SGR parameter: {}", param);
+                    log::trace!("Unknown SGR parameter: {:?}", param);
                 }
             }
-        }
-    }
-
-    /// Parse extended color (256-color or RGB)
-    fn parse_extended_color(
-        &self,
-        iter: &mut std::iter::Peekable<std::slice::Iter<usize>>,
-    ) -> Option<Color> {
-        let mode = *iter.next()?;
-
-        match mode {
-            // 256-color
-            5 => {
-                let index = *iter.next()? as u8;
-                Some(Color::Indexed(index))
-            }
-            // RGB
-            2 => {
-                let r = *iter.next()? as u8;
-                let g = *iter.next()? as u8;
-                let b = *iter.next()? as u8;
-                Some(Color::Rgb(Rgb::new(r, g, b)))
-            }
-            _ => None,
         }
     }
 
@@ -1982,6 +1949,27 @@ impl ScreenPerformer<'_> {
 }
 
 // Helper functions
+
+/// Parse the colon form of an SGR color while tolerating the optional color
+/// space and tolerance fields accepted by foot and VTE.
+fn parse_colon_sgr_color(params: &[u16]) -> Option<Color> {
+    let components_start = if params.len() > 4 { 2 } else { 1 };
+    let mut params =
+        std::iter::once(*params.first()?).chain(params.get(components_start..)?.iter().copied());
+    parse_sgr_color(&mut params)
+}
+
+fn parse_sgr_color(params: &mut dyn Iterator<Item = u16>) -> Option<Color> {
+    match params.next()? {
+        5 => Some(Color::Indexed(u8::try_from(params.next()?).ok()?)),
+        2 => Some(Color::Rgb(Rgb::new(
+            u8::try_from(params.next()?).ok()?,
+            u8::try_from(params.next()?).ok()?,
+            u8::try_from(params.next()?).ok()?,
+        ))),
+        _ => None,
+    }
+}
 
 fn params_to_vec(params: &Params) -> Vec<usize> {
     let mut result = Vec::new();
@@ -2165,6 +2153,34 @@ mod tests {
         // RGB: #ff8800
         parser.parse(&mut screen, b"\x1b[38;2;255;136;0m");
         assert_eq!(screen.style.fg, Color::Rgb(Rgb::new(255, 136, 0)));
+    }
+
+    #[test]
+    fn test_sgr_colon_colors_match_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[4:3;38:2::1:2:3;48:5:42;58:2:0:4:5:6m");
+
+        assert!(screen.style.attrs.contains(CellAttrs::CURLY_UNDERLINE));
+        assert_eq!(screen.style.fg, Color::Rgb(Rgb::new(1, 2, 3)));
+        assert_eq!(screen.style.bg, Color::Indexed(42));
+        assert_eq!(
+            screen.style.underline_color,
+            Some(Color::Rgb(Rgb::new(4, 5, 6)))
+        );
+    }
+
+    #[test]
+    fn test_sgr_color_components_are_checked_not_truncated() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[31;48;5;300;58:2::256:2:3m");
+
+        assert_eq!(screen.style.fg, Color::Ansi(AnsiColor::Red));
+        assert_eq!(screen.style.bg, Color::Default);
+        assert_eq!(screen.style.underline_color, None);
     }
 
     #[test]
