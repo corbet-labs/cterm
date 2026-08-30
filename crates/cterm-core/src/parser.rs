@@ -6,7 +6,7 @@
 //! Special handling is provided for OSC 1337 (iTerm2) file transfers
 //! which are intercepted before VTE to enable streaming large files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use vte::Params;
 
@@ -16,9 +16,11 @@ use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
+#[cfg(test)]
+use crate::screen::DesktopNotificationAction;
 use crate::screen::{
-    ClearMode, ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle, LineClearMode,
-    MouseEncoding, MouseMode, Screen,
+    ClearMode, ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle,
+    DesktopNotification, LineClearMode, MouseEncoding, MouseMode, NotificationUrgency, Screen,
 };
 use crate::sixel::{SixelDecoder, SixelImage};
 use crate::streaming_file::StreamingFileReceiver;
@@ -42,6 +44,45 @@ enum DcsState {
 }
 
 const XTGETTCAP_MAX_REQUEST_SIZE: usize = 64 * 1024;
+const MAX_NOTIFICATION_TITLE_BYTES: usize = 1024;
+const MAX_NOTIFICATION_BODY_BYTES: usize = 4096;
+
+#[derive(Debug)]
+struct KittyNotificationBuilder {
+    active: bool,
+    id: Option<String>,
+    title: String,
+    body: String,
+    urgency: NotificationUrgency,
+    expire_time: Option<i32>,
+    muted: bool,
+    focus: bool,
+}
+
+impl Default for KittyNotificationBuilder {
+    fn default() -> Self {
+        Self {
+            active: false,
+            id: None,
+            title: String::new(),
+            body: String::new(),
+            urgency: NotificationUrgency::Normal,
+            expire_time: None,
+            muted: false,
+            focus: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KittyPayloadType {
+    Title,
+    Body,
+    Close,
+    Alive,
+    Ignored,
+    Capabilities,
+}
 
 /// State for intercepting OSC 1337 File transfers before VTE buffers them
 #[derive(Debug, Default)]
@@ -73,6 +114,10 @@ pub struct Parser {
     osc_1337_state: Osc1337State,
     /// Whether an OSC 1337 string terminator (BEL or ESC \) was seen
     osc_1337_terminated: bool,
+    /// In-progress chunked Kitty OSC 99 notification.
+    kitty_notification: KittyNotificationBuilder,
+    /// Optimistically active Kitty notification identifiers for p=alive.
+    active_notification_ids: HashSet<String>,
 }
 
 impl Default for Parser {
@@ -90,6 +135,8 @@ impl Parser {
             saved_dec_modes: HashMap::new(),
             osc_1337_state: Osc1337State::None,
             osc_1337_terminated: false,
+            kitty_notification: KittyNotificationBuilder::default(),
+            active_notification_ids: HashSet::new(),
         }
     }
 
@@ -115,6 +162,8 @@ impl Parser {
                 dcs_state: &mut self.dcs_state,
                 last_printed: &mut self.last_printed,
                 saved_dec_modes: &mut self.saved_dec_modes,
+                kitty_notification: &mut self.kitty_notification,
+                active_notification_ids: &mut self.active_notification_ids,
             };
             self.state_machine.advance(&mut performer, byte);
         }
@@ -372,6 +421,8 @@ struct ScreenPerformer<'a> {
     dcs_state: &'a mut DcsState,
     last_printed: &'a mut Option<char>,
     saved_dec_modes: &'a mut HashMap<usize, bool>,
+    kitty_notification: &'a mut KittyNotificationBuilder,
+    active_notification_ids: &'a mut HashSet<String>,
 }
 
 impl vte::Perform for ScreenPerformer<'_> {
@@ -611,7 +662,7 @@ impl vte::Perform for ScreenPerformer<'_> {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         if params.is_empty() {
             return;
         }
@@ -670,6 +721,17 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // iTerm2 Growl notifications. Numeric prefixes belong to the
+            // ConEmu/Windows Terminal OSC 9 extension and are intentionally
+            // ignored, matching Foot.
+            9 => {
+                if let Some(notification) = parse_simple_notification(&params[1..], true) {
+                    self.screen.queue_notification(notification);
+                }
+            }
+            // Kitty desktop notifications, including chunking and capability,
+            // close, and liveness requests.
+            99 => self.handle_osc99(params, bell_terminated),
             // Set/query 256-color palette entries.
             4 => {
                 for pair in params[1..].as_chunks::<2>().0 {
@@ -731,6 +793,13 @@ impl vte::Perform for ScreenPerformer<'_> {
                 Some(b'D') => self.screen.mark_command_end(),
                 _ => {}
             },
+            // URxvt's generic extension; only its widely implemented notify
+            // command is recognized.
+            777 if params.get(1).copied() == Some(b"notify") => {
+                if let Some(notification) = parse_simple_notification(&params[2..], false) {
+                    self.screen.queue_notification(notification);
+                }
+            }
             // iTerm2 inline images and file transfer (1337)
             1337 => {
                 self.handle_osc_1337(params);
@@ -1592,6 +1661,199 @@ fn xtgettcap_capability(name: &[u8], cols: usize, lines: usize) -> Option<Xtgett
 }
 
 impl ScreenPerformer<'_> {
+    fn handle_osc99(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        use base64::Engine as _;
+
+        let Some(parameters) = params
+            .get(1)
+            .and_then(|value| std::str::from_utf8(value).ok())
+        else {
+            return;
+        };
+
+        let mut id = None;
+        let mut payload_type = KittyPayloadType::Title;
+        let mut done = true;
+        let mut base64_encoded = false;
+        let mut urgency = None;
+        let mut expire_time = None;
+        let mut muted = None;
+        let mut focus = None;
+
+        for parameter in parameters.split(':') {
+            let Some((key, value)) = parameter.split_once('=') else {
+                continue;
+            };
+            if key.len() != 1 {
+                continue;
+            }
+            match key.as_bytes()[0] {
+                b'i' if kitty_notification_id_is_valid(value) => id = Some(value.to_owned()),
+                b'p' => {
+                    payload_type = match value {
+                        "title" => KittyPayloadType::Title,
+                        "body" => KittyPayloadType::Body,
+                        "close" => KittyPayloadType::Close,
+                        "alive" => KittyPayloadType::Alive,
+                        "?" => KittyPayloadType::Capabilities,
+                        _ => KittyPayloadType::Ignored,
+                    };
+                }
+                b'd' => done = value != "0",
+                b'e' => base64_encoded = value == "1",
+                b'u' => {
+                    urgency = match value {
+                        "0" => Some(NotificationUrgency::Low),
+                        "1" => Some(NotificationUrgency::Normal),
+                        "2" => Some(NotificationUrgency::Critical),
+                        _ => None,
+                    };
+                }
+                b'w' => {
+                    expire_time = value
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|value| i32::try_from(value).ok());
+                }
+                b'a' => {
+                    for action in value.split(',') {
+                        if action == "focus" {
+                            focus = Some(true);
+                        } else if action == "-focus" {
+                            focus = Some(false);
+                        }
+                    }
+                }
+                b's' => {
+                    if let Ok(value) = base64::engine::general_purpose::STANDARD.decode(value) {
+                        if value == b"silent" {
+                            muted = Some(true);
+                        } else if value == b"system" {
+                            muted = Some(false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if payload_type == KittyPayloadType::Capabilities {
+            let id = id.as_deref().unwrap_or("0");
+            let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
+            self.screen.queue_response(
+                format!("\x1b]99;i={id}:p=?;p=title,body,?,close:a=focus:o=always:u=0,1,2:c=0{terminator}")
+                    .into_bytes(),
+            );
+            return;
+        }
+
+        if payload_type == KittyPayloadType::Alive {
+            let mut active: Vec<_> = self.active_notification_ids.iter().cloned().collect();
+            active.sort_unstable();
+            let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
+            self.screen.queue_response(
+                format!(
+                    "\x1b]99;i={}:p=alive;{}{terminator}",
+                    id.as_deref().unwrap_or("0"),
+                    active.join(",")
+                )
+                .into_bytes(),
+            );
+            return;
+        }
+
+        if payload_type == KittyPayloadType::Close {
+            if let Some(id) = id {
+                self.active_notification_ids.remove(&id);
+                self.screen.queue_notification_close(id);
+            }
+            *self.kitty_notification = KittyNotificationBuilder::default();
+            return;
+        }
+
+        if !self.kitty_notification.active || self.kitty_notification.id != id {
+            *self.kitty_notification = KittyNotificationBuilder {
+                active: true,
+                id,
+                ..Default::default()
+            };
+        }
+        if let Some(urgency) = urgency {
+            self.kitty_notification.urgency = urgency;
+        }
+        if expire_time.is_some() {
+            self.kitty_notification.expire_time = expire_time;
+        }
+        if let Some(muted) = muted {
+            self.kitty_notification.muted = muted;
+        }
+        if let Some(focus) = focus {
+            self.kitty_notification.focus = focus;
+        }
+
+        let mut payload = Vec::new();
+        for (index, part) in params.iter().skip(2).enumerate() {
+            if index > 0 {
+                payload.push(b';');
+            }
+            payload.extend_from_slice(part);
+        }
+        let payload = if base64_encoded {
+            match base64::engine::general_purpose::STANDARD.decode(payload) {
+                Ok(payload) => payload,
+                Err(_) => return,
+            }
+        } else {
+            payload
+        };
+
+        if let Ok(payload) = std::str::from_utf8(&payload) {
+            match payload_type {
+                KittyPayloadType::Title => append_bounded(
+                    &mut self.kitty_notification.title,
+                    payload,
+                    MAX_NOTIFICATION_TITLE_BYTES,
+                ),
+                KittyPayloadType::Body => append_bounded(
+                    &mut self.kitty_notification.body,
+                    payload,
+                    MAX_NOTIFICATION_BODY_BYTES,
+                ),
+                KittyPayloadType::Ignored
+                | KittyPayloadType::Close
+                | KittyPayloadType::Alive
+                | KittyPayloadType::Capabilities => {}
+            }
+        }
+
+        if done {
+            let mut completed = std::mem::take(self.kitty_notification);
+            if completed.title.is_empty() && completed.body.is_empty() {
+                return;
+            }
+            if completed.title.is_empty() {
+                completed.title = std::mem::take(&mut completed.body);
+            }
+            if let Some(id) = completed.id.as_ref() {
+                if self.active_notification_ids.len() >= 64 {
+                    if let Some(oldest) = self.active_notification_ids.iter().next().cloned() {
+                        self.active_notification_ids.remove(&oldest);
+                    }
+                }
+                self.active_notification_ids.insert(id.clone());
+            }
+            self.screen.queue_notification(DesktopNotification {
+                id: completed.id,
+                title: completed.title,
+                body: completed.body,
+                urgency: completed.urgency,
+                expire_time: completed.expire_time,
+                muted: completed.muted,
+                focus: completed.focus,
+            });
+        }
+    }
+
     /// Handle OSC 1337 (iTerm2 inline images and file transfer)
     ///
     /// Protocol format: OSC 1337 ; File=[params] : base64data ST
@@ -2116,6 +2378,75 @@ impl ScreenPerformer<'_> {
 
 // Helper functions
 
+fn parse_simple_notification(
+    params: &[&[u8]],
+    ignore_numeric_prefix: bool,
+) -> Option<DesktopNotification> {
+    let total_len = params.iter().try_fold(0_usize, |length, param| {
+        length.checked_add(param.len())?.checked_add(1)
+    })?;
+    if total_len > MAX_NOTIFICATION_TITLE_BYTES + MAX_NOTIFICATION_BODY_BYTES + 2 {
+        log::warn!("Ignoring oversized OSC desktop notification");
+        return None;
+    }
+
+    let mut payload = Vec::with_capacity(total_len);
+    for (index, param) in params.iter().enumerate() {
+        if index > 0 {
+            payload.push(b';');
+        }
+        payload.extend_from_slice(param);
+    }
+    let payload = std::str::from_utf8(&payload).ok()?;
+    if payload.is_empty() {
+        return None;
+    }
+
+    if ignore_numeric_prefix {
+        if let Some((prefix, _)) = payload.split_once(';') {
+            if prefix.parse::<u64>().is_ok() {
+                return None;
+            }
+        }
+    }
+
+    let (title, body) = payload.split_once(';').unwrap_or((payload, ""));
+    if title.is_empty() {
+        return None;
+    }
+
+    Some(DesktopNotification {
+        title: truncate_utf8(title, MAX_NOTIFICATION_TITLE_BYTES).to_owned(),
+        body: truncate_utf8(body, MAX_NOTIFICATION_BODY_BYTES).to_owned(),
+        focus: true,
+        ..Default::default()
+    })
+}
+
+fn kitty_notification_id_is_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'.'))
+}
+
+fn append_bounded(destination: &mut String, payload: &str, max_bytes: usize) {
+    let remaining = max_bytes.saturating_sub(destination.len());
+    destination.push_str(truncate_utf8(payload, remaining));
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 fn parse_osc7_working_directory(params: &[&[u8]]) -> Option<std::path::PathBuf> {
     let mut encoded_uri = Vec::new();
     for (index, param) in params.iter().enumerate() {
@@ -2633,6 +2964,100 @@ mod tests {
         assert_eq!(integration.command_start, Some(6));
         assert_eq!(integration.command_end, Some(12));
         assert_eq!(screen.last_command_output().as_deref(), Some("output"));
+    }
+
+    #[test]
+    fn test_osc9_and_777_desktop_notifications_match_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]9;Build;finished; successfully\x07\
+              \x1b]9;4;ignored Windows taskbar form\x07\
+              \x1b]777;notify;Deploy;server ready\x1b\\\
+              \x1b]777;other;ignored\x1b\\",
+        );
+
+        assert_eq!(
+            screen.take_notifications(),
+            vec![
+                DesktopNotificationAction::Show(DesktopNotification {
+                    title: "Build".into(),
+                    body: "finished; successfully".into(),
+                    focus: true,
+                    ..Default::default()
+                }),
+                DesktopNotificationAction::Show(DesktopNotification {
+                    title: "Deploy".into(),
+                    body: "server ready".into(),
+                    focus: true,
+                    ..Default::default()
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_kitty_osc99_chunks_queries_and_closes_notifications() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]99;i=build:d=0:e=1:p=title;QnVpbGQ=\x1b\\\
+              \x1b]99;i=build:d=1:p=body:u=2:s=c2lsZW50;finished\x1b\\",
+        );
+        assert_eq!(
+            screen.take_notifications(),
+            vec![DesktopNotificationAction::Show(DesktopNotification {
+                id: Some("build".into()),
+                title: "Build".into(),
+                body: "finished".into(),
+                urgency: NotificationUrgency::Critical,
+                muted: true,
+                focus: true,
+                ..Default::default()
+            })]
+        );
+
+        parser.parse(&mut screen, b"\x1b]99;i=query:p=alive;\x07");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b]99;i=query:p=alive;build\x07".to_vec()]
+        );
+
+        parser.parse(&mut screen, b"\x1b]99;i=build:p=close;\x1b\\");
+        assert_eq!(
+            screen.take_notifications(),
+            vec![DesktopNotificationAction::Close("build".into())]
+        );
+
+        parser.parse(&mut screen, b"\x1b]99;i=query:p=?;\x1b\\");
+        let response = screen.take_pending_responses().pop().unwrap();
+        let response = std::str::from_utf8(&response).unwrap();
+        assert!(response.starts_with("\x1b]99;i=query:p=?;"));
+        assert!(response.contains("p=title,body,?,close"));
+        assert!(!response.contains("alive"));
+        assert!(response.contains("a=focus"));
+        assert!(response.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn test_kitty_body_only_notification_uses_body_as_native_title() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]99;p=body;body only\x1b\\");
+
+        assert_eq!(
+            screen.take_notifications(),
+            vec![DesktopNotificationAction::Show(DesktopNotification {
+                title: "body only".into(),
+                focus: true,
+                ..Default::default()
+            })]
+        );
     }
 
     #[test]

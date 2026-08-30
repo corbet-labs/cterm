@@ -7,6 +7,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod clipboard;
+mod desktop_notification;
 pub mod dialog_utils;
 pub mod dialogs;
 pub mod docker_dialog;

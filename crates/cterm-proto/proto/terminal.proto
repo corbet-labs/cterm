@@ -747,7 +747,31 @@ message TerminalEvent {
     // Daemon-injected: an SSH session needs an interactive answer (host key,
     // password, or key passphrase). The client replies via RespondPrompt.
     SessionPromptEvent session_prompt = 6;
+    DesktopNotificationEvent desktop_notification = 7;
   }
+}
+
+message DesktopNotificationEvent {
+  string title = 1;
+  string body = 2;
+  DesktopNotificationAction action = 3;
+  optional string id = 4;
+  DesktopNotificationUrgency urgency = 5;
+  optional int32 expire_time = 6;
+  bool muted = 7;
+  bool focus = 8;
+}
+
+enum DesktopNotificationAction {
+  DESKTOP_NOTIFICATION_ACTION_SHOW = 0;
+  DESKTOP_NOTIFICATION_ACTION_CLOSE = 1;
+}
+
+enum DesktopNotificationUrgency {
+  DESKTOP_NOTIFICATION_URGENCY_UNSPECIFIED = 0;
+  DESKTOP_NOTIFICATION_URGENCY_LOW = 1;
+  DESKTOP_NOTIFICATION_URGENCY_NORMAL = 2;
+  DESKTOP_NOTIFICATION_URGENCY_CRITICAL = 3;
 }
 
 // Kinds of interactive prompt a native SSH session may raise during connect.

@@ -262,6 +262,41 @@ impl ColorQuery {
     }
 }
 
+/// Native urgency requested by Kitty OSC 99.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NotificationUrgency {
+    Low,
+    #[default]
+    Normal,
+    Critical,
+}
+
+/// A desktop notification requested by a terminal application.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesktopNotification {
+    /// Stable Kitty notification identifier, when supplied.
+    pub id: Option<String>,
+    /// Short heading shown by the native notification service.
+    pub title: String,
+    /// Optional detail text shown below the heading.
+    pub body: String,
+    /// Requested native urgency.
+    pub urgency: NotificationUrgency,
+    /// Requested expiry in milliseconds; negative/absent means native default.
+    pub expire_time: Option<i32>,
+    /// Suppress notification sound.
+    pub muted: bool,
+    /// Focus the terminal when the notification is activated.
+    pub focus: bool,
+}
+
+/// A native notification operation emitted by the terminal parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesktopNotificationAction {
+    Show(DesktopNotification),
+    Close(String),
+}
+
 /// File transfer operation for iTerm2 OSC 1337 protocol
 ///
 /// When inline=0, the protocol sends files that should be offered
@@ -504,6 +539,8 @@ pub struct Screen {
     pending_responses: Vec<Vec<u8>>,
     /// Pending clipboard operations from OSC 52
     pending_clipboard_ops: Vec<ClipboardOperation>,
+    /// Pending desktop notifications from OSC 9/777/99.
+    pending_notifications: Vec<DesktopNotificationAction>,
     /// Pending color queries (OSC 4 and OSC 10-12)
     pending_color_queries: Vec<(ColorQuery, Option<Rgb>)>,
     /// Frontend theme used for authoritative OSC color-query replies.
@@ -768,6 +805,7 @@ impl Screen {
             tab_stops: Self::default_tab_stops(width),
             pending_responses: Vec::new(),
             pending_clipboard_ops: Vec::new(),
+            pending_notifications: Vec::new(),
             pending_color_queries: Vec::new(),
             base_palette: ColorPalette::default(),
             frontend_state: FrontendState::default(),
@@ -880,6 +918,28 @@ impl Screen {
     /// Check if there are pending clipboard operations
     pub fn has_clipboard_ops(&self) -> bool {
         !self.pending_clipboard_ops.is_empty()
+    }
+
+    /// Queue a native desktop notification requested by terminal output.
+    pub fn queue_notification(&mut self, notification: DesktopNotification) {
+        self.pending_notifications
+            .push(DesktopNotificationAction::Show(notification));
+    }
+
+    /// Queue removal of a previously identified native notification.
+    pub fn queue_notification_close(&mut self, id: String) {
+        self.pending_notifications
+            .push(DesktopNotificationAction::Close(id));
+    }
+
+    /// Drain all pending desktop notification requests.
+    pub fn take_notifications(&mut self) -> Vec<DesktopNotificationAction> {
+        std::mem::take(&mut self.pending_notifications)
+    }
+
+    /// Check whether terminal output queued desktop notifications.
+    pub fn has_notifications(&self) -> bool {
+        !self.pending_notifications.is_empty()
     }
 
     /// Queue a default-color query (from OSC 10-12)

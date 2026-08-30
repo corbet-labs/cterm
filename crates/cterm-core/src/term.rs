@@ -6,7 +6,8 @@ use crate::color::ColorPalette;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
 use crate::screen::{
-    ClipboardOperation, ColorQuery, FrontendState, Screen, ScreenConfig, SearchResult,
+    ClipboardOperation, ColorQuery, DesktopNotificationAction, FrontendState, Screen, ScreenConfig,
+    SearchResult,
 };
 use crate::{KeyEventKind, KeyboardEnhancementFlags};
 use std::time::{Duration, Instant};
@@ -26,6 +27,8 @@ pub enum TerminalEvent {
     ContentChanged,
     /// Clipboard operation requested (OSC 52)
     ClipboardRequest(ClipboardOperation),
+    /// Terminal application requested a native desktop notification.
+    DesktopNotification(DesktopNotificationAction),
 }
 
 /// Terminal configuration
@@ -191,6 +194,12 @@ impl Terminal {
         if self.screen.has_clipboard_ops() {
             for op in self.screen.take_clipboard_ops() {
                 events.push(TerminalEvent::ClipboardRequest(op));
+            }
+        }
+
+        if self.screen.has_notifications() {
+            for notification in self.screen.take_notifications() {
+                events.push(TerminalEvent::DesktopNotification(notification));
             }
         }
 
@@ -1063,6 +1072,21 @@ mod tests {
             "plain text must not generate PTY responses"
         );
         assert_eq!(term.screen().get_cell(0, 0).unwrap().text(), "H");
+    }
+
+    #[test]
+    fn process_emits_desktop_notification_actions() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let events = term.process_mirror(b"\x1b]99;i=build:p=body;finished\x1b\\");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::DesktopNotification(DesktopNotificationAction::Show(notification))
+                if notification.id.as_deref() == Some("build")
+                    && notification.title == "finished"
+                    && notification.focus
+        )));
     }
 
     #[test]

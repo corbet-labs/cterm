@@ -26,6 +26,7 @@
 pub mod app;
 pub mod cg_renderer;
 pub mod clipboard;
+mod desktop_notification;
 pub mod dialogs;
 pub mod file_transfer;
 pub mod log_capture;

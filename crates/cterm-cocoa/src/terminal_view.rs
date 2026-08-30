@@ -138,6 +138,8 @@ struct ViewState {
     title_locked: AtomicBool,
     /// Flag indicating bell was triggered and needs UI update
     bell_changed: AtomicBool,
+    /// Notifications parsed on the daemon reader thread and awaiting the main thread.
+    pending_notifications: std::sync::Mutex<Vec<cterm_core::DesktopNotificationAction>>,
 }
 
 impl Default for ViewState {
@@ -150,6 +152,7 @@ impl Default for ViewState {
             title_changed: AtomicBool::new(false),
             title_locked: AtomicBool::new(false),
             bell_changed: AtomicBool::new(false),
+            pending_notifications: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -2008,6 +2011,11 @@ impl TerminalView {
                                                 TerminalEvent::Bell => {
                                                     state.bell_changed.store(true, Ordering::Relaxed);
                                                 }
+                                                TerminalEvent::DesktopNotification(notification) => {
+                                                    if let Ok(mut pending) = state.pending_notifications.lock() {
+                                                        pending.push(notification);
+                                                    }
+                                                }
                                                 TerminalEvent::ContentChanged => {
                                                     content_changed = true;
                                                 }
@@ -2140,6 +2148,19 @@ impl TerminalView {
                                     );
                                 }
                             }
+                        }
+                    });
+                }
+
+                let notifications = state
+                    .pending_notifications
+                    .lock()
+                    .map(|mut pending| std::mem::take(&mut *pending))
+                    .unwrap_or_default();
+                if !notifications.is_empty() {
+                    dispatch2::Queue::main().exec_async(move || {
+                        for notification in notifications {
+                            crate::desktop_notification::handle(&notification);
                         }
                     });
                 }

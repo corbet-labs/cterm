@@ -46,6 +46,8 @@ pub const WM_APP_PTY_DATA: u32 = WM_APP + 1;
 pub const WM_APP_PTY_EXIT: u32 = WM_APP + 2;
 pub const WM_APP_TITLE_CHANGED: u32 = WM_APP + 3;
 pub const WM_APP_BELL: u32 = WM_APP + 4;
+pub const WM_APP_DESKTOP_NOTIFICATION: u32 = WM_APP + 5;
+pub const WM_APP_NATIVE_NOTIFICATION: u32 = WM_APP + 6;
 
 /// Commands sent to the daemon I/O thread
 pub enum DaemonCmd {
@@ -982,6 +984,9 @@ impl WindowState {
                                     LPARAM(0),
                                 );
                             },
+                            TerminalEvent::DesktopNotification(notification) => {
+                                post_desktop_notification(hwnd, tab_id, notification);
+                            }
                             TerminalEvent::ProcessExited(_) => {
                                 unsafe {
                                     let _ = PostMessageW(
@@ -3156,6 +3161,13 @@ async fn run_daemon_io_loop(
                                             TerminalEvent::Bell => {
                                                 post_message(hwnd, WM_APP_BELL, tab_id);
                                             }
+                                            TerminalEvent::DesktopNotification(notification) => {
+                                                post_desktop_notification(
+                                                    hwnd,
+                                                    tab_id,
+                                                    notification,
+                                                );
+                                            }
                                             TerminalEvent::ContentChanged => content_changed = true,
                                             _ => {}
                                         }
@@ -3198,6 +3210,27 @@ fn post_message(hwnd: usize, msg: u32, tab_id: u64) {
             WPARAM(tab_id as usize),
             LPARAM(0),
         );
+    }
+}
+
+fn post_desktop_notification(
+    hwnd: usize,
+    tab_id: u64,
+    notification: cterm_core::DesktopNotificationAction,
+) {
+    let notification = Box::into_raw(Box::new(notification));
+    let result = unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_APP_DESKTOP_NOTIFICATION,
+            WPARAM(tab_id as usize),
+            LPARAM(notification as isize),
+        )
+    };
+    if result.is_err() {
+        unsafe {
+            drop(Box::from_raw(notification));
+        }
     }
 }
 
@@ -3431,6 +3464,21 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_APP_TITLE_CHANGED => {
             let tab_id = wparam.0 as u64;
             state.on_title_changed(tab_id);
+            LRESULT(0)
+        }
+
+        WM_APP_DESKTOP_NOTIFICATION => {
+            if lparam.0 != 0 {
+                let notification = unsafe {
+                    Box::from_raw(lparam.0 as *mut cterm_core::DesktopNotificationAction)
+                };
+                crate::desktop_notification::handle(hwnd, &notification);
+            }
+            LRESULT(0)
+        }
+
+        WM_APP_NATIVE_NOTIFICATION => {
+            crate::desktop_notification::native_event(hwnd, wparam.0 as u32, lparam.0 as u32);
             LRESULT(0)
         }
 

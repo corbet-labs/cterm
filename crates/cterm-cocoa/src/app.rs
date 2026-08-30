@@ -84,6 +84,7 @@ define_class!(
             log::info!("Application did finish launching");
 
             let mtm = MainThreadMarker::from(self);
+            crate::desktop_notification::request_authorization();
 
             // Check for seamless upgrade state
             if let Some(upgrade_state) = take_upgrade_state() {

@@ -1919,6 +1919,9 @@ impl TerminalWidget {
                                         callback(title);
                                     }
                                 }
+                                TerminalEvent::DesktopNotification(ref notification) => {
+                                    crate::desktop_notification::handle(notification);
+                                }
                                 TerminalEvent::ContentChanged => content_changed = true,
                                 TerminalEvent::ProcessExited(_) => {}
                             }
