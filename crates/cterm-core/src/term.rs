@@ -438,10 +438,17 @@ impl Terminal {
         self.pty.as_ref().and_then(|p| p.foreground_process_name())
     }
 
-    /// Get the current working directory of the foreground process
-    #[cfg(unix)]
+    /// Get the shell-reported working directory, falling back to Unix process inspection.
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
-        self.pty.as_ref().and_then(|p| p.foreground_cwd())
+        if let Some(path) = self.screen.current_working_directory() {
+            return Some(path.to_path_buf());
+        }
+
+        #[cfg(unix)]
+        return self.pty.as_ref().and_then(Pty::foreground_cwd);
+
+        #[cfg(not(unix))]
+        None
     }
 
     /// Get terminal width
@@ -1189,6 +1196,17 @@ mod tests {
                 dynamic_color: None,
             }
         )));
+    }
+
+    #[test]
+    fn foreground_cwd_uses_osc7_without_a_local_pty() {
+        let expected = std::env::temp_dir().join("cterm-osc7-cwd");
+        let uri = url::Url::from_file_path(&expected).unwrap();
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        term.process_mirror(format!("\x1b]7;{uri}\x1b\\").as_bytes());
+
+        assert_eq!(term.foreground_cwd(), Some(expected));
     }
 
     #[test]

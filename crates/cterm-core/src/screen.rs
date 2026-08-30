@@ -11,6 +11,7 @@ use crate::keyboard::KeyboardEnhancementFlags;
 use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -470,6 +471,8 @@ pub struct Screen {
     dynamic_cursor: Option<Rgb>,
     /// Application-provided overrides from OSC 4, indexed by palette entry.
     dynamic_palette: [Option<Rgb>; 256],
+    /// Shell-reported working directory from OSC 7.
+    current_working_directory: Option<PathBuf>,
     /// Current text selection (if any)
     pub selection: Option<Selection>,
     /// Terminal images (Sixel, etc.)
@@ -667,6 +670,7 @@ impl Screen {
             dynamic_background: None,
             dynamic_cursor: None,
             dynamic_palette: [None; 256],
+            current_working_directory: None,
             selection: None,
             images: HashMap::new(),
             // Zero is reserved as an invalid/sentinel identifier by native UI
@@ -2042,6 +2046,16 @@ impl Screen {
                 && col >= img_left
                 && col < img_right
         })
+    }
+
+    /// Set the shell-reported working directory from OSC 7.
+    pub fn set_current_working_directory(&mut self, path: Option<PathBuf>) {
+        self.current_working_directory = path;
+    }
+
+    /// Return the shell-reported working directory, if available.
+    pub fn current_working_directory(&self) -> Option<&Path> {
+        self.current_working_directory.as_deref()
     }
 
     /// Get an image by its ID

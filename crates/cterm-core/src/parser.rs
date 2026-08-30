@@ -639,6 +639,12 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // Shell-reported current working directory.
+            7 => {
+                if let Some(path) = parse_osc7_working_directory(&params[1..]) {
+                    self.screen.set_current_working_directory(Some(path));
+                }
+            }
             // Hyperlink (OSC 8)
             8 => {
                 if params.len() >= 3 {
@@ -1978,6 +1984,39 @@ impl ScreenPerformer<'_> {
 
 // Helper functions
 
+fn parse_osc7_working_directory(params: &[&[u8]]) -> Option<std::path::PathBuf> {
+    let mut encoded_uri = Vec::new();
+    for (index, param) in params.iter().enumerate() {
+        if index > 0 {
+            encoded_uri.push(b';');
+        }
+        encoded_uri.extend_from_slice(param);
+    }
+
+    let mut uri = url::Url::parse(std::str::from_utf8(&encoded_uri).ok()?).ok()?;
+    if uri.scheme() != "file" || !osc7_hostname_is_local(uri.host_str().unwrap_or("")) {
+        return None;
+    }
+
+    // `Url::to_file_path` only treats an empty/localhost authority as local.
+    // We have already verified the actual machine hostname, so normalize it
+    // away before performing the platform-specific path conversion.
+    uri.set_host(None).ok()?;
+    let path = uri.to_file_path().ok()?;
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return None;
+    }
+    Some(path)
+}
+
+fn osc7_hostname_is_local(host: &str) -> bool {
+    host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || hostname::get()
+            .ok()
+            .is_some_and(|local| host.eq_ignore_ascii_case(&local.to_string_lossy()))
+}
+
 /// Parse the colon form of an SGR color while tolerating the optional color
 /// space and tolerance fields accepted by foot and VTE.
 fn parse_colon_sgr_color(params: &[u16]) -> Option<Color> {
@@ -2305,6 +2344,44 @@ mod tests {
 
         assert_eq!(screen.dynamic_palette_colors().count(), 0);
         assert!(screen.take_color_queries().is_empty());
+    }
+
+    #[test]
+    fn test_osc7_tracks_local_file_uri_with_encoded_and_semicolon_path() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        let expected = std::env::temp_dir().join("cterm OSC7;directory");
+        let mut uri = url::Url::from_file_path(&expected).unwrap();
+        uri.set_host(Some("localhost")).unwrap();
+        let sequence = format!("\x1b]7;{uri}\x1b\\");
+
+        parser.parse(&mut screen, sequence.as_bytes());
+
+        assert_eq!(screen.current_working_directory(), Some(expected.as_path()));
+    }
+
+    #[test]
+    fn test_osc7_rejects_remote_hosts_and_non_file_uris() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        let original = std::env::temp_dir().join("cterm-osc7-original");
+        screen.set_current_working_directory(Some(original.clone()));
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]7;file://definitely-remote.invalid/tmp/other\x1b\\\
+              \x1b]7;https://localhost/tmp/other\x1b\\\
+              \x1b]7;file://localhost/tmp/%00\x1b\\",
+        );
+
+        assert_eq!(screen.current_working_directory(), Some(original.as_path()));
+    }
+
+    #[test]
+    fn test_osc7_accepts_the_machine_hostname() {
+        let hostname = hostname::get().unwrap();
+        let hostname = hostname.to_string_lossy();
+        assert!(osc7_hostname_is_local(&hostname));
     }
 
     #[test]

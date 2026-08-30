@@ -306,6 +306,9 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
                 })
                 .collect(),
         }),
+        current_working_directory: screen
+            .current_working_directory()
+            .map(|path| path.to_string_lossy().into_owned()),
     }
 }
 
@@ -391,6 +394,7 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
     }
 
     // Restore terminal modes
+    screen.set_current_working_directory(None);
     if let Some(modes) = &screen_data.modes {
         screen.modes.application_cursor = modes.application_cursor;
         screen.modes.application_keypad = modes.application_keypad;
@@ -404,6 +408,13 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.modes.modify_other_keys = u8::try_from(modes.modify_other_keys)
             .unwrap_or(1)
             .clamp(1, 2);
+        screen.set_current_working_directory(
+            modes
+                .current_working_directory
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from),
+        );
         let dynamic_rgb = |color: Option<&proto::Color>| {
             color.map(proto_to_color).and_then(|color| {
                 if let Color::Rgb(rgb) = color {
@@ -548,6 +559,9 @@ mod tests {
             ColorQuery::Palette(200),
             Some(cterm_core::Rgb::new(13, 14, 15)),
         );
+        source
+            .screen_mut()
+            .set_current_working_directory(Some(std::path::PathBuf::from("/tmp/cterm cwd")));
 
         let snapshot = screen_to_proto(source.screen(), true);
         let mut restored = Terminal::new(1, 1, ScreenConfig::default());
@@ -577,6 +591,10 @@ mod tests {
             restored.screen().dynamic_color(ColorQuery::Palette(200)),
             Some(cterm_core::Rgb::new(13, 14, 15))
         );
+        assert_eq!(
+            restored.screen().current_working_directory(),
+            Some(std::path::Path::new("/tmp/cterm cwd"))
+        );
     }
 
     #[test]
@@ -591,6 +609,9 @@ mod tests {
             ColorQuery::Palette(200),
             Some(cterm_core::Rgb::new(4, 5, 6)),
         );
+        restored
+            .screen_mut()
+            .set_current_working_directory(Some(std::path::PathBuf::from("/tmp/stale")));
 
         apply_screen_snapshot(&mut restored, &snapshot);
 
@@ -602,6 +623,7 @@ mod tests {
             restored.screen().dynamic_color(ColorQuery::Palette(200)),
             None
         );
+        assert_eq!(restored.screen().current_working_directory(), None);
     }
 
     #[test]

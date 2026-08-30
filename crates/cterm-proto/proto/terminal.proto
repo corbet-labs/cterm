@@ -569,6 +569,8 @@ message TerminalModes {
   // Application-provided OSC 10-12 overrides. The frontend combines these
   // with its local theme when rendering and answering color queries.
   DynamicColors dynamic_colors = 12;
+  // Shell-reported OSC 7 working directory for reconnecting frontends.
+  optional string current_working_directory = 13;
 }
 
 message DynamicColors {
