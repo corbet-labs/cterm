@@ -601,7 +601,7 @@ impl SixelDecoder {
         new_pixels.resize(new_len, 0);
         if !self.transparent_bg {
             let background = self.palette[0];
-            for pixel in new_pixels.chunks_exact_mut(BYTES_PER_PIXEL) {
+            for pixel in new_pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
                 pixel.copy_from_slice(&background);
             }
         }
