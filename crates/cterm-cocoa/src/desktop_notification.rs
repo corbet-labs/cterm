@@ -2,7 +2,8 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
-use objc2_app_kit::NSApplication;
+use objc2_app_kit::{NSApplication, NSRunningApplication};
 use objc2_foundation::{MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSString};
 use objc2_user_notifications::{
     UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
@@ -20,6 +21,7 @@ use objc2_user_notifications::{
 };
 
 static NEXT_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
+static NOTIFICATIONS_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 static ACTIVE_NOTIFICATION_IDS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static FOCUS_NOTIFICATION_IDS: LazyLock<Mutex<HashSet<String>>> =
@@ -86,10 +88,71 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+fn is_app_bundle_executable(path: &Path) -> bool {
+    let Some(macos_directory) = path.parent() else {
+        return false;
+    };
+    if macos_directory.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
+        return false;
+    }
+
+    let Some(contents_directory) = macos_directory.parent() else {
+        return false;
+    };
+    if contents_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("Contents")
+    {
+        return false;
+    }
+
+    contents_directory
+        .parent()
+        .and_then(Path::extension)
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+}
+
+/// UserNotifications requires a LaunchServices-backed application bundle.
+/// Calling `currentNotificationCenter` from a raw executable raises an
+/// Objective-C exception on recent macOS releases instead of returning an
+/// error, so reject such processes before entering the framework.
+fn notification_center() -> Option<Retained<UNUserNotificationCenter>> {
+    if NOTIFICATIONS_UNAVAILABLE.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let executable_is_bundled = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .is_some_and(is_app_bundle_executable);
+    if !executable_is_bundled {
+        NOTIFICATIONS_UNAVAILABLE.store(true, Ordering::Relaxed);
+        log::debug!("macOS desktop notifications are unavailable outside a .app bundle");
+        return None;
+    }
+
+    let running_application = NSRunningApplication::currentApplication();
+    let launch_services_recognizes_bundle = running_application.bundleIdentifier().is_some()
+        && running_application.bundleURL().is_some();
+    if !launch_services_recognizes_bundle {
+        NOTIFICATIONS_UNAVAILABLE.store(true, Ordering::Relaxed);
+        log::debug!(
+            "macOS desktop notifications are unavailable because LaunchServices did not register the .app bundle"
+        );
+        return None;
+    }
+
+    Some(UNUserNotificationCenter::currentNotificationCenter())
+}
+
 /// Ask once during application startup so the first terminal notification is
 /// not silently dropped while macOS is still presenting its permission sheet.
 pub fn request_authorization() {
-    let center = UNUserNotificationCenter::currentNotificationCenter();
+    let Some(center) = notification_center() else {
+        return;
+    };
     NOTIFICATION_DELEGATE.with(|stored| {
         let mut stored = stored.borrow_mut();
         let delegate = stored.get_or_insert_with(|| {
@@ -118,6 +181,10 @@ pub fn handle(action: &cterm_core::DesktopNotificationAction) {
 }
 
 fn show(notification: &cterm_core::DesktopNotification) {
+    let Some(center) = notification_center() else {
+        return;
+    };
+
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(&notification.title));
     content.setBody(&NSString::from_str(&notification.body));
@@ -169,8 +236,7 @@ fn show(notification: &cterm_core::DesktopNotification) {
     let identifier = NSString::from_str(&native_id);
     let request =
         UNNotificationRequest::requestWithIdentifier_content_trigger(&identifier, &content, None);
-    UNUserNotificationCenter::currentNotificationCenter()
-        .addNotificationRequest_withCompletionHandler(&request, None);
+    center.addNotificationRequest_withCompletionHandler(&request, None);
 
     if let Some(milliseconds) = notification.expire_time.filter(|value| *value > 0) {
         let protocol_id = notification.id.clone();
@@ -213,7 +279,38 @@ fn close_native(native_id: &str) {
     }
     let identifier = NSString::from_str(native_id);
     let identifiers = NSArray::from_slice(&[&*identifier]);
-    let center = UNUserNotificationCenter::currentNotificationCenter();
+    let Some(center) = notification_center() else {
+        return;
+    };
     center.removePendingNotificationRequestsWithIdentifiers(&identifiers);
     center.removeDeliveredNotificationsWithIdentifiers(&identifiers);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_app_bundle_executable;
+    use std::path::Path;
+
+    #[test]
+    fn recognizes_app_bundle_executable_paths() {
+        assert!(is_app_bundle_executable(Path::new(
+            "/Applications/cterm.app/Contents/MacOS/cterm"
+        )));
+        assert!(is_app_bundle_executable(Path::new(
+            "/tmp/Test.APP/Contents/MacOS/cterm"
+        )));
+    }
+
+    #[test]
+    fn rejects_raw_and_malformed_executable_paths() {
+        assert!(!is_app_bundle_executable(Path::new(
+            "/tmp/cterm/target/debug/cterm"
+        )));
+        assert!(!is_app_bundle_executable(Path::new(
+            "/tmp/cterm.app/MacOS/cterm"
+        )));
+        assert!(!is_app_bundle_executable(Path::new(
+            "/tmp/cterm.app/Contents/cterm"
+        )));
+    }
 }
