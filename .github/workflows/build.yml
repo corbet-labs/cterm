@@ -205,7 +205,8 @@ jobs:
             neovim \
             protobuf-compiler \
             tmux \
-            weston
+            weston \
+            xvfb
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -229,14 +230,34 @@ jobs:
           export XDG_RUNTIME_DIR="${{ runner.temp }}/cterm-compat-xdg-runtime"
           mkdir -p "$XDG_RUNTIME_DIR"
           chmod 700 "$XDG_RUNTIME_DIR"
-          unset DISPLAY
+          Xvfb :99 \
+            -screen 0 1024x768x24 \
+            -nolisten tcp \
+            >"$OUTPUT_DIR/xvfb.log" 2>&1 &
+          XVFB_PID=$!
+          for ATTEMPT in $(seq 1 40); do
+            if [ -S /tmp/.X11-unix/X99 ]; then
+              break
+            fi
+            if [ "$ATTEMPT" -eq 40 ]; then
+              cat "$OUTPUT_DIR/xvfb.log"
+              exit 1
+            fi
+            sleep 0.25
+          done
+          export DISPLAY=:99
           weston \
-            --backend=headless-backend.so \
+            --backend=x11-backend.so \
+            --use-pixman \
             --socket=cterm-compat-ci \
             --idle-time=0 \
             --log="$OUTPUT_DIR/weston.log" &
           WESTON_PID=$!
-          trap 'kill "$WESTON_PID" 2>/dev/null || true' EXIT
+          cleanup_compositors() {
+            kill "$WESTON_PID" 2>/dev/null || true
+            kill "$XVFB_PID" 2>/dev/null || true
+          }
+          trap cleanup_compositors EXIT
           export WAYLAND_DISPLAY=cterm-compat-ci
           ./scripts/foot_compat_test.sh \
             target/debug/cterm \
