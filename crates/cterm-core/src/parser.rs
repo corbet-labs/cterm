@@ -972,11 +972,12 @@ impl vte::Perform for ScreenPerformer<'_> {
                 }
             }
             // Primary Device Attributes (DA1). Advertise only capabilities
-            // implemented end to end: Sixel, ANSI color, and OSC 52.
+            // implemented end to end: Sixel, ANSI color, rectangular editing,
+            // and OSC 52.
             ('c', []) => {
                 let mode = first_param(&params_vec, 0);
                 if mode == 0 {
-                    self.screen.queue_response(b"\x1b[?62;4;22;52c".to_vec());
+                    self.screen.queue_response(b"\x1b[?62;4;22;28;52c".to_vec());
                 }
             }
             // Secondary Device Attributes (DA2): VT220 plus cterm version.
@@ -1003,6 +1004,94 @@ impl vte::Perform for ScreenPerformer<'_> {
                 };
                 self.screen.set_scroll_region(top, bottom);
                 self.screen.move_cursor(0, 0);
+            }
+            // Change Attributes in Rectangular Area (DECCARA).
+            ('r', [b'$']) => {
+                if let Some((top, left, bottom, right)) =
+                    rectangular_area(self.screen, &params_vec, 0)
+                {
+                    self.screen.change_rectangular_attributes(
+                        top,
+                        left,
+                        bottom,
+                        right,
+                        params_vec.get(4..).unwrap_or_default(),
+                    );
+                }
+            }
+            // Reverse Attributes in Rectangular Area (DECRARA).
+            ('t', [b'$']) => {
+                if let Some((top, left, bottom, right)) =
+                    rectangular_area(self.screen, &params_vec, 0)
+                {
+                    self.screen.reverse_rectangular_attributes(
+                        top,
+                        left,
+                        bottom,
+                        right,
+                        params_vec.get(4..).unwrap_or_default(),
+                    );
+                }
+            }
+            // Copy Rectangular Area (DECCRA). cterm, like foot, supports the
+            // active page only; omitted or zero page parameters mean page 1.
+            ('v', [b'$']) => {
+                let source_page = param_or(&params_vec, 4, 1);
+                let destination_page = param_or(&params_vec, 7, 1);
+                if source_page == 1 && destination_page == 1 {
+                    if let Some((src_top, src_left, src_bottom, src_right)) =
+                        rectangular_area(self.screen, &params_vec, 0)
+                    {
+                        let destination_relative_row =
+                            param_or(&params_vec, 5, 1).saturating_sub(1);
+                        let destination_row =
+                            relative_screen_row(self.screen, destination_relative_row);
+                        let destination_col = param_or(&params_vec, 6, 1)
+                            .saturating_sub(1)
+                            .min(self.screen.width().saturating_sub(1));
+                        let destination_bottom = relative_screen_row(
+                            self.screen,
+                            destination_relative_row.saturating_add(src_bottom - src_top),
+                        );
+                        let destination_right = destination_col
+                            .saturating_add(src_right - src_left)
+                            .min(self.screen.width().saturating_sub(1));
+                        let clipped_src_bottom = src_top + (destination_bottom - destination_row);
+                        let clipped_src_right = src_left + (destination_right - destination_col);
+                        self.screen.copy_rectangular_area(
+                            src_top,
+                            src_left,
+                            clipped_src_bottom,
+                            clipped_src_right,
+                            destination_row,
+                            destination_col,
+                        );
+                    }
+                }
+            }
+            // Fill Rectangular Area (DECFRA). DEC defines Pc as a single
+            // ISO-8859-1 byte; reject control characters exactly as foot does.
+            ('x', [b'$']) => {
+                let character = params_vec
+                    .first()
+                    .copied()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .filter(|&value| (32..126).contains(&value) || value >= 160)
+                    .map(char::from);
+                if let (Some(character), Some((top, left, bottom, right))) =
+                    (character, rectangular_area(self.screen, &params_vec, 1))
+                {
+                    self.screen
+                        .fill_rectangular_area(top, left, bottom, right, character);
+                }
+            }
+            // Erase Rectangular Area (DECERA).
+            ('z', [b'$']) => {
+                if let Some((top, left, bottom, right)) =
+                    rectangular_area(self.screen, &params_vec, 0)
+                {
+                    self.screen.erase_rectangular_area(top, left, bottom, right);
+                }
             }
             // Save Cursor (DECSC)
             ('s', []) => {
@@ -2064,6 +2153,56 @@ fn second_param(params: &[usize], default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn param_or(params: &[usize], index: usize, default: usize) -> usize {
+    params
+        .get(index)
+        .copied()
+        .filter(|&value| value != 0)
+        .unwrap_or(default)
+}
+
+/// Convert a DEC screen-relative row to the active grid row. In origin mode,
+/// coordinates are relative to and clipped by the scrolling margins.
+fn relative_screen_row(screen: &Screen, row: usize) -> usize {
+    if screen.modes.origin_mode {
+        screen
+            .scroll_region()
+            .top
+            .saturating_add(row)
+            .min(screen.scroll_region().bottom.saturating_sub(1))
+    } else {
+        row.min(screen.height().saturating_sub(1))
+    }
+}
+
+/// Parse the four one-based coordinates shared by DEC rectangular commands.
+/// Defaults, validation order and clipping intentionally follow foot.
+fn rectangular_area(
+    screen: &Screen,
+    params: &[usize],
+    first_index: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let relative_top = param_or(params, first_index, 1).saturating_sub(1);
+    let left = param_or(params, first_index + 1, 1)
+        .saturating_sub(1)
+        .min(screen.width().saturating_sub(1));
+    let relative_bottom = param_or(params, first_index + 2, screen.height()).saturating_sub(1);
+    let right = param_or(params, first_index + 3, screen.width())
+        .saturating_sub(1)
+        .min(screen.width().saturating_sub(1));
+
+    if relative_top > relative_bottom || left > right {
+        return None;
+    }
+
+    Some((
+        relative_screen_row(screen, relative_top),
+        left,
+        relative_screen_row(screen, relative_bottom),
+        right,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2123,7 +2262,7 @@ mod tests {
         assert_eq!(
             screen.take_pending_responses(),
             vec![
-                b"\x1b[?62;4;22;52c".to_vec(),
+                b"\x1b[?62;4;22;28;52c".to_vec(),
                 secondary_device_attributes().into_bytes(),
                 b"\x1bP!|4354524D\x1b\\".to_vec(),
                 format!("\x1bP>|cterm({})\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes(),
@@ -2395,6 +2534,96 @@ mod tests {
         for col in 0..5 {
             assert_eq!(screen.get_cell(0, col).unwrap().text(), " ");
         }
+    }
+
+    #[test]
+    fn test_dec_rectangular_fill_and_erase_match_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"abcdefgh\x1b[2;1Hijklmnop\x1b[1;44m\x1b[88;1;2;2;4$x",
+        );
+
+        assert_eq!(screen.grid().row(0).unwrap().text(), "aXXXefgh");
+        assert_eq!(screen.grid().row(1).unwrap().text(), "iXXXmnop");
+        let filled = screen.get_cell(0, 1).unwrap();
+        assert_eq!(filled.bg, Color::Ansi(AnsiColor::Blue));
+        assert!(filled.attrs.contains(CellAttrs::BOLD));
+
+        parser.parse(&mut screen, b"\x1b[22;41m\x1b[1;3;2;3$z");
+        for row in 0..2 {
+            let erased = screen.get_cell(row, 2).unwrap();
+            assert_eq!(erased.text(), " ");
+            assert_eq!(erased.bg, Color::Ansi(AnsiColor::Red));
+            assert!(erased.attrs.is_empty());
+        }
+        assert_eq!(screen.grid().row(0).unwrap().text(), "aX Xefgh");
+    }
+
+    #[test]
+    fn test_dec_rectangular_copy_uses_overlap_safe_snapshot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]8;;https://example.com\x1b\\abcdef\x1b]8;;\x1b\\\x1b[1;1;1;4;1;1;3;1$v",
+        );
+
+        assert_eq!(screen.grid().row(0).unwrap().text(), "ababcd");
+        assert!(screen.get_cell(0, 0).unwrap().hyperlink.is_some());
+        assert!(screen.get_cell(0, 2).unwrap().hyperlink.is_none());
+
+        // Pages other than the active page are ignored.
+        parser.parse(&mut screen, b"\x1b[1;1;1;2;2;2;1;1$v");
+        assert!(screen.grid().row(1).unwrap().text().is_empty());
+    }
+
+    #[test]
+    fn test_dec_rectangular_attribute_subset_preserves_other_style() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b[3;32mABCD\x1b[1;2;1;3;1;4;7$r\x1b[1;3;1;4;0$t",
+        );
+
+        let second = screen.get_cell(0, 1).unwrap();
+        assert!(second.attrs.contains(CellAttrs::BOLD));
+        assert!(second.attrs.contains(CellAttrs::UNDERLINE));
+        assert!(second.attrs.contains(CellAttrs::INVERSE));
+        assert!(second.attrs.contains(CellAttrs::ITALIC));
+        assert_eq!(second.fg, Color::Ansi(AnsiColor::Green));
+
+        let third = screen.get_cell(0, 2).unwrap();
+        assert!(!third.attrs.contains(CellAttrs::BOLD));
+        assert!(!third.attrs.has_underline());
+        assert!(!third.attrs.contains(CellAttrs::INVERSE));
+        assert!(third.attrs.contains(CellAttrs::BLINK));
+        assert!(third.attrs.contains(CellAttrs::ITALIC));
+
+        let fourth = screen.get_cell(0, 3).unwrap();
+        assert!(fourth.attrs.contains(CellAttrs::BOLD));
+        assert!(fourth.attrs.contains(CellAttrs::UNDERLINE));
+        assert!(fourth.attrs.contains(CellAttrs::BLINK));
+        assert!(fourth.attrs.contains(CellAttrs::INVERSE));
+        assert!(fourth.attrs.contains(CellAttrs::ITALIC));
+    }
+
+    #[test]
+    fn test_dec_rectangular_coordinates_respect_origin_mode() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[3;5r\x1b[?6h\x1b[90;1;1;1;2$x");
+
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), " ");
+        assert_eq!(screen.get_cell(2, 0).unwrap().text(), "Z");
+        assert_eq!(screen.get_cell(2, 1).unwrap().text(), "Z");
+        assert_eq!(screen.get_cell(3, 0).unwrap().text(), " ");
     }
 
     #[test]

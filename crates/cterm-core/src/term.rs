@@ -1067,7 +1067,7 @@ mod tests {
         assert_eq!(
             responses,
             [
-                b"\x1b[?62;4;22;52c".to_vec(),
+                b"\x1b[?62;4;22;28;52c".to_vec(),
                 b"\x1b[6;20;10t".to_vec(),
                 b"\x1b[0n".to_vec(),
             ]

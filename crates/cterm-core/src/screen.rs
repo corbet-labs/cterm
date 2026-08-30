@@ -1671,6 +1671,262 @@ impl Screen {
         self.dirty = true;
     }
 
+    /// Apply the DEC-supported SGR attribute subset to an inclusive rectangle.
+    ///
+    /// DECCARA deliberately affects only bold, underline, blink and inverse;
+    /// colors and all other attributes remain untouched. This matches VT400
+    /// behavior and foot's implementation.
+    pub(crate) fn change_rectangular_attributes(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        params: &[usize],
+    ) {
+        if top > bottom || left > right {
+            return;
+        }
+
+        self.clear_selection_if_rows_selected(top, bottom);
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            let Some(row) = self.grid.row_mut(row_index) else {
+                continue;
+            };
+            for col in left..=right.min(row.len().saturating_sub(1)) {
+                let attrs = &mut row[col].attrs;
+                for &param in params {
+                    match param {
+                        0 => {
+                            attrs.remove(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
+                            attrs.clear_underline();
+                        }
+                        1 => attrs.insert(CellAttrs::BOLD),
+                        4 => {
+                            attrs.clear_underline();
+                            attrs.insert(CellAttrs::UNDERLINE);
+                        }
+                        5 => attrs.insert(CellAttrs::BLINK),
+                        7 => attrs.insert(CellAttrs::INVERSE),
+                        22 => attrs.remove(CellAttrs::BOLD),
+                        24 => attrs.clear_underline(),
+                        25 => attrs.remove(CellAttrs::BLINK),
+                        27 => attrs.remove(CellAttrs::INVERSE),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Invert the DEC-supported SGR attribute subset in an inclusive rectangle.
+    pub(crate) fn reverse_rectangular_attributes(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        params: &[usize],
+    ) {
+        if top > bottom || left > right {
+            return;
+        }
+
+        self.clear_selection_if_rows_selected(top, bottom);
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            let Some(row) = self.grid.row_mut(row_index) else {
+                continue;
+            };
+            for col in left..=right.min(row.len().saturating_sub(1)) {
+                let attrs = &mut row[col].attrs;
+                for &param in params {
+                    match param {
+                        0 => {
+                            attrs.toggle(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
+                            Self::toggle_basic_underline(attrs);
+                        }
+                        1 => attrs.toggle(CellAttrs::BOLD),
+                        4 => Self::toggle_basic_underline(attrs),
+                        5 => attrs.toggle(CellAttrs::BLINK),
+                        7 => attrs.toggle(CellAttrs::INVERSE),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn toggle_basic_underline(attrs: &mut CellAttrs) {
+        if attrs.has_underline() {
+            attrs.clear_underline();
+        } else {
+            attrs.insert(CellAttrs::UNDERLINE);
+        }
+    }
+
+    /// Copy a rectangular cell area using snapshot semantics, so overlapping
+    /// source and destination rectangles behave like `memmove`.
+    pub(crate) fn copy_rectangular_area(
+        &mut self,
+        src_top: usize,
+        src_left: usize,
+        src_bottom: usize,
+        src_right: usize,
+        dst_top: usize,
+        dst_left: usize,
+    ) {
+        if src_top > src_bottom || src_left > src_right {
+            return;
+        }
+
+        let row_count = (src_bottom - src_top + 1).min(self.height().saturating_sub(dst_top));
+        let col_count = (src_right - src_left + 1).min(self.width().saturating_sub(dst_left));
+        if row_count == 0 || col_count == 0 {
+            return;
+        }
+
+        let mut copy = Vec::with_capacity(row_count);
+        for row_index in src_top..src_top + row_count {
+            let Some(row) = self.grid.row(row_index) else {
+                return;
+            };
+            copy.push(
+                (src_left..src_left + col_count)
+                    .map(|col| {
+                        let mut cell = row[col].clone();
+                        // Foot copies cell contents and SGR attributes, but
+                        // deliberately does not copy OSC 8 URI ranges.
+                        cell.hyperlink = None;
+                        cell
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let dst_bottom = dst_top + row_count - 1;
+        let dst_right = dst_left + col_count - 1;
+        self.clear_selection_if_rows_selected(dst_top, dst_bottom);
+        self.remove_images_overlapping_rectangle(dst_top, dst_left, dst_bottom, dst_right);
+
+        for row_offset in 0..row_count {
+            for col_offset in 0..col_count {
+                self.clear_wide_cell_at(dst_top + row_offset, dst_left + col_offset);
+            }
+        }
+        for (row_offset, cells) in copy.into_iter().enumerate() {
+            if let Some(row) = self.grid.row_mut(dst_top + row_offset) {
+                for (col_offset, cell) in cells.into_iter().enumerate() {
+                    row[dst_left + col_offset] = cell;
+                }
+            }
+            self.repair_wide_cells_in_row(dst_top + row_offset);
+        }
+        self.dirty = true;
+    }
+
+    /// Fill an inclusive rectangle with a single-byte DEC character and the
+    /// current SGR style (DECFRA).
+    pub(crate) fn fill_rectangular_area(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+        c: char,
+    ) {
+        if top > bottom || left > right {
+            return;
+        }
+
+        self.clear_selection_if_rows_selected(top, bottom);
+        self.remove_images_overlapping_rectangle(top, left, bottom, right);
+        let mut fill = Cell::new(c);
+        self.style.apply_to(&mut fill);
+        // OSC 8 is not an SGR attribute and is not applied by DECFRA.
+        fill.hyperlink = None;
+
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            for col in left..=right.min(self.width().saturating_sub(1)) {
+                self.clear_wide_cell_at(row_index, col);
+                if let Some(cell) = self.grid.get_mut(row_index, col) {
+                    *cell = fill.clone();
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Erase an inclusive rectangle using the current SGR background (DECERA).
+    pub(crate) fn erase_rectangular_area(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+    ) {
+        if top > bottom || left > right {
+            return;
+        }
+
+        self.clear_selection_if_rows_selected(top, bottom);
+        self.remove_images_overlapping_rectangle(top, left, bottom, right);
+        let mut blank = Cell::default();
+        blank.bg = self.style.bg;
+
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            for col in left..=right.min(self.width().saturating_sub(1)) {
+                self.clear_wide_cell_at(row_index, col);
+                if let Some(cell) = self.grid.get_mut(row_index, col) {
+                    *cell = blank.clone();
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn repair_wide_cells_in_row(&mut self, row_index: usize) {
+        let width = self.width();
+        let Some(row) = self.grid.row_mut(row_index) else {
+            return;
+        };
+        for col in 0..width {
+            if row[col].attrs.contains(CellAttrs::WIDE) {
+                if col + 1 >= width || !row[col + 1].attrs.contains(CellAttrs::WIDE_SPACER) {
+                    row[col].reset();
+                }
+            } else if row[col].attrs.contains(CellAttrs::WIDE_SPACER)
+                && (col == 0 || !row[col - 1].attrs.contains(CellAttrs::WIDE))
+            {
+                row[col].reset();
+            }
+        }
+    }
+
+    fn remove_images_overlapping_rectangle(
+        &mut self,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+    ) {
+        let absolute_top = self.scrollback.len().saturating_add(top);
+        let absolute_bottom = self
+            .scrollback
+            .len()
+            .saturating_add(bottom)
+            .saturating_add(1);
+        self.images.retain(|_, image| {
+            let image_bottom = image.line.saturating_add(image.cell_height.max(1));
+            let image_right = image.col.saturating_add(image.cell_width.max(1));
+            image_bottom <= absolute_top
+                || image.line >= absolute_bottom
+                || image_right <= left
+                || image.col > right
+        });
+    }
+
     /// Delete characters at cursor position
     pub fn delete_chars(&mut self, count: usize) {
         let cursor_row = self.cursor.row;

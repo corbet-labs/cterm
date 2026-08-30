@@ -314,16 +314,20 @@ identity_file = "~/.ssh/prod_key"
 | 7 | DECAWM | Auto-wrap mode |
 | 9 | X10 Mouse | X10 mouse reporting (button press only) |
 | 25 | DECTCEM | Show/hide cursor |
+| 45 | — | Reverse-wrap at the left margin |
 | 80 | DECSDM | Sixel display mode (scrolling control) |
 | 1000 | — | Normal mouse tracking (button press/release) |
 | 1002 | — | Button-event mouse tracking (press/release/motion with button) |
 | 1003 | — | Any-event mouse tracking (all motion events) |
 | 1004 | — | Focus event reporting |
 | 1006 | — | SGR extended mouse coordinates |
+| 1007 | — | Alternate-screen wheel-to-cursor-key translation |
 | 1047 | — | Alternate screen buffer |
 | 1048 | — | Save/restore cursor |
 | 1049 | — | Alternate screen buffer with cursor save/restore |
 | 2004 | — | Bracketed paste mode |
+| 2026 | — | Synchronized application updates |
+| 8452 | — | Place the cursor to the right of Sixel graphics |
 
 ### Supported ANSI Modes (SM/RM)
 
@@ -339,15 +343,31 @@ identity_file = "~/.ssh/prod_key"
 | 0 | Set window title and icon name |
 | 1 | Set icon name |
 | 2 | Set window title |
+| 4 | Query/set indexed palette colors |
+| 7 | Track the shell-reported working directory (`file:` URI) |
 | 8 | Hyperlinks |
 | 10 | Query/set foreground color |
 | 11 | Query/set background color |
 | 12 | Query/set cursor color |
 | 52 | Clipboard operations |
+| 104 | Reset indexed palette colors |
 | 110 | Reset foreground color |
 | 111 | Reset background color |
 | 112 | Reset cursor color |
 | 1337 | iTerm2 inline images and file transfer |
+
+### Supported DEC Rectangular Editing
+
+| Sequence | Description |
+|----------|-------------|
+| DECCARA | Change bold, underline, blink, and inverse attributes in a rectangle |
+| DECRARA | Invert those attributes in a rectangle |
+| DECCRA | Copy a rectangle, including overlap-safe copies |
+| DECFRA | Fill a rectangle using the current SGR style |
+| DECERA | Erase a rectangle using the current background color |
+
+Coordinates honor origin mode and scrolling margins, are clipped to the active
+page, and preserve the cursor position.
 
 ### Sixel Graphics
 
@@ -357,7 +377,7 @@ cterm supports DEC Sixel graphics for inline image display:
 - DECSDM mode for controlling image placement and scrolling
 - Images scroll with terminal content
 - Grid cells under images are cleared (xterm-compatible behavior)
-- DA1 reports Sixel, ANSI color, and OSC 52 capabilities (`CSI ? 62 ; 4 ; 22 ; 52 c`)
+- DA1 reports Sixel, ANSI color, rectangular editing, and OSC 52 capabilities (`CSI ? 62 ; 4 ; 22 ; 28 ; 52 c`)
 - `CSI 16 t` reports the renderer's current character-cell height and width
 
 ### Enhanced keyboard events

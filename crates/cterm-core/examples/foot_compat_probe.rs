@@ -55,6 +55,7 @@ mod unix {
         let mut stdout = io::stdout().lock();
 
         let cases: &[(&str, &[u8], &[u8])] = &[
+            ("device-attributes", b"\x1b[c", b"c"),
             ("cursor", b"\x1b[2J\x1b[H\x1b[6;11H\x1b[6n", b"R"),
             (
                 "sgr",
