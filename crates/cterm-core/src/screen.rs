@@ -610,10 +610,18 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
             let used = if continues {
                 rows[row_index].len()
             } else {
-                rows[row_index]
+                let text_end = rows[row_index]
                     .iter()
                     .rposition(|cell| !cell.is_empty())
-                    .map_or(0, |index| index + 1)
+                    .map_or(0, |index| index + 1);
+                let marker_end = rows[row_index]
+                    .shell_integration
+                    .command_start
+                    .into_iter()
+                    .chain(rows[row_index].shell_integration.command_end)
+                    .max()
+                    .unwrap_or(0);
+                text_end.max(marker_end).min(rows[row_index].len())
             };
 
             cells.extend(
@@ -674,12 +682,52 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
         output.push(Row::new(new_width));
     }
 
-    ReflowedRows {
+    let mut reflowed = ReflowedRows {
         rows: output,
         old_row_origins,
         logical_boundaries,
         new_width,
+    };
+
+    // Shell markers refer to positions in the old grid. Remap them through
+    // the same boundary table as cursors, selections and image anchors.
+    let shell_markers: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .map(|(row, source)| {
+            let prompt_row = source
+                .shell_integration
+                .prompt_marker
+                .then(|| reflowed.map_position(row, 0).0);
+            let command_start = source
+                .shell_integration
+                .command_start
+                .map(|col| reflowed.map_position(row, col));
+            let command_end = source
+                .shell_integration
+                .command_end
+                .map(|col| reflowed.map_position(row, col));
+            (prompt_row, command_start, command_end)
+        })
+        .collect();
+
+    for (prompt_row, command_start, command_end) in shell_markers {
+        if let Some(row) = prompt_row.and_then(|row| reflowed.rows.get_mut(row)) {
+            row.shell_integration.prompt_marker = true;
+        }
+        if let Some((row, col)) = command_start {
+            if let Some(row) = reflowed.rows.get_mut(row) {
+                row.shell_integration.command_start = Some(col.min(new_width));
+            }
+        }
+        if let Some((row, col)) = command_end {
+            if let Some(row) = reflowed.rows.get_mut(row) {
+                row.shell_integration.command_end = Some(col.min(new_width));
+            }
+        }
     }
+
+    reflowed
 }
 
 impl Screen {
@@ -1819,8 +1867,12 @@ impl Screen {
         };
 
         if let Some(row) = self.grid.row_mut(cursor_row) {
-            for col in start..end.min(width) {
-                row[col].reset();
+            if matches!(mode, LineClearMode::All) {
+                row.clear();
+            } else {
+                for col in start..end.min(width) {
+                    row[col].reset();
+                }
             }
         }
         self.dirty = true;
@@ -2297,6 +2349,126 @@ impl Screen {
         let scrollback_len = self.scrollback.len();
         // If line is in scrollback, return offset; otherwise 0 for visible area
         scrollback_len.saturating_sub(line_idx)
+    }
+
+    /// Mark the current row as the beginning of a shell prompt (OSC 133 A).
+    pub fn mark_shell_prompt(&mut self) {
+        if let Some(row) = self.grid.row_mut(self.cursor.row) {
+            row.shell_integration.prompt_marker = true;
+        }
+    }
+
+    /// Mark the current cursor boundary as the start of command output
+    /// (OSC 133 C).
+    pub fn mark_command_start(&mut self) {
+        if let Some(row) = self.grid.row_mut(self.cursor.row) {
+            row.shell_integration.command_start = Some(self.cursor.col.min(row.len()));
+        }
+    }
+
+    /// Mark the current cursor boundary as the end of command output
+    /// (OSC 133 D).
+    pub fn mark_command_end(&mut self) {
+        if let Some(row) = self.grid.row_mut(self.cursor.row) {
+            row.shell_integration.command_end = Some(self.cursor.col.min(row.len()));
+        }
+    }
+
+    /// Move the viewport to the closest prompt before its current top edge.
+    ///
+    /// This intentionally ignores the alternate screen, matching Foot: prompt
+    /// navigation operates on the normal shell's scrollback only.
+    pub fn scroll_to_previous_prompt(&mut self) -> bool {
+        if self.modes.alternate_screen {
+            return false;
+        }
+
+        let first_visible = self.scrollback.len().saturating_sub(self.scroll_offset);
+        let prompt = (0..first_visible).rev().find(|&line| {
+            self.get_row_by_absolute_line(line)
+                .is_some_and(|row| row.shell_integration.prompt_marker)
+        });
+
+        if let Some(line) = prompt {
+            self.scroll_offset = self.line_to_scroll_offset(line);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the viewport to the next prompt after its current top edge.
+    pub fn scroll_to_next_prompt(&mut self) -> bool {
+        if self.modes.alternate_screen || self.scroll_offset == 0 {
+            return false;
+        }
+
+        let first_visible = self.scrollback.len().saturating_sub(self.scroll_offset);
+        let prompt = (first_visible + 1..self.total_lines()).find(|&line| {
+            self.get_row_by_absolute_line(line)
+                .is_some_and(|row| row.shell_integration.prompt_marker)
+        });
+
+        if let Some(line) = prompt {
+            self.scroll_offset = self.line_to_scroll_offset(line);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Extract the output of the most recently completed shell command.
+    ///
+    /// OSC 133 C and D delimit cell boundaries. Wrapped physical rows are
+    /// joined, while hard line breaks are retained.
+    pub fn last_command_output(&self) -> Option<String> {
+        let mut end = None;
+        let mut start = None;
+
+        for line in (0..self.total_lines()).rev() {
+            let row = self.get_row_by_absolute_line(line)?;
+            if let Some(col) = row.shell_integration.command_end {
+                end = Some((line, col.min(row.len())));
+            }
+            if end.is_some() {
+                if let Some(col) = row.shell_integration.command_start {
+                    start = Some((line, col.min(row.len())));
+                    break;
+                }
+            }
+        }
+
+        let ((start_line, start_col), (end_line, end_col)) = (start?, end?);
+        if start_line > end_line || (start_line == end_line && start_col > end_col) {
+            return None;
+        }
+
+        let mut output = String::new();
+        for line in start_line..=end_line {
+            let row = self.get_row_by_absolute_line(line)?;
+            let from = if line == start_line { start_col } else { 0 };
+            let to = if line == end_line { end_col } else { row.len() };
+
+            for cell in row.iter().take(to).skip(from) {
+                if !cell.is_wide_spacer() {
+                    output.push_str(cell.text());
+                }
+            }
+
+            if line < end_line {
+                let next_is_wrapped = self
+                    .get_row_by_absolute_line(line + 1)
+                    .is_some_and(|next| next.wrapped);
+                if !next_is_wrapped {
+                    while output.ends_with(' ') {
+                        output.pop();
+                    }
+                    output.push('\n');
+                }
+            }
+        }
+
+        Some(output)
     }
 
     // ========== Image Methods ==========
@@ -3468,6 +3640,55 @@ mod tests {
 
         screen.resize(3, 3);
         assert_eq!(screen.get_selected_text().as_deref(), Some("bcdefg"));
+    }
+
+    #[test]
+    fn resize_keeps_shell_markers_attached_to_command_output() {
+        let mut screen = Screen::new(6, 3, ScreenConfig::default());
+        for c in "abcdefghi".chars() {
+            screen.put_char(c);
+        }
+        screen.grid_mut()[0].shell_integration.prompt_marker = true;
+        screen.grid_mut()[0].shell_integration.command_start = Some(2);
+        screen.grid_mut()[1].shell_integration.command_end = Some(3);
+        assert_eq!(screen.last_command_output().as_deref(), Some("cdefghi"));
+
+        screen.resize(4, 3);
+
+        assert!(screen.grid()[0].shell_integration.prompt_marker);
+        assert_eq!(screen.grid()[0].shell_integration.command_start, Some(2));
+        assert_eq!(screen.grid()[2].shell_integration.command_end, Some(1));
+        assert_eq!(screen.last_command_output().as_deref(), Some("cdefghi"));
+    }
+
+    #[test]
+    fn shell_prompt_navigation_matches_foot_view_edges() {
+        let mut screen = Screen::new(
+            10,
+            2,
+            ScreenConfig {
+                scrollback_lines: 10,
+            },
+        );
+        for text in ["one", "two", "three", "four"] {
+            screen.mark_shell_prompt();
+            for c in text.chars() {
+                screen.put_char(c);
+            }
+            screen.carriage_return();
+            screen.line_feed();
+        }
+
+        assert_eq!(screen.scroll_offset, 0);
+        assert!(screen.scroll_to_previous_prompt());
+        assert_eq!(screen.scroll_offset, 1);
+        assert!(screen.scroll_to_previous_prompt());
+        assert_eq!(screen.scroll_offset, 2);
+        assert!(screen.scroll_to_next_prompt());
+        assert_eq!(screen.scroll_offset, 1);
+        assert!(screen.scroll_to_next_prompt());
+        assert_eq!(screen.scroll_offset, 0);
+        assert!(!screen.scroll_to_next_prompt());
     }
 
     #[test]

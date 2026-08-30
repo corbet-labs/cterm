@@ -335,6 +335,55 @@ impl TerminalWidget {
         self.drawing_area.queue_draw();
     }
 
+    /// Scroll the local viewport up by a fixed number of physical rows.
+    pub fn scroll_viewport_up(&self, lines: usize) {
+        self.terminal.lock().scroll_viewport_up(lines);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Scroll the local viewport down by a fixed number of physical rows.
+    pub fn scroll_viewport_down(&self, lines: usize) {
+        self.terminal.lock().scroll_viewport_down(lines);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Scroll one viewport upward or downward.
+    pub fn scroll_viewport_page(&self, up: bool) {
+        let mut terminal = self.terminal.lock();
+        let lines = terminal.rows().max(1);
+        if up {
+            terminal.scroll_viewport_up(lines);
+        } else {
+            terminal.scroll_viewport_down(lines);
+        }
+        drop(terminal);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Jump to the oldest retained row or back to the live bottom.
+    pub fn scroll_viewport_edge(&self, top: bool) {
+        let mut terminal = self.terminal.lock();
+        if top {
+            terminal.scroll_viewport_up(usize::MAX);
+        } else {
+            terminal.scroll_viewport_to_bottom();
+        }
+        drop(terminal);
+        self.drawing_area.queue_draw();
+    }
+
+    /// Navigate between OSC 133 prompt markers.
+    pub fn scroll_to_shell_prompt(&self, previous: bool) {
+        let mut terminal = self.terminal.lock();
+        if previous {
+            terminal.scroll_to_previous_prompt();
+        } else {
+            terminal.scroll_to_next_prompt();
+        }
+        drop(terminal);
+        self.drawing_area.queue_draw();
+    }
+
     /// Convert pixel coordinates to cell (row, col) coordinates
     ///
     /// Returns (visible_row, col) where visible_row is the row on screen (0 = top)

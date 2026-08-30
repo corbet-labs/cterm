@@ -21,9 +21,11 @@ use objc2_foundation::{
 use parking_lot::Mutex;
 
 use cterm_app::config::Config;
+use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags, Terminal};
+use cterm_ui::events::Action;
 use cterm_ui::theme::Theme;
 
 use crate::cg_renderer::CGRenderer;
@@ -172,6 +174,7 @@ enum DaemonCommand {
 /// Terminal view state
 pub struct TerminalViewIvars {
     terminal: Arc<Mutex<Terminal>>,
+    shortcuts: ShortcutManager,
     renderer: RefCell<Option<CGRenderer>>,
     cell_width: f64,
     cell_height: f64,
@@ -330,6 +333,53 @@ define_class!(
             let kind = key_event_kind(event.isARepeat());
             let modifiers = keycode::modifiers_from_event(event);
             let core_mods = CoreModifiers::from_bits_truncate(modifiers.bits());
+
+            if let Some(action) = keycode::keycode_from_event(event)
+                .and_then(|key| self.ivars().shortcuts.match_event(key, modifiers))
+            {
+                let mut terminal = self.ivars().terminal.lock();
+                let page = terminal.rows().max(1);
+                let handled = match action {
+                    Action::ScrollUp => {
+                        terminal.scroll_viewport_up(1);
+                        true
+                    }
+                    Action::ScrollDown => {
+                        terminal.scroll_viewport_down(1);
+                        true
+                    }
+                    Action::ScrollPageUp => {
+                        terminal.scroll_viewport_up(page);
+                        true
+                    }
+                    Action::ScrollPageDown => {
+                        terminal.scroll_viewport_down(page);
+                        true
+                    }
+                    Action::ScrollToTop => {
+                        terminal.scroll_viewport_up(usize::MAX);
+                        true
+                    }
+                    Action::ScrollToBottom => {
+                        terminal.scroll_viewport_to_bottom();
+                        true
+                    }
+                    Action::PromptPrevious => {
+                        terminal.scroll_to_previous_prompt();
+                        true
+                    }
+                    Action::PromptNext => {
+                        terminal.scroll_to_next_prompt();
+                        true
+                    }
+                    _ => false,
+                };
+                drop(terminal);
+                if handled {
+                    self.set_needs_display();
+                    return;
+                }
+            }
 
             // Clear any stale press for a newly pressed physical key. Repeats retain the
             // original identity so keyUp can report the same key even if the layout changes.
@@ -1473,6 +1523,7 @@ impl TerminalView {
         mtm: MainThreadMarker,
         renderer: CGRenderer,
         terminal: Arc<Mutex<Terminal>>,
+        config: &Config,
         theme: &Theme,
         options: ViewInitOptions,
     ) -> (Retained<Self>, Arc<ViewState>) {
@@ -1483,6 +1534,7 @@ impl TerminalView {
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(TerminalViewIvars {
             terminal: terminal.clone(),
+            shortcuts: ShortcutManager::from_config(&config.shortcuts),
             renderer: RefCell::new(Some(renderer)),
             cell_width,
             cell_height,
@@ -1568,6 +1620,7 @@ impl TerminalView {
             mtm,
             renderer,
             terminal.clone(),
+            config,
             theme,
             ViewInitOptions::default(),
         );
@@ -1653,6 +1706,7 @@ impl TerminalView {
             mtm,
             renderer,
             terminal.clone(),
+            config,
             theme,
             ViewInitOptions::default(),
         );

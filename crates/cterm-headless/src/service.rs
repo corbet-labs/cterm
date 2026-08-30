@@ -912,6 +912,10 @@ impl TerminalService for TerminalServiceImpl {
                                         dirty.push(DirtyRow {
                                             row_index: i as u32,
                                             cells: current_rows[i].cells.clone(),
+                                            wrapped: current_rows[i].wrapped,
+                                            shell_prompt: current_rows[i].shell_prompt,
+                                            command_start: current_rows[i].command_start,
+                                            command_end: current_rows[i].command_end,
                                         });
                                     }
                                 }

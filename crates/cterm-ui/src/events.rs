@@ -358,6 +358,8 @@ pub enum Action {
     ScrollPageDown,
     ScrollToTop,
     ScrollToBottom,
+    PromptPrevious,
+    PromptNext,
 
     // Other
     OpenPreferences,

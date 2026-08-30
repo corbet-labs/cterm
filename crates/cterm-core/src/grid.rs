@@ -6,12 +6,29 @@
 use crate::cell::Cell;
 use serde::{Deserialize, Serialize};
 
+/// Per-row markers emitted by shell integration protocols such as OSC 133.
+///
+/// Command positions are cell boundaries: a value of `0` is before the first
+/// cell and a value equal to the row width is immediately after the last one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellIntegration {
+    /// This physical row contains the beginning of a shell prompt.
+    pub prompt_marker: bool,
+    /// Start of the most recently executed command's output.
+    pub command_start: Option<usize>,
+    /// End of the most recently completed command's output.
+    pub command_end: Option<usize>,
+}
+
 /// A row of cells in the terminal
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     cells: Vec<Cell>,
     /// Whether this row has been wrapped from the previous row
     pub wrapped: bool,
+    /// Shell prompt and command-output boundaries attached to this row.
+    #[serde(default)]
+    pub shell_integration: ShellIntegration,
 }
 
 impl Row {
@@ -20,6 +37,7 @@ impl Row {
         Self {
             cells: vec![Cell::default(); width],
             wrapped: false,
+            shell_integration: ShellIntegration::default(),
         }
     }
 
@@ -36,6 +54,12 @@ impl Row {
     /// Resize the row to a new width
     pub fn resize(&mut self, width: usize) {
         self.cells.resize(width, Cell::default());
+        self.shell_integration.command_start = self
+            .shell_integration
+            .command_start
+            .map(|col| col.min(width));
+        self.shell_integration.command_end =
+            self.shell_integration.command_end.map(|col| col.min(width));
     }
 
     /// Clear all cells in the row
@@ -44,6 +68,7 @@ impl Row {
             cell.reset();
         }
         self.wrapped = false;
+        self.shell_integration = ShellIntegration::default();
     }
 
     /// Get a reference to a cell at the given column

@@ -456,6 +456,10 @@ message TerminalImages {
 message DirtyRow {
   uint32 row_index = 1;
   repeated Cell cells = 2;
+  bool wrapped = 3;
+  bool shell_prompt = 4;
+  optional uint32 command_start = 5;
+  optional uint32 command_end = 6;
 }
 
 message CursorUpdate {
@@ -538,6 +542,12 @@ message DrcsGlyph {
 
 message Row {
   repeated Cell cells = 1;
+  // True when this physical row continues the preceding logical line.
+  bool wrapped = 2;
+  // OSC 133 shell-integration metadata.
+  bool shell_prompt = 3;
+  optional uint32 command_start = 4;
+  optional uint32 command_end = 5;
 }
 
 message Cell {

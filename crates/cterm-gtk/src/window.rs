@@ -1638,6 +1638,44 @@ impl CtermWindow {
                             }
                             return glib::Propagation::Stop;
                         }
+                        Action::ScrollUp
+                        | Action::ScrollDown
+                        | Action::ScrollPageUp
+                        | Action::ScrollPageDown
+                        | Action::ScrollToTop
+                        | Action::ScrollToBottom
+                        | Action::PromptPrevious
+                        | Action::PromptNext => {
+                            if let Some(page_idx) = notebook.current_page() {
+                                let tabs_ref = tabs.borrow();
+                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
+                                    match action {
+                                        Action::ScrollUp => tab.terminal.scroll_viewport_up(1),
+                                        Action::ScrollDown => tab.terminal.scroll_viewport_down(1),
+                                        Action::ScrollPageUp => {
+                                            tab.terminal.scroll_viewport_page(true)
+                                        }
+                                        Action::ScrollPageDown => {
+                                            tab.terminal.scroll_viewport_page(false)
+                                        }
+                                        Action::ScrollToTop => {
+                                            tab.terminal.scroll_viewport_edge(true)
+                                        }
+                                        Action::ScrollToBottom => {
+                                            tab.terminal.scroll_viewport_edge(false)
+                                        }
+                                        Action::PromptPrevious => {
+                                            tab.terminal.scroll_to_shell_prompt(true)
+                                        }
+                                        Action::PromptNext => {
+                                            tab.terminal.scroll_to_shell_prompt(false)
+                                        }
+                                        _ => unreachable!(),
+                                    }
+                                }
+                            }
+                            return glib::Propagation::Stop;
+                        }
                         Action::NewWindow => {
                             gtk4::prelude::ActionGroupExt::activate_action(
                                 &window,

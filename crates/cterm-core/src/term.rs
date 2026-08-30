@@ -475,6 +475,21 @@ impl Terminal {
         self.screen.scroll_offset = 0;
     }
 
+    /// Scroll to the closest shell prompt above the viewport.
+    pub fn scroll_to_previous_prompt(&mut self) -> bool {
+        self.screen.scroll_to_previous_prompt()
+    }
+
+    /// Scroll to the closest shell prompt below the viewport.
+    pub fn scroll_to_next_prompt(&mut self) -> bool {
+        self.screen.scroll_to_next_prompt()
+    }
+
+    /// Return the output delimited by the latest OSC 133 C/D pair.
+    pub fn last_command_output(&self) -> Option<String> {
+        self.screen.last_command_output()
+    }
+
     /// Check if viewport is at bottom
     pub fn is_at_bottom(&self) -> bool {
         self.screen.scroll_offset == 0

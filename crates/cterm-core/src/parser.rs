@@ -723,6 +723,14 @@ impl vte::Perform for ScreenPerformer<'_> {
                     }
                 }
             }
+            // FinalTerm/iTerm2 shell integration. Foot deliberately treats B
+            // as informational and records A/C/D on the current physical row.
+            133 => match params.get(1).and_then(|value| value.first()).copied() {
+                Some(b'A') => self.screen.mark_shell_prompt(),
+                Some(b'C') => self.screen.mark_command_start(),
+                Some(b'D') => self.screen.mark_command_end(),
+                _ => {}
+            },
             // iTerm2 inline images and file transfer (1337)
             1337 => {
                 self.handle_osc_1337(params);
@@ -2608,6 +2616,23 @@ mod tests {
         let hostname = hostname::get().unwrap();
         let hostname = hostname.to_string_lossy();
         assert!(osc7_hostname_is_local(&hostname));
+    }
+
+    #[test]
+    fn test_osc133_records_foot_shell_markers() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"prompt\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07output\x1b]133;D;0\x1b\\",
+        );
+
+        let integration = &screen.grid()[0].shell_integration;
+        assert!(integration.prompt_marker);
+        assert_eq!(integration.command_start, Some(6));
+        assert_eq!(integration.command_end, Some(12));
+        assert_eq!(screen.last_command_output().as_deref(), Some("output"));
     }
 
     #[test]

@@ -1391,6 +1391,36 @@ impl WindowState {
             Action::ZoomIn => self.zoom_in(),
             Action::ZoomOut => self.zoom_out(),
             Action::ZoomReset => self.zoom_reset(),
+            Action::ScrollUp
+            | Action::ScrollDown
+            | Action::ScrollPageUp
+            | Action::ScrollPageDown
+            | Action::ScrollToTop
+            | Action::ScrollToBottom
+            | Action::PromptPrevious
+            | Action::PromptNext => {
+                if let Some(terminal) = self.active_terminal() {
+                    let mut term = terminal.lock().unwrap();
+                    let page = term.rows().max(1);
+                    match action {
+                        Action::ScrollUp => term.scroll_viewport_up(1),
+                        Action::ScrollDown => term.scroll_viewport_down(1),
+                        Action::ScrollPageUp => term.scroll_viewport_up(page),
+                        Action::ScrollPageDown => term.scroll_viewport_down(page),
+                        Action::ScrollToTop => term.scroll_viewport_up(usize::MAX),
+                        Action::ScrollToBottom => term.scroll_viewport_to_bottom(),
+                        Action::PromptPrevious => {
+                            term.scroll_to_previous_prompt();
+                        }
+                        Action::PromptNext => {
+                            term.scroll_to_next_prompt();
+                        }
+                        _ => unreachable!(),
+                    }
+                    drop(term);
+                }
+                self.invalidate();
+            }
             Action::CloseWindow => {
                 unsafe {
                     let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));

@@ -4,6 +4,7 @@ use crate::convert::color::{color_to_proto, proto_to_color};
 use crate::proto;
 use cterm_core::cell::Hyperlink;
 use cterm_core::drcs::{DrcsFont, DrcsGlyph};
+use cterm_core::grid::Row as CoreRow;
 use cterm_core::term::Terminal;
 use cterm_core::{
     Cell, CellAttrs, Color, ColorQuery, MouseEncoding, MouseMode, Screen, TerminalImage,
@@ -97,10 +98,33 @@ pub fn cell_to_proto(cell: &Cell) -> proto::Cell {
     }
 }
 
-/// Convert a row of cells to proto
+/// Convert a bare cell slice to a protocol row.
+///
+/// This compatibility helper has no physical-row metadata. Screen snapshots
+/// use `grid_row_to_proto` below so wrapping and shell markers are retained.
 pub fn row_to_proto(cells: &[Cell]) -> proto::Row {
     proto::Row {
         cells: cells.iter().map(cell_to_proto).collect(),
+        wrapped: false,
+        shell_prompt: false,
+        command_start: None,
+        command_end: None,
+    }
+}
+
+fn grid_row_to_proto(row: &CoreRow) -> proto::Row {
+    proto::Row {
+        cells: row.iter().map(cell_to_proto).collect(),
+        wrapped: row.wrapped,
+        shell_prompt: row.shell_integration.prompt_marker,
+        command_start: row
+            .shell_integration
+            .command_start
+            .and_then(|col| u32::try_from(col).ok()),
+        command_end: row
+            .shell_integration
+            .command_end
+            .and_then(|col| u32::try_from(col).ok()),
     }
 }
 
@@ -216,24 +240,12 @@ pub fn screen_to_proto(screen: &Screen, include_scrollback: bool) -> proto::GetS
 
     // Get visible rows
     let visible_rows: Vec<proto::Row> = (0..screen.height())
-        .map(|row_idx| {
-            let cells: Vec<Cell> = (0..screen.width())
-                .map(|col| screen.get_cell(row_idx, col).cloned().unwrap_or_default())
-                .collect();
-            row_to_proto(&cells)
-        })
+        .filter_map(|row_idx| screen.grid().row(row_idx).map(grid_row_to_proto))
         .collect();
 
     // Get scrollback if requested
     let scrollback = if include_scrollback {
-        screen
-            .scrollback()
-            .iter()
-            .map(|row| {
-                let cells: Vec<Cell> = row.iter().cloned().collect();
-                row_to_proto(&cells)
-            })
-            .collect()
+        screen.scrollback().iter().map(grid_row_to_proto).collect()
     } else {
         Vec::new()
     };
@@ -253,10 +265,11 @@ pub fn screen_to_proto(screen: &Screen, include_scrollback: bool) -> proto::GetS
 
 /// Convert a single visible row from the screen to proto
 pub fn visible_row_to_proto(screen: &Screen, row_idx: usize) -> proto::Row {
-    let cells: Vec<Cell> = (0..screen.width())
-        .map(|col| screen.get_cell(row_idx, col).cloned().unwrap_or_default())
-        .collect();
-    row_to_proto(&cells)
+    screen
+        .grid()
+        .row(row_idx)
+        .map(grid_row_to_proto)
+        .unwrap_or_else(|| grid_row_to_proto(&CoreRow::new(screen.width())))
 }
 
 /// Convert all visible rows to proto (no scrollback)
@@ -377,18 +390,43 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
 
     // Restore visible rows
     for (row_idx, row) in screen_data.visible_rows.iter().enumerate() {
-        for (col_idx, cell) in row.cells.iter().enumerate() {
-            if let Some(grid_cell) = screen.grid_mut().get_mut(row_idx, col_idx) {
-                apply_proto_cell(grid_cell, cell);
+        if let Some(grid_row) = screen.grid_mut().row_mut(row_idx) {
+            grid_row.clear();
+            grid_row.wrapped = row.wrapped;
+            grid_row.shell_integration.prompt_marker = row.shell_prompt;
+            grid_row.shell_integration.command_start = row
+                .command_start
+                .map(|col| col as usize)
+                .filter(|&col| col <= grid_row.len());
+            grid_row.shell_integration.command_end = row
+                .command_end
+                .map(|col| col as usize)
+                .filter(|&col| col <= grid_row.len());
+            for (col_idx, cell) in row.cells.iter().enumerate() {
+                if let Some(grid_cell) = grid_row.get_mut(col_idx) {
+                    apply_proto_cell(grid_cell, cell);
+                }
             }
         }
     }
 
-    // Restore scrollback
+    // A screen snapshot is authoritative. Replace, rather than append to, any
+    // history retained by a reconnecting local mirror.
+    screen.scrollback_mut().clear();
     if !screen_data.scrollback.is_empty() {
         use cterm_core::grid::Row;
         for proto_row in &screen_data.scrollback {
             let mut row = Row::new(screen_data.cols as usize);
+            row.wrapped = proto_row.wrapped;
+            row.shell_integration.prompt_marker = proto_row.shell_prompt;
+            row.shell_integration.command_start = proto_row
+                .command_start
+                .map(|col| col as usize)
+                .filter(|&col| col <= row.len());
+            row.shell_integration.command_end = proto_row
+                .command_end
+                .map(|col| col as usize)
+                .filter(|&col| col <= row.len());
             for (col_idx, cell) in proto_row.cells.iter().enumerate() {
                 if let Some(grid_cell) = row.get_mut(col_idx) {
                     apply_proto_cell(grid_cell, cell);
@@ -576,6 +614,11 @@ mod tests {
         source_cell.set_text("x\u{301}");
         source_cell.underline_color = Some(Color::rgb(1, 2, 3));
         source_cell.hyperlink = Some(expected_link.clone());
+        let source_row = source.screen_mut().grid_mut().row_mut(1).unwrap();
+        source_row.wrapped = true;
+        source_row.shell_integration.prompt_marker = true;
+        source_row.shell_integration.command_start = Some(1);
+        source_row.shell_integration.command_end = Some(3);
         source.screen_mut().modes.reverse_video = true;
         source.screen_mut().modes.reverse_wrap = false;
         source.screen_mut().modes.modify_other_keys = 2;
@@ -609,6 +652,11 @@ mod tests {
         assert_eq!(restored_cell.text(), "x\u{301}");
         assert_eq!(restored_cell.underline_color, Some(Color::rgb(1, 2, 3)));
         assert_eq!(restored_cell.hyperlink, Some(expected_link));
+        let restored_row = restored.screen().grid().row(1).unwrap();
+        assert!(restored_row.wrapped);
+        assert!(restored_row.shell_integration.prompt_marker);
+        assert_eq!(restored_row.shell_integration.command_start, Some(1));
+        assert_eq!(restored_row.shell_integration.command_end, Some(3));
         assert!(restored.screen().modes.reverse_video);
         assert!(!restored.screen().modes.reverse_wrap);
         assert_eq!(restored.screen().modes.modify_other_keys, 2);
@@ -656,6 +704,9 @@ mod tests {
         restored
             .screen_mut()
             .set_current_working_directory(Some(std::path::PathBuf::from("/tmp/stale")));
+        restored.screen_mut().cursor.row = 23;
+        restored.screen_mut().line_feed();
+        assert!(!restored.screen().scrollback().is_empty());
 
         apply_screen_snapshot(&mut restored, &snapshot);
 
@@ -668,6 +719,7 @@ mod tests {
             None
         );
         assert_eq!(restored.screen().current_working_directory(), None);
+        assert!(restored.screen().scrollback().is_empty());
     }
 
     #[test]

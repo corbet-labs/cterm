@@ -50,6 +50,8 @@ impl ShortcutManager {
         manager.bind_str(&config.scroll_down, Action::ScrollDown);
         manager.bind_str(&config.scroll_page_up, Action::ScrollPageUp);
         manager.bind_str(&config.scroll_page_down, Action::ScrollPageDown);
+        manager.bind_str(&config.prompt_previous, Action::PromptPrevious);
+        manager.bind_str(&config.prompt_next, Action::PromptNext);
         manager.bind_str(&config.preferences, Action::OpenPreferences);
         manager.bind_str(&config.find, Action::FindText);
         manager.bind_str(&config.reset, Action::ResetTerminal);
@@ -109,6 +111,8 @@ impl ShortcutManager {
         );
         self.bind(Shortcut::ctrl_shift(KeyCode::Home), Action::ScrollToTop);
         self.bind(Shortcut::ctrl_shift(KeyCode::End), Action::ScrollToBottom);
+        self.bind(Shortcut::ctrl_shift(KeyCode::Z), Action::PromptPrevious);
+        self.bind(Shortcut::ctrl_shift(KeyCode::X), Action::PromptNext);
 
         // Other shortcuts
         self.bind(Shortcut::ctrl(KeyCode::Comma), Action::OpenPreferences);
@@ -431,5 +435,13 @@ mod tests {
         let manager = ShortcutManager::new();
         let action = manager.match_event(KeyCode::T, Modifiers::CTRL | Modifiers::SHIFT);
         assert_eq!(action, Some(&Action::NewTab));
+        assert_eq!(
+            manager.match_event(KeyCode::Z, Modifiers::CTRL | Modifiers::SHIFT),
+            Some(&Action::PromptPrevious)
+        );
+        assert_eq!(
+            manager.match_event(KeyCode::X, Modifiers::CTRL | Modifiers::SHIFT),
+            Some(&Action::PromptNext)
+        );
     }
 }

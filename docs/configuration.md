@@ -90,6 +90,8 @@ zoom_reset = "Ctrl+0"
 # Navigation
 scroll_up = "Shift+Page_Up"
 scroll_down = "Shift+Page_Down"
+prompt_previous = "Ctrl+Shift+Z"
+prompt_next = "Ctrl+Shift+X"
 
 # Find
 find = "Ctrl+Shift+F"
