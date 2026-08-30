@@ -16,6 +16,19 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
+  release-metadata:
+    name: Check release metadata
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Match tag, workspace version, and changelog
+        run: bash scripts/check_release_metadata.sh "$GITHUB_REF_NAME"
+
   format:
     name: Check formatting
     runs-on: ubuntu-22.04
@@ -375,7 +388,10 @@ jobs:
         run: |
           mkdir -p release/cterm-linux-x86_64/icons
           cp target/release/cterm release/cterm-linux-x86_64/
+          cp target/release/ctermd release/cterm-linux-x86_64/
           cp README.md LICENSE release/cterm-linux-x86_64/
+          cp THIRD_PARTY_LICENSES.md release/cterm-linux-x86_64/
+          cp -R LICENSES release/cterm-linux-x86_64/
           cp /tmp/icons/* release/cterm-linux-x86_64/icons/
           cd release && tar -czvf cterm-linux-x86_64.tar.gz cterm-linux-x86_64
 
@@ -384,19 +400,37 @@ jobs:
           mkdir -p release/ctermd-linux-x86_64
           cp target/release/ctermd release/ctermd-linux-x86_64/
           cp README.md LICENSE release/ctermd-linux-x86_64/
+          cp THIRD_PARTY_LICENSES.md release/ctermd-linux-x86_64/
+          cp -R LICENSES release/ctermd-linux-x86_64/
           cd release && tar -czvf ctermd-linux-x86_64.tar.gz ctermd-linux-x86_64
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd release
+          sha256sum cterm-linux-x86_64.tar.gz > cterm-linux-x86_64.tar.gz.sha256
+          sha256sum ctermd-linux-x86_64.tar.gz > ctermd-linux-x86_64.tar.gz.sha256
+
+      - name: Verify packaging contract
+        run: |
+          (cd release && sha256sum --check cterm-linux-x86_64.tar.gz.sha256 ctermd-linux-x86_64.tar.gz.sha256)
+          bash scripts/verify_release_package.sh client-tar release/cterm-linux-x86_64.tar.gz cterm-linux-x86_64
+          bash scripts/verify_release_package.sh daemon-tar release/ctermd-linux-x86_64.tar.gz ctermd-linux-x86_64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: cterm-linux-x86_64
-          path: release/cterm-linux-x86_64.tar.gz
+          path: |
+            release/cterm-linux-x86_64.tar.gz
+            release/cterm-linux-x86_64.tar.gz.sha256
 
       - name: Upload ctermd artifact
         uses: actions/upload-artifact@v7
         with:
           name: ctermd-linux-x86_64
-          path: release/ctermd-linux-x86_64.tar.gz
+          path: |
+            release/ctermd-linux-x86_64.tar.gz
+            release/ctermd-linux-x86_64.tar.gz.sha256
 
   build-linux-arm64:
     name: Build Linux (ARM64)
@@ -455,7 +489,10 @@ jobs:
         run: |
           mkdir -p release/cterm-linux-arm64/icons
           cp target/release/cterm release/cterm-linux-arm64/
+          cp target/release/ctermd release/cterm-linux-arm64/
           cp README.md LICENSE release/cterm-linux-arm64/
+          cp THIRD_PARTY_LICENSES.md release/cterm-linux-arm64/
+          cp -R LICENSES release/cterm-linux-arm64/
           cp /tmp/icons/* release/cterm-linux-arm64/icons/
           cd release && tar -czvf cterm-linux-arm64.tar.gz cterm-linux-arm64
 
@@ -464,19 +501,37 @@ jobs:
           mkdir -p release/ctermd-linux-arm64
           cp target/release/ctermd release/ctermd-linux-arm64/
           cp README.md LICENSE release/ctermd-linux-arm64/
+          cp THIRD_PARTY_LICENSES.md release/ctermd-linux-arm64/
+          cp -R LICENSES release/ctermd-linux-arm64/
           cd release && tar -czvf ctermd-linux-arm64.tar.gz ctermd-linux-arm64
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd release
+          sha256sum cterm-linux-arm64.tar.gz > cterm-linux-arm64.tar.gz.sha256
+          sha256sum ctermd-linux-arm64.tar.gz > ctermd-linux-arm64.tar.gz.sha256
+
+      - name: Verify packaging contract
+        run: |
+          (cd release && sha256sum --check cterm-linux-arm64.tar.gz.sha256 ctermd-linux-arm64.tar.gz.sha256)
+          bash scripts/verify_release_package.sh client-tar release/cterm-linux-arm64.tar.gz cterm-linux-arm64
+          bash scripts/verify_release_package.sh daemon-tar release/ctermd-linux-arm64.tar.gz ctermd-linux-arm64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: cterm-linux-arm64
-          path: release/cterm-linux-arm64.tar.gz
+          path: |
+            release/cterm-linux-arm64.tar.gz
+            release/cterm-linux-arm64.tar.gz.sha256
 
       - name: Upload ctermd artifact
         uses: actions/upload-artifact@v7
         with:
           name: ctermd-linux-arm64
-          path: release/ctermd-linux-arm64.tar.gz
+          path: |
+            release/ctermd-linux-arm64.tar.gz
+            release/ctermd-linux-arm64.tar.gz.sha256
 
   test-windows:
     name: Test (Windows)
@@ -549,8 +604,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path release/cterm-windows-x86_64
           Copy-Item target/release/cterm.exe release/cterm-windows-x86_64/
+          Copy-Item target/release/ctermd.exe release/cterm-windows-x86_64/
           Copy-Item README.md release/cterm-windows-x86_64/
           Copy-Item LICENSE release/cterm-windows-x86_64/
+          Copy-Item THIRD_PARTY_LICENSES.md release/cterm-windows-x86_64/
+          Copy-Item LICENSES release/cterm-windows-x86_64/LICENSES -Recurse
 
       - name: Prepare ctermd release files
         shell: pwsh
@@ -559,11 +617,13 @@ jobs:
           Copy-Item target/release/ctermd.exe release/ctermd-windows-x86_64/
           Copy-Item README.md release/ctermd-windows-x86_64/
           Copy-Item LICENSE release/ctermd-windows-x86_64/
+          Copy-Item THIRD_PARTY_LICENSES.md release/ctermd-windows-x86_64/
+          Copy-Item LICENSES release/ctermd-windows-x86_64/LICENSES -Recurse
 
       - name: Install NSIS and ImageMagick
         shell: pwsh
         run: |
-          choco install nsis imagemagick -y
+          choco install nsis imagemagick 7zip -y
 
       - name: Generate app icon
         shell: pwsh
@@ -620,23 +680,56 @@ jobs:
         run: |
           Compress-Archive -Path release/ctermd-windows-x86_64 -DestinationPath release/ctermd-windows-x86_64.zip
 
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        run: |
+          $assets = @(
+            "release/cterm-windows-x86_64.zip",
+            "release/cterm-windows-x86_64-setup.exe",
+            "release/ctermd-windows-x86_64.zip"
+          )
+          foreach ($asset in $assets) {
+            $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+            $filename = Split-Path -Leaf $asset
+            $sidecar = [System.IO.Path]::GetFullPath("$asset.sha256")
+            [System.IO.File]::WriteAllText(
+              $sidecar,
+              "$hash  $filename`n",
+              [System.Text.Encoding]::ASCII
+            )
+          }
+
+      - name: Verify packaging contract
+        shell: pwsh
+        run: |
+          ./scripts/verify_windows_release.ps1 `
+            -ClientZip release/cterm-windows-x86_64.zip `
+            -DaemonZip release/ctermd-windows-x86_64.zip `
+            -Installer release/cterm-windows-x86_64-setup.exe
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v7
         with:
           name: cterm-windows-installer
-          path: release/cterm-windows-x86_64-setup.exe
+          path: |
+            release/cterm-windows-x86_64-setup.exe
+            release/cterm-windows-x86_64-setup.exe.sha256
 
       - name: Upload zip artifact
         uses: actions/upload-artifact@v7
         with:
           name: cterm-windows-x86_64
-          path: release/cterm-windows-x86_64.zip
+          path: |
+            release/cterm-windows-x86_64.zip
+            release/cterm-windows-x86_64.zip.sha256
 
       - name: Upload ctermd zip artifact
         uses: actions/upload-artifact@v7
         with:
           name: ctermd-windows-x86_64
-          path: release/ctermd-windows-x86_64.zip
+          path: |
+            release/ctermd-windows-x86_64.zip
+            release/ctermd-windows-x86_64.zip.sha256
 
   build-macos-intel:
     name: Build macOS (Intel)
@@ -775,6 +868,10 @@ jobs:
           # Copy generated icon
           cp packaging/macos/cterm.icns "$APP_DIR/Contents/Resources/"
 
+          # Ship the product and inherited-source licenses inside the app.
+          cp LICENSE THIRD_PARTY_LICENSES.md "$APP_DIR/Contents/Resources/"
+          cp -R LICENSES "$APP_DIR/Contents/Resources/"
+
           # Get version from Cargo.toml
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
 
@@ -784,8 +881,36 @@ jobs:
           # Create PkgInfo
           echo -n "APPL????" > "$APP_DIR/Contents/PkgInfo"
 
+      - name: Detect Apple distribution credentials
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          SIGNING_AVAILABLE=false
+          NOTARIZATION_AVAILABLE=false
+
+          if [ -n "$APPLE_CERTIFICATE_BASE64" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ]; then
+            SIGNING_AVAILABLE=true
+          fi
+          if [ "$SIGNING_AVAILABLE" = true ] && \
+             [ -n "$APPLE_ID" ] && [ -n "$APPLE_ID_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            NOTARIZATION_AVAILABLE=true
+          fi
+
+          echo "APPLE_SIGNING_AVAILABLE=$SIGNING_AVAILABLE" >> "$GITHUB_ENV"
+          echo "APPLE_NOTARIZATION_AVAILABLE=$NOTARIZATION_AVAILABLE" >> "$GITHUB_ENV"
+
+          if [ "$SIGNING_AVAILABLE" != true ]; then
+            echo "::warning title=Ad-hoc macOS signature::Apple Developer ID certificate credentials are unavailable. Release artifacts will be ad-hoc signed and will not be notarized."
+          elif [ "$NOTARIZATION_AVAILABLE" != true ]; then
+            echo "::warning title=macOS notarization skipped::Apple notarization credentials are incomplete. Artifacts will be Developer ID signed but not notarized."
+          fi
+
       - name: Import signing certificate
-        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        if: env.APPLE_SIGNING_AVAILABLE == 'true'
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -814,9 +939,7 @@ jobs:
           rm /tmp/certificate.p12
 
       - name: Sign app bundle
-        if: env.APPLE_CERTIFICATE_BASE64 != ''
-        env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+        if: env.APPLE_SIGNING_AVAILABLE == 'true'
         run: |
           IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
           if [ -z "$IDENTITY" ]; then
@@ -850,10 +973,26 @@ jobs:
           # Verify
           codesign --verify --deep --strict --verbose=2 "release/cterm.app"
 
+      - name: Ad-hoc sign app bundle
+        if: env.APPLE_SIGNING_AVAILABLE != 'true'
+        run: |
+          codesign --force --options runtime \
+            --entitlements packaging/macos/cterm.entitlements \
+            --sign - \
+            "release/cterm.app/Contents/MacOS/ctermd"
+          codesign --force --options runtime \
+            --entitlements packaging/macos/cterm.entitlements \
+            --sign - \
+            "release/cterm.app/Contents/MacOS/cterm"
+          codesign --force --options runtime \
+            --entitlements packaging/macos/cterm.entitlements \
+            --sign - \
+            "release/cterm.app"
+          codesign --verify --deep --strict --verbose=2 "release/cterm.app"
+
       - name: Notarize app bundle
-        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        if: env.APPLE_NOTARIZATION_AVAILABLE == 'true'
         env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -905,20 +1044,21 @@ jobs:
           # Rename to standard name for artifact
           mv "release/cterm-macos-$VERSION.dmg" "release/cterm-macos-universal.dmg"
 
-      - name: Sign and notarize DMG
-        if: env.APPLE_CERTIFICATE_BASE64 != ''
+      - name: Sign DMG
+        if: env.APPLE_SIGNING_AVAILABLE == 'true'
+        run: |
+          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+          codesign --force --sign "$IDENTITY" --timestamp "release/cterm-macos-universal.dmg"
+          codesign --verify --strict --verbose=2 "release/cterm-macos-universal.dmg"
+
+      - name: Notarize DMG
+        if: env.APPLE_NOTARIZATION_AVAILABLE == 'true'
         env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
         run: |
-          IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
-
-          # Sign the DMG
-          codesign --force --sign "$IDENTITY" --timestamp "release/cterm-macos-universal.dmg"
-
-          # Notarize the DMG
           xcrun notarytool submit "release/cterm-macos-universal.dmg" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
@@ -929,16 +1069,21 @@ jobs:
           xcrun stapler staple "release/cterm-macos-universal.dmg"
 
       - name: Sign ctermd binary
-        if: env.APPLE_CERTIFICATE_BASE64 != ''
-        env:
-          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        if: env.APPLE_SIGNING_AVAILABLE == 'true'
         run: |
           IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
           codesign --force --options runtime \
             --sign "$IDENTITY" \
             --timestamp \
             "universal-binary/ctermd"
+          codesign --verify --strict --verbose=2 "universal-binary/ctermd"
+
+      - name: Ad-hoc sign DMG and ctermd binary
+        if: env.APPLE_SIGNING_AVAILABLE != 'true'
+        run: |
+          codesign --force --sign - "release/cterm-macos-universal.dmg"
+          codesign --verify --strict --verbose=2 "release/cterm-macos-universal.dmg"
+          codesign --force --options runtime --sign - "universal-binary/ctermd"
           codesign --verify --strict --verbose=2 "universal-binary/ctermd"
 
       - name: Clean up keychain
@@ -960,34 +1105,58 @@ jobs:
           mkdir -p release/ctermd-macos-universal
           cp universal-binary/ctermd release/ctermd-macos-universal/
           cp README.md LICENSE release/ctermd-macos-universal/
+          cp THIRD_PARTY_LICENSES.md release/ctermd-macos-universal/
+          cp -R LICENSES release/ctermd-macos-universal/
           cd release && tar -czvf ctermd-macos-universal.tar.gz ctermd-macos-universal
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd release
+          shasum -a 256 cterm-macos-universal.dmg > cterm-macos-universal.dmg.sha256
+          shasum -a 256 cterm-macos-universal.tar.gz > cterm-macos-universal.tar.gz.sha256
+          shasum -a 256 ctermd-macos-universal.tar.gz > ctermd-macos-universal.tar.gz.sha256
+
+      - name: Verify packaging contract
+        run: |
+          (cd release && shasum -a 256 --check cterm-macos-universal.dmg.sha256 cterm-macos-universal.tar.gz.sha256 ctermd-macos-universal.tar.gz.sha256)
+          bash scripts/verify_release_package.sh macos-app-tar release/cterm-macos-universal.tar.gz
+          bash scripts/verify_release_package.sh macos-dmg release/cterm-macos-universal.dmg
+          bash scripts/verify_release_package.sh daemon-tar release/ctermd-macos-universal.tar.gz ctermd-macos-universal
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
         with:
           name: cterm-macos-dmg
-          path: release/cterm-macos-universal.dmg
+          path: |
+            release/cterm-macos-universal.dmg
+            release/cterm-macos-universal.dmg.sha256
 
       - name: Upload tar.gz artifact
         uses: actions/upload-artifact@v7
         with:
           name: cterm-macos-universal
-          path: release/cterm-macos-universal.tar.gz
+          path: |
+            release/cterm-macos-universal.tar.gz
+            release/cterm-macos-universal.tar.gz.sha256
 
       - name: Upload ctermd tar.gz artifact
         uses: actions/upload-artifact@v7
         with:
           name: ctermd-macos-universal
-          path: release/ctermd-macos-universal.tar.gz
+          path: |
+            release/ctermd-macos-universal.tar.gz
+            release/ctermd-macos-universal.tar.gz.sha256
 
   release:
     name: Create Release
-    needs: [build-linux, build-linux-arm64, build-windows, build-macos-arm]
+    needs: [release-metadata, test-freebsd, build-linux, build-linux-arm64, build-windows, build-macos-arm]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -996,20 +1165,33 @@ jobs:
       - name: List artifacts
         run: find artifacts -type f
 
+      - name: Verify release asset manifest
+        run: bash scripts/verify_release_assets.sh artifacts
+
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/cterm-linux-x86_64/cterm-linux-x86_64.tar.gz
+            artifacts/cterm-linux-x86_64/cterm-linux-x86_64.tar.gz.sha256
             artifacts/cterm-linux-arm64/cterm-linux-arm64.tar.gz
+            artifacts/cterm-linux-arm64/cterm-linux-arm64.tar.gz.sha256
             artifacts/cterm-windows-x86_64/cterm-windows-x86_64.zip
+            artifacts/cterm-windows-x86_64/cterm-windows-x86_64.zip.sha256
             artifacts/cterm-windows-installer/cterm-windows-x86_64-setup.exe
+            artifacts/cterm-windows-installer/cterm-windows-x86_64-setup.exe.sha256
             artifacts/cterm-macos-universal/cterm-macos-universal.tar.gz
+            artifacts/cterm-macos-universal/cterm-macos-universal.tar.gz.sha256
             artifacts/cterm-macos-dmg/cterm-macos-universal.dmg
+            artifacts/cterm-macos-dmg/cterm-macos-universal.dmg.sha256
             artifacts/ctermd-linux-x86_64/ctermd-linux-x86_64.tar.gz
+            artifacts/ctermd-linux-x86_64/ctermd-linux-x86_64.tar.gz.sha256
             artifacts/ctermd-linux-arm64/ctermd-linux-arm64.tar.gz
+            artifacts/ctermd-linux-arm64/ctermd-linux-arm64.tar.gz.sha256
             artifacts/ctermd-windows-x86_64/ctermd-windows-x86_64.zip
+            artifacts/ctermd-windows-x86_64/ctermd-windows-x86_64.zip.sha256
             artifacts/ctermd-macos-universal/ctermd-macos-universal.tar.gz
+            artifacts/ctermd-macos-universal/ctermd-macos-universal.tar.gz.sha256
           draft: false
           prerelease: false
           generate_release_notes: true
