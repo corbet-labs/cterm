@@ -5,12 +5,14 @@
 //! interface.
 
 pub mod events;
+pub mod pane;
 pub mod sprite;
 pub mod theme;
 pub mod traits;
 pub mod utils;
 
 pub use events::*;
+pub use pane::*;
 pub use theme::*;
 pub use traits::*;
 pub use utils::*;
