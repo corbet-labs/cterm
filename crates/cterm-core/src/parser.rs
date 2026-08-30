@@ -672,7 +672,7 @@ impl vte::Perform for ScreenPerformer<'_> {
             }
             // Set/query 256-color palette entries.
             4 => {
-                for pair in params[1..].chunks_exact(2) {
+                for pair in params[1..].as_chunks::<2>().0 {
                     let Ok(index) = std::str::from_utf8(pair[0]).unwrap_or("").parse::<u8>() else {
                         continue;
                     };
