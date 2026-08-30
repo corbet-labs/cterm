@@ -669,7 +669,7 @@ mod windows {
     };
     use winapi::um::synchapi::WaitForSingleObject;
     use winapi::um::winbase::{
-        EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTUPINFOEXW, WAIT_OBJECT_0,
+        EXTENDED_STARTUPINFO_PRESENT, INFINITE, STARTF_USESTDHANDLES, STARTUPINFOEXW, WAIT_OBJECT_0,
     };
     use winapi::um::wincon::COORD;
     use winapi::um::winnt::HANDLE;
@@ -893,8 +893,8 @@ mod windows {
             let mut attr_list_size: usize = 0;
             InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_list_size);
 
-            let attr_list = vec![0u8; attr_list_size];
-            let attr_list_ptr = attr_list.as_ptr() as *mut _;
+            let mut attr_list = vec![0u8; attr_list_size];
+            let attr_list_ptr = attr_list.as_mut_ptr() as *mut _;
 
             if InitializeProcThreadAttributeList(attr_list_ptr, 1, 0, &mut attr_list_size) == FALSE
             {
@@ -923,13 +923,20 @@ mod windows {
 
             let mut startup_info: STARTUPINFOEXW = std::mem::zeroed();
             startup_info.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            // Prevent Windows from supplying redirected parent standard handles.
+            // A console child can otherwise bypass the pseudoconsole even though
+            // ordinary handle inheritance is disabled.
+            startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+            startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+            startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
             startup_info.lpAttributeList = attr_list_ptr;
 
             // Determine command to run
             let command = config.shell.clone().unwrap_or_else(get_default_shell);
             let cmd_line = windows_command_line(&command, &config.args);
 
-            let cmd_wide: Vec<u16> = OsStr::new(&cmd_line)
+            let mut cmd_wide: Vec<u16> = OsStr::new(&cmd_line)
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect();
@@ -951,7 +958,7 @@ mod windows {
 
             let result = CreateProcessW(
                 ptr::null(),
-                cmd_wide.as_ptr() as *mut _,
+                cmd_wide.as_mut_ptr(),
                 ptr::null_mut(),
                 ptr::null_mut(),
                 FALSE,
