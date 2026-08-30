@@ -87,6 +87,11 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Replace the palette used for daemon-authoritative OSC color replies.
+    pub fn set_base_palette(&self, palette: cterm_core::ColorPalette) {
+        self.terminal.write().set_base_palette(palette);
+    }
+
     /// Create a new session with the given configuration
     #[allow(clippy::too_many_arguments)]
     pub fn new(

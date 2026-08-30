@@ -165,6 +165,7 @@ enum DaemonCommand {
     SetTitle(String),
     SetTabColor(String),
     SetTemplateName(String),
+    SetPalette(cterm_core::ColorPalette),
 }
 
 /// Terminal view state
@@ -1483,7 +1484,11 @@ impl TerminalView {
             reported_keys: RefCell::new(HashMap::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
-            color_palette: theme.colors.clone(),
+            color_palette: {
+                let mut palette = theme.colors.clone();
+                palette.cursor = theme.cursor.color;
+                palette
+            },
             daemon_cmd_tx: RefCell::new(None),
             daemon_socket: RefCell::new(None),
         });
@@ -1520,8 +1525,10 @@ impl TerminalView {
         );
         let (cell_width, cell_height) = renderer.cell_size();
 
+        let mut base_palette = theme.colors.clone();
+        base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
-        terminal.set_base_palette(theme.colors.clone());
+        terminal.set_base_palette(base_palette.clone());
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
@@ -1558,7 +1565,14 @@ impl TerminalView {
         // Start daemon I/O thread — owns the connection, handles reads and writes
         let state_clone = state.clone();
         std::thread::spawn(move || {
-            Self::read_daemon_loop(sid, terminal, state_clone, cmd_rx, daemon_socket);
+            Self::read_daemon_loop(
+                sid,
+                terminal,
+                state_clone,
+                cmd_rx,
+                daemon_socket,
+                base_palette,
+            );
         });
 
         this.schedule_redraw_check(view_ptr, state);
@@ -1584,8 +1598,10 @@ impl TerminalView {
         );
         let (cell_width, cell_height) = renderer.cell_size();
 
+        let mut base_palette = theme.colors.clone();
+        base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
-        terminal.set_base_palette(theme.colors.clone());
+        terminal.set_base_palette(base_palette.clone());
         terminal.screen_mut().set_cell_height_hint(cell_height);
         terminal.screen_mut().set_cell_width_hint(cell_width);
 
@@ -1625,7 +1641,14 @@ impl TerminalView {
         // Start daemon I/O thread — owns the connection, handles reads and writes
         let state_clone = state.clone();
         std::thread::spawn(move || {
-            Self::read_daemon_loop(sid, terminal, state_clone, cmd_rx, daemon_socket);
+            Self::read_daemon_loop(
+                sid,
+                terminal,
+                state_clone,
+                cmd_rx,
+                daemon_socket,
+                base_palette,
+            );
         });
 
         this.schedule_redraw_check(view_ptr, state);
@@ -1650,6 +1673,7 @@ impl TerminalView {
         state: Arc<ViewState>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
         daemon_socket: Option<std::path::PathBuf>,
+        base_palette: cterm_core::ColorPalette,
     ) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1686,6 +1710,10 @@ impl TerminalView {
                     return;
                 }
             };
+
+            if let Err(error) = session.set_base_palette(&base_palette).await {
+                log::warn!("Failed to synchronize frontend palette with daemon: {error}");
+            }
 
             // Spawn command handler — drains write/resize/destroy commands and forwards to daemon
             let cmd_session = session.clone();
@@ -1787,6 +1815,11 @@ impl TerminalView {
                             if let Err(e) = cmd_session.set_metadata(None, None, Some(&name)).await
                             {
                                 log::error!("Failed to set template name: {}", e);
+                            }
+                        }
+                        DaemonCommand::SetPalette(palette) => {
+                            if let Err(error) = cmd_session.set_base_palette(&palette).await {
+                                log::error!("Failed to update daemon palette: {error}");
                             }
                         }
                     }
@@ -2056,7 +2089,13 @@ impl TerminalView {
         if let Some(background) = color.and_then(cterm_core::Rgb::from_hex) {
             palette.background = background;
         }
-        self.ivars().terminal.lock().set_base_palette(palette);
+        self.ivars()
+            .terminal
+            .lock()
+            .set_base_palette(palette.clone());
+        if let Some(sender) = self.ivars().daemon_cmd_tx.borrow().as_ref() {
+            let _ = sender.send(DaemonCommand::SetPalette(palette));
+        }
     }
 
     /// Check if the title is locked (user-set or template-set)

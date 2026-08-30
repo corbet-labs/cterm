@@ -171,21 +171,13 @@ impl TerminalWidget {
     /// Set an optional background color override (hex string like "#1a1b26")
     #[allow(dead_code)]
     pub fn set_background_override(&self, color: Option<&str>) {
-        let rgb = color.and_then(|hex| {
-            let hex = hex.trim_start_matches('#');
-            if hex.len() == 6 {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                Some(cterm_core::color::Rgb::new(r, g, b))
-            } else {
-                None
-            }
-        });
+        let rgb = color.and_then(parse_rgb);
         *self.background_override.borrow_mut() = rgb;
-        self.terminal
-            .lock()
-            .set_base_palette(frontend_palette(&self.theme, rgb));
+        let palette = frontend_palette(&self.theme, rgb);
+        self.terminal.lock().set_base_palette(palette.clone());
+        if let Some(sender) = &self.daemon_cmd_tx {
+            let _ = sender.send(DaemonCommand::SetPalette(palette));
+        }
         // Trigger redraw to apply new background
         self.drawing_area.queue_draw();
     }
@@ -1393,7 +1385,7 @@ impl TerminalWidget {
         widget.setup_drawing();
         widget.setup_input();
         widget.setup_drop();
-        widget.setup_daemon_reader(sid, cmd_rx, daemon_socket);
+        widget.setup_daemon_reader(sid, cmd_rx, daemon_socket, frontend_palette(theme, None));
         widget.setup_daemon_resize(cmd_tx);
 
         widget
@@ -1470,7 +1462,7 @@ impl TerminalWidget {
         widget.setup_drawing();
         widget.setup_input();
         widget.setup_drop();
-        widget.setup_daemon_reader(sid, cmd_rx, daemon_socket);
+        widget.setup_daemon_reader(sid, cmd_rx, daemon_socket, frontend_palette(theme, None));
         widget.setup_daemon_resize(cmd_tx);
 
         widget
@@ -1489,6 +1481,7 @@ impl TerminalWidget {
         session_id: String,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
         daemon_socket: Option<std::path::PathBuf>,
+        base_palette: ColorPalette,
     ) {
         let drawing_area = self.drawing_area.clone();
 
@@ -1530,6 +1523,10 @@ impl TerminalWidget {
                         return;
                     }
                 };
+
+                if let Err(error) = session.set_base_palette(&base_palette).await {
+                    log::warn!("Failed to synchronize frontend palette with daemon: {error}");
+                }
 
                 // Spawn command handler — drains write/resize/destroy commands and forwards to daemon
                 let cmd_session = session.clone();
@@ -1653,6 +1650,11 @@ impl TerminalWidget {
                             DaemonCommand::ClearAlert => {
                                 if let Err(e) = cmd_session.clear_alert().await {
                                     log::error!("Failed to clear alert: {}", e);
+                                }
+                            }
+                            DaemonCommand::SetPalette(palette) => {
+                                if let Err(error) = cmd_session.set_base_palette(&palette).await {
+                                    log::error!("Failed to update daemon palette: {error}");
                                 }
                             }
                         }
@@ -1798,9 +1800,6 @@ impl TerminalWidget {
                                 }
                                 TerminalEvent::ContentChanged => content_changed = true,
                                 TerminalEvent::ProcessExited(_) => {}
-                                // process_mirror already answered this through
-                                // the daemon write callback.
-                                TerminalEvent::ColorQuery { .. } => {}
                             }
                         }
 
@@ -1939,6 +1938,7 @@ enum DaemonCommand {
     SetTabColor(String),
     SetTemplateName(String),
     ClearAlert,
+    SetPalette(ColorPalette),
 }
 
 /// Rendering parameters for draw_terminal
@@ -2247,13 +2247,25 @@ fn draw_terminal(
     }
 }
 
-fn frontend_palette(theme: &Theme, background: Option<Rgb>) -> ColorPalette {
+pub(crate) fn frontend_palette(theme: &Theme, background: Option<Rgb>) -> ColorPalette {
     let mut palette = theme.colors.clone();
     palette.cursor = theme.cursor.color;
     if let Some(background) = background {
         palette.background = background;
     }
     palette
+}
+
+pub(crate) fn parse_rgb(hex: &str) -> Option<Rgb> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    Some(Rgb::new(
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
 }
 
 fn draw_cell_decorations(

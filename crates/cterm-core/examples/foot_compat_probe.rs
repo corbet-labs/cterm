@@ -67,6 +67,12 @@ mod unix {
             ("sync-mode", b"\x1b[?2026$p", b"y"),
             ("reverse-wrap", b"\x1b[?45$p", b"y"),
             ("terminfo-am", b"\x1bP+q616d\x1b\\", b"\x1b\\"),
+            (
+                "palette-stack",
+                b"\x1b]10;#112233\x1b\\\x1b[#P\x1b]10;#445566\x1b\\\x1b[#Q\x1b]10;?\x1b\\",
+                b"\x1b\\",
+            ),
+            ("palette-stack-status", b"\x1b[#P\x1b[#R\x1b[#Q", b"#Q"),
         ];
 
         let mut report = String::new();
@@ -81,7 +87,7 @@ mod unix {
             report.push('\n');
         }
 
-        stdout.write_all(b"\x1b[0m\x1b[r\x1b[H")?;
+        stdout.write_all(b"\x1b[0m\x1b[r\x1b[H\x1b]110\x1b\\")?;
         stdout.flush()?;
         fs::write(output_path, report)?;
         Ok(())

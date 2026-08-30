@@ -5,7 +5,7 @@ pub mod events;
 pub mod key;
 pub mod screen;
 
-pub use color::{color_to_proto, proto_to_color};
+pub use color::{color_to_proto, palette_to_proto, proto_to_color, proto_to_palette};
 pub use events::event_to_proto;
 pub use key::{key_to_proto, modifiers_to_proto, proto_to_key, proto_to_modifiers};
 pub use screen::{

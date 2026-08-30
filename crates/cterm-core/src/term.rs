@@ -24,11 +24,6 @@ pub enum TerminalEvent {
     ContentChanged,
     /// Clipboard operation requested (OSC 52)
     ClipboardRequest(ClipboardOperation),
-    /// Frontend theme or palette color requested through OSC 4/10-12.
-    ColorQuery {
-        target: ColorQuery,
-        dynamic_color: Option<crate::color::Rgb>,
-    },
 }
 
 /// Terminal configuration
@@ -150,8 +145,6 @@ impl Terminal {
             }
         }
 
-        self.answer_color_queries(&events);
-
         events
     }
 
@@ -159,7 +152,6 @@ impl Terminal {
     /// query replies a second time. The daemon is the authoritative responder.
     pub fn process_mirror(&mut self, data: &[u8]) -> Vec<TerminalEvent> {
         let (events, _responses) = self.process_collecting(data);
-        self.answer_color_queries(&events);
         events
     }
 
@@ -187,7 +179,7 @@ impl Terminal {
         }
 
         // Collect any pending responses for the caller to write back to the PTY
-        let responses = if self.screen.has_pending_responses() {
+        let mut responses = if self.screen.has_pending_responses() {
             self.screen.take_pending_responses()
         } else {
             Vec::new()
@@ -202,10 +194,8 @@ impl Terminal {
 
         if self.screen.has_color_queries() {
             for (target, dynamic_color) in self.screen.take_color_queries() {
-                events.push(TerminalEvent::ColorQuery {
-                    target,
-                    dynamic_color,
-                });
+                let color = dynamic_color.unwrap_or_else(|| self.screen.base_query_color(target));
+                responses.push(Self::color_query_response(target, color));
             }
         }
 
@@ -238,29 +228,12 @@ impl Terminal {
         (events, responses)
     }
 
-    fn answer_color_queries(&mut self, events: &[TerminalEvent]) {
-        if !self.screen.has_base_palette() {
-            return;
-        }
-
-        for event in events {
-            let TerminalEvent::ColorQuery {
-                target,
-                dynamic_color,
-            } = event
-            else {
-                continue;
-            };
-            let color = dynamic_color.unwrap_or_else(|| self.screen.base_query_color(*target));
-            let response = match target {
-                ColorQuery::Palette(index) => {
-                    format!("\x1b]4;{index};{}\x1b\\", color.to_osc_spec())
-                }
-                _ => format!("\x1b]{};{}\x1b\\", target.osc_code(), color.to_osc_spec()),
-            };
-            if let Err(error) = self.write(response.as_bytes()) {
-                log::error!("Failed to answer OSC color query: {}", error);
+    fn color_query_response(target: ColorQuery, color: crate::color::Rgb) -> Vec<u8> {
+        match target {
+            ColorQuery::Palette(index) => {
+                format!("\x1b]4;{index};{}\x1b\\", color.to_osc_spec()).into_bytes()
             }
+            _ => format!("\x1b]{};{}\x1b\\", target.osc_code(), color.to_osc_spec()).into_bytes(),
         }
     }
 
@@ -1101,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_mirror_answers_theme_color_queries_in_the_frontend() {
+    fn daemon_mirror_never_answers_theme_color_queries_in_the_frontend() {
         use crate::color::{ColorPalette, Rgb};
 
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -1119,35 +1092,24 @@ mod tests {
 
         term.process_mirror(b"\x1b]10;?\x1b\\\x1b]11;?\x07\x1b]12;?\x1b\\");
 
-        assert_eq!(
-            writes.lock().unwrap().as_slice(),
-            b"\x1b]10;rgb:1212/3434/5656\x1b\\\
-              \x1b]11;rgb:7878/9a9a/bcbc\x1b\\\
-              \x1b]12;rgb:dede/f0f0/1111\x1b\\"
-        );
+        assert!(writes.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn daemon_mirror_answers_palette_queries_in_stream_order() {
+    fn daemon_authority_returns_palette_queries_in_stream_order() {
         use crate::color::{ColorPalette, Rgb};
 
-        let writes = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&writes);
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
         let mut palette = ColorPalette::default_dark();
         palette.ansi[1] = Rgb::new(0x10, 0x20, 0x30);
         term.set_base_palette(palette);
-        term.set_write_fn(Box::new(move |data| {
-            observed.lock().unwrap().extend_from_slice(data);
-            Ok(())
-        }));
 
-        term.process_mirror(
+        let (_, responses) = term.process_collecting(
             b"\x1b]4;1;?;200;?\x1b\\\x1b]4;1;#abc;1;?\x1b\\\x1b]104;1\x1b\\\x1b]4;1;?\x1b\\",
         );
 
         assert_eq!(
-            writes.lock().unwrap().as_slice(),
+            responses.concat().as_slice(),
             b"\x1b]4;1;rgb:1010/2020/3030\x1b\\\
               \x1b]4;200;rgb:ffff/0000/d7d7\x1b\\\
               \x1b]4;1;rgb:aaaa/bbbb/cccc\x1b\\\
@@ -1156,26 +1118,20 @@ mod tests {
     }
 
     #[test]
-    fn color_query_replies_preserve_stream_order() {
+    fn daemon_color_query_replies_preserve_stream_order() {
         use crate::color::{ColorPalette, Rgb};
 
-        let writes = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&writes);
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
         let mut palette = ColorPalette::default_dark();
         palette.foreground = Rgb::new(0x12, 0x34, 0x56);
         term.set_base_palette(palette);
-        term.set_write_fn(Box::new(move |data| {
-            observed.lock().unwrap().extend_from_slice(data);
-            Ok(())
-        }));
 
-        term.process_mirror(
+        let (_, responses) = term.process_collecting(
             b"\x1b]10;?\x1b\\\x1b]10;#abc\x1b\\\x1b]10;?\x1b\\\x1b]110\x1b\\\x1b]10;?\x1b\\",
         );
 
         assert_eq!(
-            writes.lock().unwrap().as_slice(),
+            responses.concat().as_slice(),
             b"\x1b]10;rgb:1212/3434/5656\x1b\\\
               \x1b]10;rgb:aaaa/bbbb/cccc\x1b\\\
               \x1b]10;rgb:1212/3434/5656\x1b\\"
@@ -1183,19 +1139,22 @@ mod tests {
     }
 
     #[test]
-    fn daemon_authority_does_not_answer_ui_color_queries() {
+    fn daemon_authority_answers_color_queries_without_a_frontend() {
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
 
         let (events, responses) = term.process_collecting(b"\x1b]10;?\x1b\\");
 
-        assert!(responses.is_empty());
-        assert!(events.iter().any(|event| matches!(
-            event,
-            TerminalEvent::ColorQuery {
-                target: ColorQuery::Foreground,
-                dynamic_color: None,
-            }
-        )));
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0],
+            Terminal::color_query_response(
+                ColorQuery::Foreground,
+                ColorPalette::default().foreground
+            )
+        );
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, TerminalEvent::ContentChanged)));
     }
 
     #[test]

@@ -461,16 +461,18 @@ pub struct Screen {
     pending_clipboard_ops: Vec<ClipboardOperation>,
     /// Pending color queries (OSC 4 and OSC 10-12)
     pending_color_queries: Vec<(ColorQuery, Option<Rgb>)>,
-    /// UI theme used when replying to color queries. The headless daemon does
-    /// not set this; the attached frontend is authoritative for theme colors.
+    /// Frontend theme used for authoritative OSC color-query replies.
     base_palette: ColorPalette,
-    base_palette_configured: bool,
     /// Application-provided overrides from OSC 10-12.
     dynamic_foreground: Option<Rgb>,
     dynamic_background: Option<Rgb>,
     dynamic_cursor: Option<Rgb>,
     /// Application-provided overrides from OSC 4, indexed by palette entry.
     dynamic_palette: [Option<Rgb>; 256],
+    /// xterm color-palette stack. The index is one-based, matching the wire
+    /// protocol; zero means no current entry.
+    color_stack: Vec<DynamicColorState>,
+    color_stack_index: usize,
     /// Shell-reported working directory from OSC 7.
     current_working_directory: Option<PathBuf>,
     /// Current text selection (if any)
@@ -496,6 +498,14 @@ pub struct Screen {
     /// Incremented whenever an application starts (or restarts) a synchronized
     /// update, allowing Terminal to re-arm its fail-safe deadline.
     sync_update_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicColorState {
+    foreground: Option<Rgb>,
+    background: Option<Rgb>,
+    cursor: Option<Rgb>,
+    palette: Box<[Option<Rgb>; 256]>,
 }
 
 /// Reflowed physical rows plus a mapping from old cell coordinates to their
@@ -665,11 +675,12 @@ impl Screen {
             pending_clipboard_ops: Vec::new(),
             pending_color_queries: Vec::new(),
             base_palette: ColorPalette::default(),
-            base_palette_configured: false,
             dynamic_foreground: None,
             dynamic_background: None,
             dynamic_cursor: None,
             dynamic_palette: [None; 256],
+            color_stack: Vec::new(),
+            color_stack_index: 0,
             current_working_directory: None,
             selection: None,
             images: HashMap::new(),
@@ -807,13 +818,6 @@ impl Screen {
     /// Set the frontend's configured palette for OSC query replies.
     pub fn set_base_palette(&mut self, palette: ColorPalette) {
         self.base_palette = palette;
-        self.base_palette_configured = true;
-    }
-
-    /// Whether this terminal mirror has a frontend palette and may answer OSC
-    /// color queries. The daemon intentionally leaves this false.
-    pub fn has_base_palette(&self) -> bool {
-        self.base_palette_configured
     }
 
     /// Set or reset an application-provided default color.
@@ -882,6 +886,64 @@ impl Screen {
             .iter()
             .enumerate()
             .filter_map(|(index, color)| color.map(|color| (index as u8, color)))
+    }
+
+    fn dynamic_color_state(&self) -> DynamicColorState {
+        DynamicColorState {
+            foreground: self.dynamic_foreground,
+            background: self.dynamic_background,
+            cursor: self.dynamic_cursor,
+            palette: Box::new(self.dynamic_palette),
+        }
+    }
+
+    /// Save the active application palette in an xterm color-stack slot.
+    /// Slot zero means the entry after the current one; explicit slots are
+    /// one-based and capped at xterm/foot's 128-entry limit.
+    pub(crate) fn push_color_palette(&mut self, slot: usize) {
+        const MAX_COLOR_STACK_DEPTH: usize = 128;
+
+        let slot = if slot == 0 {
+            self.color_stack_index.saturating_add(1)
+        } else {
+            slot
+        }
+        .min(MAX_COLOR_STACK_DEPTH);
+        let state = self.dynamic_color_state();
+
+        if self.color_stack.len() < slot {
+            self.color_stack.resize(slot, state.clone());
+        }
+        self.color_stack_index = slot;
+        self.color_stack[slot - 1] = state;
+    }
+
+    /// Restore an xterm color-stack slot. Slot zero pops the current entry.
+    pub(crate) fn pop_color_palette(&mut self, slot: usize) {
+        let slot = if slot == 0 {
+            self.color_stack_index
+        } else {
+            slot
+        };
+        let Some(state) = slot
+            .checked_sub(1)
+            .and_then(|index| self.color_stack.get(index))
+            .cloned()
+        else {
+            return;
+        };
+
+        self.color_stack_index = slot - 1;
+        self.dynamic_foreground = state.foreground;
+        self.dynamic_background = state.background;
+        self.dynamic_cursor = state.cursor;
+        self.dynamic_palette = *state.palette;
+        self.dirty = true;
+    }
+
+    /// Return the current one-based xterm color-stack entry and allocated size.
+    pub(crate) fn color_palette_stack_status(&self) -> (usize, usize) {
+        (self.color_stack_index, self.color_stack.len())
     }
 
     /// Return one queried color from the frontend's configured palette.
@@ -2017,6 +2079,8 @@ impl Screen {
         self.dynamic_background = None;
         self.dynamic_cursor = None;
         self.dynamic_palette.fill(None);
+        self.color_stack.clear();
+        self.color_stack_index = 0;
         self.drcs_fonts.clear();
         self.keyboard_main_stack.clear();
         self.keyboard_alt_stack.clear();

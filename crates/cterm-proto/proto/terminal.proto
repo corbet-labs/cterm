@@ -20,6 +20,7 @@ service TerminalService {
   // Session Metadata
   rpc SetSessionTitle(SetSessionTitleRequest) returns (SetSessionTitleResponse);
   rpc SetSessionMetadata(SetSessionMetadataRequest) returns (SetSessionMetadataResponse);
+  rpc SetSessionPalette(SetSessionPaletteRequest) returns (SetSessionPaletteResponse);
 
   // Input
   rpc WriteInput(WriteInputRequest) returns (WriteInputResponse);
@@ -155,6 +156,10 @@ message CreateSessionRequest {
   // conservative cell-size fallback for older clients.
   uint32 pixel_width = 9;
   uint32 pixel_height = 10;
+
+  // Frontend palette used by the daemon to answer OSC 4/10-12 queries from
+  // the first byte of process output. Omitted by older/non-visual clients.
+  FrontendPalette base_palette = 11;
 }
 
 message CreateSessionResponse {
@@ -266,6 +271,24 @@ message SetSessionMetadataRequest {
 }
 
 message SetSessionMetadataResponse {
+  bool success = 1;
+}
+
+// Complete frontend palette. The ANSI array must contain exactly 16 colors.
+message FrontendPalette {
+  repeated Rgb ansi = 1;
+  Rgb foreground = 2;
+  Rgb background = 3;
+  Rgb cursor = 4;
+  Rgb selection = 5;
+}
+
+message SetSessionPaletteRequest {
+  string session_id = 1;
+  FrontendPalette palette = 2;
+}
+
+message SetSessionPaletteResponse {
   bool success = 1;
 }
 

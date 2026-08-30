@@ -703,6 +703,7 @@ impl WindowState {
         if opts.pixel_height == 0 {
             opts.pixel_height = pixel_height;
         }
+        opts.base_palette = Some(terminal_palette(&self.theme, background_color.as_deref()));
 
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
@@ -794,8 +795,9 @@ impl WindowState {
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
+        let base_palette = terminal_palette(&self.theme, None);
         let mut terminal = Terminal::new(cols, rows, screen_config);
-        terminal.set_base_palette(terminal_palette(&self.theme, None));
+        terminal.set_base_palette(base_palette.clone());
 
         // Apply screen snapshot if available
         if let Some(ref screen_data) = screen_snapshot {
@@ -862,6 +864,7 @@ impl WindowState {
             rows as u32,
             cmd_rx,
             None, // local sessions only for now
+            base_palette,
         );
 
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -2812,6 +2815,7 @@ fn start_daemon_attach_thread(
     rows: u32,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCmd>,
     daemon_socket: Option<std::path::PathBuf>,
+    base_palette: ColorPalette,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -2854,6 +2858,10 @@ fn start_daemon_attach_thread(
                     return;
                 }
             };
+
+            if let Err(error) = session.set_base_palette(&base_palette).await {
+                log::warn!("Failed to synchronize frontend palette with daemon: {error}");
+            }
 
             run_daemon_io_loop(hwnd, tab_id, terminal, session, cmd_rx).await;
         });

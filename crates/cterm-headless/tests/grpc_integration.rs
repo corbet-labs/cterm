@@ -397,6 +397,7 @@ async fn test_create_and_list_sessions() {
             ssh: None,
             pixel_width: 0,
             pixel_height: 0,
+            base_palette: None,
         })
         .await
         .expect("create_session failed");
@@ -450,6 +451,7 @@ async fn test_get_session() {
             ssh: None,
             pixel_width: 0,
             pixel_height: 0,
+            base_palette: None,
         })
         .await
         .expect("create_session failed");
@@ -500,6 +502,7 @@ async fn test_write_input_and_get_screen() {
             ssh: None,
             pixel_width: 0,
             pixel_height: 0,
+            base_palette: None,
         })
         .await
         .expect("create_session failed");
@@ -569,6 +572,7 @@ async fn test_resize() {
             ssh: None,
             pixel_width: 640,
             pixel_height: 384,
+            base_palette: None,
         })
         .await
         .expect("create_session failed");
@@ -628,6 +632,7 @@ async fn test_get_cursor() {
             ssh: None,
             pixel_width: 0,
             pixel_height: 0,
+            base_palette: None,
         })
         .await
         .expect("create_session failed");
@@ -676,6 +681,7 @@ async fn test_get_screen_full() {
             ssh: None,
             pixel_width: 0,
             pixel_height: 0,
+            base_palette: None,
         })
         .await
         .expect("create_session failed");
@@ -730,6 +736,7 @@ async fn test_multiple_sessions() {
                 ssh: None,
                 pixel_width: 0,
                 pixel_height: 0,
+                base_palette: None,
             })
             .await
             .expect("create_session failed");

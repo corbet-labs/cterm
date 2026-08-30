@@ -1164,6 +1164,20 @@ impl vte::Perform for ScreenPerformer<'_> {
                 };
                 self.screen.set_keyboard_enhancement_flags(flags);
             }
+            // Save the current xterm color palette (XTPUSHCOLORS).
+            ('P', [b'#']) => {
+                self.screen.push_color_palette(first_param(&params_vec, 0));
+            }
+            // Restore an xterm color palette (XTPOPCOLORS).
+            ('Q', [b'#']) => {
+                self.screen.pop_color_palette(first_param(&params_vec, 0));
+            }
+            // Report current and allocated xterm color-stack slots.
+            ('R', [b'#']) => {
+                let (current, size) = self.screen.color_palette_stack_status();
+                self.screen
+                    .queue_response(format!("\x1b[?{current};{size}#Q").into_bytes());
+            }
             // Save DEC private modes (XTSAVE).
             ('s', [b'?']) => {
                 for &mode in &params_vec {
@@ -2483,6 +2497,58 @@ mod tests {
 
         assert_eq!(screen.dynamic_palette_colors().count(), 0);
         assert!(screen.take_color_queries().is_empty());
+    }
+
+    #[test]
+    fn test_xterm_color_stack_restores_dynamic_palette_like_foot() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]10;#112233\x1b\\\x1b]4;200;#123456\x1b\\\x1b[#P",
+        );
+        parser.parse(
+            &mut screen,
+            b"\x1b]10;#445566\x1b\\\x1b]4;200;#abcdef\x1b\\\x1b[3#P",
+        );
+        parser.parse(&mut screen, b"\x1b]10;#778899\x1b\\\x1b[#R\x1b[#Q");
+
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[?3;3#Q".to_vec()]
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Foreground),
+            Some(Rgb::new(0x44, 0x55, 0x66))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Palette(200)),
+            Some(Rgb::new(0xab, 0xcd, 0xef))
+        );
+
+        // Slot two was initialized from the same active palette when the
+        // explicit third slot grew the stack. Two further pops restore slot
+        // two and then the original slot one while retaining allocated slots.
+        parser.parse(&mut screen, b"\x1b[#Q\x1b[#Q\x1b[#R");
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Foreground),
+            Some(Rgb::new(0x11, 0x22, 0x33))
+        );
+        assert_eq!(
+            screen.dynamic_color(ColorQuery::Palette(200)),
+            Some(Rgb::new(0x12, 0x34, 0x56))
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[?0;3#Q".to_vec()]
+        );
+
+        parser.parse(&mut screen, b"\x1b[128#P\x1b[999#P\x1b[#R\x1bc\x1b[#R");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[?128;128#Q".to_vec(), b"\x1b[?0;0#Q".to_vec()]
+        );
     }
 
     #[test]

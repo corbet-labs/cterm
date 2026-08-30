@@ -21,7 +21,7 @@ use crate::menu;
 use crate::notification_bar::NotificationBar;
 use crate::quick_open::QuickOpenOverlay;
 use crate::tab_bar::TabBar;
-use crate::terminal_widget::{CellDimensions, TerminalWidget};
+use crate::terminal_widget::{frontend_palette, parse_rgb, CellDimensions, TerminalWidget};
 
 /// Tab entry tracking terminal and its ID
 struct TabEntry {
@@ -2662,6 +2662,10 @@ fn spawn_daemon_tab(
     remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
     daemon_socket: Option<std::path::PathBuf>,
 ) {
+    opts.base_palette = Some(frontend_palette(
+        theme,
+        background_color.as_deref().and_then(parse_rgb),
+    ));
     if opts.pixel_width == 0 || opts.pixel_height == 0 {
         let cell_dims = calculate_initial_cell_dimensions(&config.borrow());
         opts.pixel_width = (cell_dims.width * opts.cols.max(1) as f64)

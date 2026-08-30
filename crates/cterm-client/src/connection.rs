@@ -245,6 +245,8 @@ pub struct CreateSessionOpts {
     pub term: Option<String>,
     /// When set, the daemon opens a native SSH session instead of a local shell.
     pub ssh: Option<SshParams>,
+    /// Active frontend palette for authoritative OSC color-query replies.
+    pub base_palette: Option<cterm_core::ColorPalette>,
 }
 
 /// Connection to a ctermd instance
@@ -775,6 +777,10 @@ impl DaemonConnection {
                 ssh: opts.ssh,
                 pixel_width: opts.pixel_width,
                 pixel_height: opts.pixel_height,
+                base_palette: opts
+                    .base_palette
+                    .as_ref()
+                    .map(cterm_proto::convert::palette_to_proto),
             })
             .await?;
 

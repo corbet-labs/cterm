@@ -7,8 +7,6 @@ use cterm_core::screen::{
 use cterm_core::term::TerminalEvent as CoreEvent;
 
 /// Convert a wire-visible cterm_core event to its protocol representation.
-/// Theme color queries are answered by the frontend that sees the raw PTY
-/// stream and therefore are intentionally not broadcast by ctermd.
 pub fn event_to_proto(event: &CoreEvent) -> Option<proto::TerminalEvent> {
     use proto::terminal_event::Event;
 
@@ -40,7 +38,6 @@ pub fn event_to_proto(event: &CoreEvent) -> Option<proto::TerminalEvent> {
                 data,
             })
         }
-        CoreEvent::ColorQuery { .. } => return None,
     };
 
     Some(proto::TerminalEvent { event: Some(event) })
@@ -91,14 +88,5 @@ mod tests {
             }
             _ => panic!("Expected ProcessExited event"),
         }
-    }
-
-    #[test]
-    fn color_queries_are_frontend_local() {
-        assert!(event_to_proto(&CoreEvent::ColorQuery {
-            target: cterm_core::ColorQuery::Foreground,
-            dynamic_color: None,
-        })
-        .is_none());
     }
 }

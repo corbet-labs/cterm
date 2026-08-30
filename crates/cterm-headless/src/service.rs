@@ -2,8 +2,8 @@
 
 use crate::convert::{
     cell_to_proto, cursor_to_proto, event_to_proto, modes_to_proto, proto_to_key,
-    proto_to_modifiers, screen_to_proto, screen_to_text, terminal_images_to_proto,
-    visible_rows_to_proto,
+    proto_to_modifiers, proto_to_palette, screen_to_proto, screen_to_text,
+    terminal_images_to_proto, visible_rows_to_proto,
 };
 use crate::proto::terminal_service_server::TerminalService;
 use crate::proto::*;
@@ -88,6 +88,14 @@ impl TerminalService for TerminalServiceImpl {
     ) -> Result<Response<CreateSessionResponse>, Status> {
         let req = request.into_inner();
 
+        let base_palette = match req.base_palette.as_ref() {
+            Some(palette) => Some(
+                proto_to_palette(palette)
+                    .ok_or_else(|| Status::invalid_argument("invalid frontend palette"))?,
+            ),
+            None => None,
+        };
+
         let cols = req.cols.max(1) as usize;
         let rows = req.rows.max(1) as usize;
         let size = cterm_core::PtySize {
@@ -134,7 +142,7 @@ impl TerminalService for TerminalServiceImpl {
 
             let session = self
                 .session_manager
-                .create_ssh_session_with_size(size, ssh_config)
+                .create_ssh_session_with_size_and_palette(size, ssh_config, base_palette)
                 .map_err(Status::from)?;
 
             return Ok(Response::new(CreateSessionResponse {
@@ -148,13 +156,14 @@ impl TerminalService for TerminalServiceImpl {
 
         let session = self
             .session_manager
-            .create_session_with_size(
+            .create_session_with_size_and_palette(
                 size,
                 req.shell,
                 req.args,
                 req.cwd.map(PathBuf::from),
                 env,
                 req.term,
+                base_palette,
             )
             .map_err(Status::from)?;
 
@@ -283,6 +292,24 @@ impl TerminalService for TerminalServiceImpl {
         }
 
         Ok(Response::new(SetSessionMetadataResponse { success: true }))
+    }
+
+    async fn set_session_palette(
+        &self,
+        request: Request<SetSessionPaletteRequest>,
+    ) -> Result<Response<SetSessionPaletteResponse>, Status> {
+        let req = request.into_inner();
+        let palette = req
+            .palette
+            .as_ref()
+            .and_then(proto_to_palette)
+            .ok_or_else(|| Status::invalid_argument("invalid frontend palette"))?;
+        let session = self
+            .session_manager
+            .get_session(&req.session_id)
+            .map_err(Status::from)?;
+        session.set_base_palette(palette);
+        Ok(Response::new(SetSessionPaletteResponse { success: true }))
     }
 
     // ========================================================================

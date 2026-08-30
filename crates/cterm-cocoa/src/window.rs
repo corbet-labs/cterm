@@ -421,6 +421,7 @@ impl CtermWindow {
         let config = self.ivars().config.clone();
         ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
+        opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         let window_ptr = self as *const Self as usize;
 
         std::thread::spawn(move || {
@@ -603,6 +604,7 @@ impl CtermWindow {
         let config = self.ivars().config.clone();
         ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
+        opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         // SAFETY: self is MainThreadOnly, we use the raw pointer only inside
         // dispatch2::Queue::main().exec_async() which runs on the main thread
         let window_ptr = self as *const Self as usize;
@@ -1143,4 +1145,13 @@ impl CtermWindow {
         );
         self.setFrame_display(frame, true);
     }
+}
+
+fn terminal_palette(theme: &Theme, background: Option<&str>) -> cterm_core::ColorPalette {
+    let mut palette = theme.colors.clone();
+    palette.cursor = theme.cursor.color;
+    if let Some(background) = background.and_then(cterm_core::Rgb::from_hex) {
+        palette.background = background;
+    }
+    palette
 }
