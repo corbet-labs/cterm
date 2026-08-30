@@ -764,7 +764,7 @@ impl CtermWindow {
         self.ivars()
             .panes
             .borrow()
-            .id_matching(|entry| Retained::as_ptr(&entry.terminal) == pointer)
+            .id_matching(|entry| std::ptr::eq(Retained::as_ptr(&entry.terminal), pointer))
     }
 
     fn is_active_terminal(&self, terminal: &TerminalView) -> bool {
@@ -772,7 +772,7 @@ impl CtermWindow {
             .active_terminal
             .borrow()
             .as_ref()
-            .is_some_and(|active| Retained::as_ptr(active) == terminal as *const TerminalView)
+            .is_some_and(|active| std::ptr::eq(Retained::as_ptr(active), terminal))
     }
 
     fn focus_pane(&self, id: PaneId) {
@@ -785,18 +785,15 @@ impl CtermWindow {
 
     fn focus_pane_direction(&self, direction: PaneDirection) {
         let bounds = self.pane_bounds();
-        match self
+        if let Some(active) = self
             .ivars()
             .panes
             .borrow_mut()
             .focus_direction(direction, bounds)
         {
-            Some(active) => {
-                log::info!("Focused pane {} {:?}", active, direction);
-                self.layout_panes();
-                self.sync_active_terminal(true);
-            }
-            None => {}
+            log::info!("Focused pane {} {:?}", active, direction);
+            self.layout_panes();
+            self.sync_active_terminal(true);
         }
     }
 
@@ -858,8 +855,8 @@ impl CtermWindow {
         let daemon_socket = terminal.daemon_socket();
         let remote_name = terminal.remote_name();
         let mut launch_context = match terminal.pane_launch_context() {
-            Ok(context) => context,
-            Err(()) => {
+            Some(context) => context,
+            None => {
                 log::warn!(
                     "Cannot split an attached session whose process/SSH launch context is unknown"
                 );
@@ -1562,7 +1559,7 @@ impl CtermWindow {
                 state.keep_open = terminal.keep_open();
                 state.daemon_socket = terminal.daemon_socket();
                 state.remote_name = terminal.remote_name();
-                state.launch_context = terminal.pane_launch_context().ok();
+                state.launch_context = terminal.pane_launch_context();
                 state
             })
             .collect();

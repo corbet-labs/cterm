@@ -2400,14 +2400,14 @@ impl TerminalView {
     /// Return the launch context for a sibling pane. Remote daemons can safely
     /// fall back to their own defaults for legacy records; unknown local
     /// sessions are rejected because inheriting the wrong SSH domain is unsafe.
-    pub fn pane_launch_context(&self) -> Result<PaneLaunchContext, ()> {
+    pub fn pane_launch_context(&self) -> Option<PaneLaunchContext> {
         let context = self.ivars().pane_session_context.borrow();
         if let Some(launch) = context.launch.as_ref() {
-            Ok(launch.clone())
+            Some(launch.clone())
         } else if context.remote_daemon {
-            Ok(PaneLaunchContext::default())
+            Some(PaneLaunchContext::default())
         } else {
-            Err(())
+            None
         }
     }
 

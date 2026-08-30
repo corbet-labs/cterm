@@ -1178,10 +1178,11 @@ impl AppDelegate {
         Ok(cterm_app::daemon_reconnect::ReconnectedSession {
             handle,
             title: pane.title.clone(),
-            custom_title: pane
-                .title_locked
-                .then(|| pane.title.clone())
-                .unwrap_or_default(),
+            custom_title: if pane.title_locked {
+                pane.title.clone()
+            } else {
+                String::new()
+            },
             tab_color: String::new(),
             template_name: pane.template_name.clone().unwrap_or_default(),
             screen,
