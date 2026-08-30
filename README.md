@@ -312,7 +312,6 @@ identity_file = "~/.ssh/prod_key"
 | 1 | DECCKM | Application cursor keys |
 | 6 | DECOM | Origin mode (cursor addressing relative to scroll region) |
 | 7 | DECAWM | Auto-wrap mode |
-| 9 | X10 Mouse | X10 mouse reporting (button press only) |
 | 25 | DECTCEM | Show/hide cursor |
 | 45 | — | Reverse-wrap at the left margin |
 | 80 | DECSDM | Sixel display mode (scrolling control) |
@@ -322,11 +321,15 @@ identity_file = "~/.ssh/prod_key"
 | 1004 | — | Focus event reporting |
 | 1006 | — | SGR extended mouse coordinates |
 | 1007 | — | Alternate-screen wheel-to-cursor-key translation |
+| 1015 | — | URXVT decimal mouse coordinates |
+| 1016 | — | SGR pixel mouse coordinates |
 | 1047 | — | Alternate screen buffer |
 | 1048 | — | Save/restore cursor |
 | 1049 | — | Alternate screen buffer with cursor save/restore |
 | 2004 | — | Bracketed paste mode |
 | 2026 | — | Synchronized application updates |
+| 2031 | — | Native theme change reports |
+| 2033 | — | Native window visibility reports |
 | 8452 | — | Place the cursor to the right of Sixel graphics |
 
 ### Supported ANSI Modes (SM/RM)

@@ -15,8 +15,10 @@ use parking_lot::Mutex;
 use cterm_app::config::Config;
 use cterm_core::cell::CellAttrs;
 use cterm_core::color::{Color, ColorPalette, Rgb};
-use cterm_core::mouse::{encode_mouse_event, MouseButton, MouseModifiers};
-use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseMode, ScreenConfig};
+use cterm_core::mouse::{
+    encode_mouse_event, MouseButton, MouseEvent, MouseModifiers, MousePosition,
+};
+use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseEncoding, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
 use cterm_ui::sprite::{Sprite, SpriteCache};
@@ -755,7 +757,7 @@ impl TerminalWidget {
         // `last_cell` is the pointer's current cell, needed by the scroll handler
         // (GTK scroll events carry no coordinates). `pressed_button` is the button
         // currently held, so motion can be reported as a drag and released cleanly.
-        let last_cell = Rc::new(RefCell::new((0usize, 0usize)));
+        let last_position = Rc::new(RefCell::new(MousePosition::default()));
         let pressed_button: Rc<RefCell<Option<MouseButton>>> = Rc::new(RefCell::new(None));
 
         // Mouse click for selection
@@ -806,11 +808,9 @@ impl TerminalWidget {
                 if mouse_tracking_active(&term)
                     && report_mouse(
                         &mut term,
-                        MouseButton::Left,
-                        col,
-                        row,
+                        MouseEvent::Press(MouseButton::Left),
+                        MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                         gtk_state_to_mouse_mods(state),
-                        false,
                     )
                 {
                     drop(term);
@@ -845,8 +845,8 @@ impl TerminalWidget {
         click_controller.connect_released(move |gesture, _n_press, x, y| {
             // If this press was forwarded to a mouse-tracking app, report the release
             // and skip the selection-finalize path.
-            if pressed_button_released.borrow().is_some() {
-                *pressed_button_released.borrow_mut() = None;
+            let reported_button = pressed_button_released.borrow_mut().take();
+            if let Some(button) = reported_button {
                 let dims = cell_dims_released.borrow();
                 let col = (x / dims.width).floor() as usize;
                 let row = (y / dims.height).floor() as usize;
@@ -858,11 +858,9 @@ impl TerminalWidget {
                 let mut term = terminal_released.lock();
                 report_mouse(
                     &mut term,
-                    MouseButton::Release,
-                    col,
-                    row,
+                    MouseEvent::Release(button),
+                    MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                     gtk_state_to_mouse_mods(state),
-                    false,
                 );
                 return;
             }
@@ -927,11 +925,9 @@ impl TerminalWidget {
                     if mouse_tracking_active(&term)
                         && report_mouse(
                             &mut term,
-                            MouseButton::Right,
-                            col,
-                            row,
+                            MouseEvent::Press(MouseButton::Right),
+                            MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                             gtk_state_to_mouse_mods(state),
-                            false,
                         )
                     {
                         drop(term);
@@ -981,11 +977,9 @@ impl TerminalWidget {
                 let mut term = terminal_rr.lock();
                 report_mouse(
                     &mut term,
-                    MouseButton::Release,
-                    col,
-                    row,
+                    MouseEvent::Release(MouseButton::Right),
+                    MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                     gtk_state_to_mouse_mods(state),
-                    false,
                 );
             });
 
@@ -1020,11 +1014,9 @@ impl TerminalWidget {
                     if mouse_tracking_active(&term)
                         && report_mouse(
                             &mut term,
-                            MouseButton::Middle,
-                            col,
-                            row,
+                            MouseEvent::Press(MouseButton::Middle),
+                            MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                             gtk_state_to_mouse_mods(state),
-                            false,
                         )
                     {
                         drop(term);
@@ -1075,11 +1067,9 @@ impl TerminalWidget {
                 let mut term = terminal_mr.lock();
                 report_mouse(
                     &mut term,
-                    MouseButton::Release,
-                    col,
-                    row,
+                    MouseEvent::Release(MouseButton::Middle),
+                    MousePosition::new(col, row, x.floor() as i32, y.floor() as i32),
                     gtk_state_to_mouse_mods(state),
-                    false,
                 );
             });
 
@@ -1093,7 +1083,7 @@ impl TerminalWidget {
         let cell_dims_motion = Rc::clone(&cell_dims);
         let drawing_area_motion = self.drawing_area.clone();
         let selecting_motion = Rc::clone(&selecting);
-        let last_cell_motion = Rc::clone(&last_cell);
+        let last_position_motion = Rc::clone(&last_position);
         let pressed_button_motion = Rc::clone(&pressed_button);
 
         motion_controller.connect_motion(move |controller, x, y| {
@@ -1104,8 +1094,9 @@ impl TerminalWidget {
 
             // Track the pointer cell for the scroll handler (scroll events carry no
             // coordinates), and detect whether we moved to a new cell.
-            let prev_cell = *last_cell_motion.borrow();
-            *last_cell_motion.borrow_mut() = (col, row);
+            let position = MousePosition::new(col, row, x.floor() as i32, y.floor() as i32);
+            let previous_position = *last_position_motion.borrow();
+            *last_position_motion.borrow_mut() = position;
 
             let state = controller
                 .current_event()
@@ -1117,15 +1108,34 @@ impl TerminalWidget {
             // the app: report motion (on cell change, to avoid flooding) and swallow it.
             if !shift {
                 if let Some(button) = *pressed_button_motion.borrow() {
-                    if prev_cell != (col, row) {
-                        let mut term = terminal_motion.lock();
+                    let mut term = terminal_motion.lock();
+                    if mouse_position_changed(
+                        term.screen().modes.mouse_encoding,
+                        previous_position,
+                        position,
+                    ) {
                         report_mouse(
                             &mut term,
-                            button,
-                            col,
-                            row,
+                            MouseEvent::Motion(Some(button)),
+                            position,
                             gtk_state_to_mouse_mods(state),
-                            true,
+                        );
+                    }
+                    return;
+                }
+
+                let mut term = terminal_motion.lock();
+                if term.screen().modes.mouse_mode == MouseMode::AnyEvent {
+                    if mouse_position_changed(
+                        term.screen().modes.mouse_encoding,
+                        previous_position,
+                        position,
+                    ) {
+                        report_mouse(
+                            &mut term,
+                            MouseEvent::Motion(None),
+                            position,
+                            gtk_state_to_mouse_mods(state),
                         );
                     }
                     return;
@@ -1174,7 +1184,7 @@ impl TerminalWidget {
             EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         let terminal_scroll = Arc::clone(&terminal);
         let drawing_area_scroll = self.drawing_area.clone();
-        let last_cell_scroll = Rc::clone(&last_cell);
+        let last_position_scroll = Rc::clone(&last_position);
 
         // Lines of cursor-key / viewport movement per wheel notch.
         const SCROLL_LINES: usize = 3;
@@ -1194,7 +1204,7 @@ impl TerminalWidget {
             if !shift {
                 // 1) Application is tracking the mouse: forward a wheel report.
                 if mouse_tracking_active(&term) {
-                    let (col, row) = *last_cell_scroll.borrow();
+                    let position = *last_position_scroll.borrow();
                     let button = if up {
                         MouseButton::WheelUp
                     } else {
@@ -1202,11 +1212,9 @@ impl TerminalWidget {
                     };
                     report_mouse(
                         &mut term,
-                        button,
-                        col,
-                        row,
+                        MouseEvent::Press(button),
+                        position,
                         gtk_state_to_mouse_mods(state),
-                        false,
                     );
                     return glib::Propagation::Stop;
                 }
@@ -2550,19 +2558,29 @@ fn mouse_tracking_active(term: &Terminal) -> bool {
 /// consumed (a report was sent), false if mouse reporting is inactive for it.
 fn report_mouse(
     term: &mut Terminal,
-    button: MouseButton,
-    col: usize,
-    row: usize,
+    event: MouseEvent,
+    position: MousePosition,
     mods: MouseModifiers,
-    is_drag: bool,
 ) -> bool {
     let mode = term.screen().modes.mouse_mode;
-    let sgr = term.screen().modes.sgr_mouse;
-    if let Some(seq) = encode_mouse_event(mode, sgr, button, col, row, mods, is_drag) {
+    let encoding = term.screen().modes.mouse_encoding;
+    if let Some(seq) = encode_mouse_event(mode, encoding, event, position, mods) {
         let _ = term.write(&seq);
         true
     } else {
         false
+    }
+}
+
+fn mouse_position_changed(
+    encoding: MouseEncoding,
+    previous: MousePosition,
+    current: MousePosition,
+) -> bool {
+    if encoding == MouseEncoding::SgrPixels {
+        (previous.pixel_x, previous.pixel_y) != (current.pixel_x, current.pixel_y)
+    } else {
+        (previous.col, previous.row) != (current.col, current.row)
     }
 }
 

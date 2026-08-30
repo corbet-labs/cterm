@@ -20,9 +20,12 @@ use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_core::color::{ColorPalette, Rgb};
-use cterm_core::mouse::{encode_mouse_event, MouseButton as ReportButton, MouseModifiers};
+use cterm_core::mouse::{
+    encode_mouse_event, MouseButton as ReportButton, MouseEvent as ReportMouseEvent,
+    MouseModifiers, MousePosition,
+};
 use cterm_core::pty::{PtyConfig, PtySize};
-use cterm_core::screen::{FileTransferOperation, MouseMode, ScreenConfig};
+use cterm_core::screen::{FileTransferOperation, MouseEncoding, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, Terminal, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
 use cterm_ui::events::{Action, Modifiers};
@@ -186,8 +189,9 @@ pub struct WindowState {
     /// Last pointer position in client pixels (used by the wheel handler, whose
     /// message carries screen coordinates we'd otherwise have to convert).
     last_mouse_pos: (f32, f32),
-    /// Last reported pointer cell, to avoid flooding drag reports per pixel.
-    last_mouse_cell: Option<(usize, usize)>,
+    /// Last reported pointer position, used to coalesce cell-based motion while
+    /// retaining every pixel transition in mode 1016.
+    last_reported_mouse_position: Option<MousePosition>,
     /// Key releases paired with key-down events consumed by application
     /// shortcuts must not leak into enhanced keyboard reporting.
     suppressed_key_releases: HashSet<u16>,
@@ -242,7 +246,7 @@ impl WindowState {
             mouse_state: MouseState::new(),
             mouse_report_button: None,
             last_mouse_pos: (0.0, 0.0),
-            last_mouse_cell: None,
+            last_reported_mouse_position: None,
             suppressed_key_releases: HashSet::new(),
             reported_keys: HashMap::new(),
             enhanced_text_keys: HashSet::new(),
@@ -2062,21 +2066,18 @@ impl WindowState {
         }
     }
 
-    /// Handle mouse down
-    /// Map window pixel coordinates to a visible terminal cell (col, row), or
-    /// None if the point is above the terminal area. Does not lock the terminal.
-    fn terminal_cell_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+    /// Map client coordinates to both terminal-cell and terminal-local pixel
+    /// coordinates. Pixel rows exclude tab and notification chrome.
+    fn terminal_mouse_position(&self, x: f32, y: f32) -> Option<MousePosition> {
         let y_offset = self.terminal_y_offset();
         if y < y_offset {
             return None;
         }
         let cell_dims = self.renderer.as_ref()?.cell_dimensions();
-        Some(mouse::pixel_to_cell(
-            x as i32,
-            (y - y_offset) as i32,
-            &cell_dims,
-            0,
-        ))
+        let pixel_x = x.floor() as i32;
+        let pixel_y = (y - y_offset).floor() as i32;
+        let (col, row) = mouse::pixel_to_cell(pixel_x, pixel_y, &cell_dims, 0);
+        Some(MousePosition::new(col, row, pixel_x, pixel_y))
     }
 
     /// Whether the active terminal has enabled any mouse tracking mode.
@@ -2089,8 +2090,8 @@ impl WindowState {
     /// Forward a mouse event to a mouse-tracking application. Returns true if a
     /// report was sent (the event was consumed). Must not be called while holding
     /// the terminal lock.
-    fn forward_mouse_event(&self, button: ReportButton, x: f32, y: f32, is_drag: bool) -> bool {
-        let Some((col, row)) = self.terminal_cell_at(x, y) else {
+    fn forward_mouse_event(&self, event: ReportMouseEvent, x: f32, y: f32) -> bool {
+        let Some(position) = self.terminal_mouse_position(x, y) else {
             return false;
         };
         let Some(terminal) = self.active_terminal() else {
@@ -2101,16 +2102,10 @@ impl WindowState {
         if mode == MouseMode::None {
             return false;
         }
-        let sgr = term.screen().modes.sgr_mouse;
-        let consumed = if let Some(seq) = encode_mouse_event(
-            mode,
-            sgr,
-            button,
-            col,
-            row,
-            current_mouse_modifiers(),
-            is_drag,
-        ) {
+        let encoding = term.screen().modes.mouse_encoding;
+        let consumed = if let Some(seq) =
+            encode_mouse_event(mode, encoding, event, position, current_mouse_modifiers())
+        {
             let _ = term.write(&seq);
             true
         } else {
@@ -2155,17 +2150,18 @@ impl WindowState {
         // reserved for local interaction, matching the xterm/VTE convention).
         if !shift_pressed()
             && self.mouse_tracking_active()
-            && self.forward_mouse_event(ReportButton::Left, x, y, false)
+            && self.forward_mouse_event(ReportMouseEvent::Press(ReportButton::Left), x, y)
         {
             self.mouse_report_button = Some(ReportButton::Left);
+            self.last_reported_mouse_position = self.terminal_mouse_position(x, y);
         }
     }
 
     /// Handle mouse button release.
     pub fn on_mouse_up(&mut self, x: f32, y: f32) {
         // If a press was forwarded to a mouse-tracking app, report the release.
-        if self.mouse_report_button.take().is_some() {
-            self.forward_mouse_event(ReportButton::Release, x, y, false);
+        if let Some(button) = self.mouse_report_button.take() {
+            self.forward_mouse_event(ReportMouseEvent::Release(button), x, y);
         }
     }
 
@@ -2173,9 +2169,10 @@ impl WindowState {
     pub fn on_middle_down(&mut self, x: f32, y: f32) {
         if !shift_pressed()
             && self.mouse_tracking_active()
-            && self.forward_mouse_event(ReportButton::Middle, x, y, false)
+            && self.forward_mouse_event(ReportMouseEvent::Press(ReportButton::Middle), x, y)
         {
             self.mouse_report_button = Some(ReportButton::Middle);
+            self.last_reported_mouse_position = self.terminal_mouse_position(x, y);
         }
     }
 
@@ -2197,7 +2194,7 @@ impl WindowState {
                 } else {
                     ReportButton::WheelDown
                 };
-                self.forward_mouse_event(button, x, y, false);
+                self.forward_mouse_event(ReportMouseEvent::Press(button), x, y);
                 return;
             }
 
@@ -2237,19 +2234,36 @@ impl WindowState {
     pub fn on_mouse_move(&mut self, x: f32, y: f32) {
         self.last_mouse_pos = (x, y);
 
-        // If a button is held for a mouse-tracking app, report drag motion (only
-        // when the pointer crosses into a new cell, to avoid flooding).
+        // Forward held-button or all-motion reporting. Cell encodings are
+        // coalesced by cell; mode 1016 preserves every pixel transition.
         if !shift_pressed() {
-            if let Some(button) = self.mouse_report_button {
-                let cell = self.terminal_cell_at(x, y);
-                if cell.is_some() && cell != self.last_mouse_cell {
-                    self.last_mouse_cell = cell;
-                    self.forward_mouse_event(button, x, y, true);
+            let reporting_modes = self.active_terminal().map(|terminal| {
+                let term = terminal.lock().unwrap();
+                (
+                    term.screen().modes.mouse_mode,
+                    term.screen().modes.mouse_encoding,
+                )
+            });
+            let event = self
+                .mouse_report_button
+                .map(|button| ReportMouseEvent::Motion(Some(button)))
+                .or_else(|| {
+                    reporting_modes
+                        .is_some_and(|(mode, _)| mode == MouseMode::AnyEvent)
+                        .then_some(ReportMouseEvent::Motion(None))
+                });
+
+            if let (Some(event), Some((_, encoding)), Some(position)) =
+                (event, reporting_modes, self.terminal_mouse_position(x, y))
+            {
+                if mouse_position_changed(encoding, self.last_reported_mouse_position, position) {
+                    self.last_reported_mouse_position = Some(position);
+                    self.forward_mouse_event(event, x, y);
                 }
                 return;
             }
         }
-        self.last_mouse_cell = self.terminal_cell_at(x, y);
+        self.last_reported_mouse_position = self.terminal_mouse_position(x, y);
 
         let has_link = self.hyperlink_at(x, y).is_some();
 
@@ -2281,9 +2295,10 @@ impl WindowState {
         // Forward to a mouse-tracking application unless Shift is held.
         if !shift_pressed()
             && self.mouse_tracking_active()
-            && self.forward_mouse_event(ReportButton::Right, x, y, false)
+            && self.forward_mouse_event(ReportMouseEvent::Press(ReportButton::Right), x, y)
         {
             self.mouse_report_button = Some(ReportButton::Right);
+            self.last_reported_mouse_position = self.terminal_mouse_position(x, y);
             return;
         }
 
@@ -3178,6 +3193,21 @@ fn current_mouse_modifiers() -> MouseModifiers {
             alt: GetKeyState(VK_MENU.0 as i32) < 0,
             ctrl: GetKeyState(VK_CONTROL.0 as i32) < 0,
         }
+    }
+}
+
+fn mouse_position_changed(
+    encoding: MouseEncoding,
+    previous: Option<MousePosition>,
+    current: MousePosition,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if encoding == MouseEncoding::SgrPixels {
+        (previous.pixel_x, previous.pixel_y) != (current.pixel_x, current.pixel_y)
+    } else {
+        (previous.col, previous.row) != (current.col, current.row)
     }
 }
 

@@ -623,6 +623,25 @@ message TerminalModes {
   optional string current_working_directory = 13;
   bool theme_change_reports = 14;
   bool visibility_change_reports = 15;
+  MouseTrackingMode mouse_tracking = 16;
+  MouseCoordinateEncoding mouse_encoding = 17;
+}
+
+enum MouseTrackingMode {
+  MOUSE_TRACKING_MODE_UNSPECIFIED = 0;
+  MOUSE_TRACKING_MODE_NONE = 1;
+  MOUSE_TRACKING_MODE_X10 = 2;
+  MOUSE_TRACKING_MODE_NORMAL = 3;
+  MOUSE_TRACKING_MODE_BUTTON_EVENT = 4;
+  MOUSE_TRACKING_MODE_ANY_EVENT = 5;
+}
+
+enum MouseCoordinateEncoding {
+  MOUSE_COORDINATE_ENCODING_UNSPECIFIED = 0;
+  MOUSE_COORDINATE_ENCODING_NORMAL = 1;
+  MOUSE_COORDINATE_ENCODING_SGR = 2;
+  MOUSE_COORDINATE_ENCODING_URXVT = 3;
+  MOUSE_COORDINATE_ENCODING_SGR_PIXELS = 4;
 }
 
 message DynamicColors {

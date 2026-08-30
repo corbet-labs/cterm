@@ -5,7 +5,9 @@ use crate::proto;
 use cterm_core::cell::Hyperlink;
 use cterm_core::drcs::{DrcsFont, DrcsGlyph};
 use cterm_core::term::Terminal;
-use cterm_core::{Cell, CellAttrs, Color, ColorQuery, Screen, TerminalImage};
+use cterm_core::{
+    Cell, CellAttrs, Color, ColorQuery, MouseEncoding, MouseMode, Screen, TerminalImage,
+};
 use std::sync::Arc;
 
 /// Convert cell attributes to proto
@@ -311,6 +313,19 @@ pub fn modes_to_proto(screen: &Screen) -> proto::TerminalModes {
             .map(|path| path.to_string_lossy().into_owned()),
         theme_change_reports: screen.modes.theme_change_reports,
         visibility_change_reports: screen.modes.visibility_change_reports,
+        mouse_tracking: match screen.modes.mouse_mode {
+            MouseMode::None => proto::MouseTrackingMode::None,
+            MouseMode::X10 => proto::MouseTrackingMode::X10,
+            MouseMode::Normal => proto::MouseTrackingMode::Normal,
+            MouseMode::ButtonEvent => proto::MouseTrackingMode::ButtonEvent,
+            MouseMode::AnyEvent => proto::MouseTrackingMode::AnyEvent,
+        } as i32,
+        mouse_encoding: match screen.modes.mouse_encoding {
+            MouseEncoding::Normal => proto::MouseCoordinateEncoding::Normal,
+            MouseEncoding::Sgr => proto::MouseCoordinateEncoding::Sgr,
+            MouseEncoding::Urxvt => proto::MouseCoordinateEncoding::Urxvt,
+            MouseEncoding::SgrPixels => proto::MouseCoordinateEncoding::SgrPixels,
+        } as i32,
     }
 }
 
@@ -412,6 +427,20 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             .clamp(1, 2);
         screen.modes.theme_change_reports = modes.theme_change_reports;
         screen.modes.visibility_change_reports = modes.visibility_change_reports;
+        screen.modes.mouse_mode = match proto::MouseTrackingMode::try_from(modes.mouse_tracking) {
+            Ok(proto::MouseTrackingMode::X10) => MouseMode::X10,
+            Ok(proto::MouseTrackingMode::Normal) => MouseMode::Normal,
+            Ok(proto::MouseTrackingMode::ButtonEvent) => MouseMode::ButtonEvent,
+            Ok(proto::MouseTrackingMode::AnyEvent) => MouseMode::AnyEvent,
+            _ => MouseMode::None,
+        };
+        screen.modes.mouse_encoding =
+            match proto::MouseCoordinateEncoding::try_from(modes.mouse_encoding) {
+                Ok(proto::MouseCoordinateEncoding::Sgr) => MouseEncoding::Sgr,
+                Ok(proto::MouseCoordinateEncoding::Urxvt) => MouseEncoding::Urxvt,
+                Ok(proto::MouseCoordinateEncoding::SgrPixels) => MouseEncoding::SgrPixels,
+                _ => MouseEncoding::Normal,
+            };
         screen.set_current_working_directory(
             modes
                 .current_working_directory
@@ -552,6 +581,8 @@ mod tests {
         source.screen_mut().modes.modify_other_keys = 2;
         source.screen_mut().modes.theme_change_reports = true;
         source.screen_mut().modes.visibility_change_reports = true;
+        source.screen_mut().modes.mouse_mode = MouseMode::AnyEvent;
+        source.screen_mut().modes.mouse_encoding = MouseEncoding::SgrPixels;
         source
             .screen_mut()
             .set_dynamic_color(ColorQuery::Foreground, Some(cterm_core::Rgb::new(4, 5, 6)));
@@ -583,6 +614,11 @@ mod tests {
         assert_eq!(restored.screen().modes.modify_other_keys, 2);
         assert!(restored.screen().modes.theme_change_reports);
         assert!(restored.screen().modes.visibility_change_reports);
+        assert_eq!(restored.screen().modes.mouse_mode, MouseMode::AnyEvent);
+        assert_eq!(
+            restored.screen().modes.mouse_encoding,
+            MouseEncoding::SgrPixels
+        );
         assert_eq!(
             restored.screen().dynamic_color(ColorQuery::Foreground),
             Some(cterm_core::Rgb::new(4, 5, 6))

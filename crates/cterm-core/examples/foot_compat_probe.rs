@@ -73,15 +73,28 @@ mod unix {
                 b"\x1b\\",
             ),
             ("palette-stack-status", b"\x1b[#P\x1b[#R\x1b[#Q", b"#Q"),
-            ("theme", b"\x1b[?996n", b"n"),
-            ("visibility", b"\x1b[?998n", b"n"),
-            ("theme-report-mode", b"\x1b[?2031h\x1b[?2031$p", b"y"),
-            ("visibility-report-mode", b"\x1b[?2033h", b"n"),
+            ("mouse-x10-mode", b"\x1b[?9$p", b"y"),
+            ("mouse-sgr-mode", b"\x1b[?1006h\x1b[?1006$p", b"y"),
             (
-                "visibility-report-mode-reset",
-                b"\x1b[?2033l\x1b[?2033$p",
+                "mouse-urxvt-mode",
+                b"\x1b[?1015h\x1b[?1006$p\x1b[?1015$p",
                 b"y",
             ),
+            (
+                "mouse-pixel-mode",
+                b"\x1b[?1016h\x1b[?1015$p\x1b[?1016$p",
+                b"y",
+            ),
+            (
+                "mouse-mode-restore",
+                b"\x1b[?1015h\x1b[?1015s\x1b[?1006h\x1b[?1015r\x1b[?1015$p",
+                b"y",
+            ),
+            ("theme", b"\x1b[?996n", b"n"),
+            ("theme-report-mode", b"\x1b[?2031h\x1b[?2031$p", b"y"),
+            // Foot added visibility query 998 and mode 2033 after the 1.27.0
+            // release used by this gate. cterm tests those extensions directly
+            // until they are available in a released reference binary.
         ];
 
         let mut report = String::new();

@@ -35,8 +35,8 @@ pub use pty::save_original_nofile_limit;
 pub use pty::{Pty, PtyConfig, PtyError, PtySize};
 pub use screen::{
     ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle, FileTransferOperation,
-    FrontendState, Screen, SearchResult, Selection, SelectionMode, SelectionPoint, TerminalImage,
-    ThemeAppearance, WindowVisibility,
+    FrontendState, MouseEncoding, MouseMode, Screen, SearchResult, Selection, SelectionMode,
+    SelectionPoint, TerminalImage, ThemeAppearance, WindowVisibility,
 };
 pub use sixel::{SixelDecoder, SixelImage};
 pub use ssh::{

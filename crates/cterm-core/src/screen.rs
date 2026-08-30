@@ -123,8 +123,10 @@ pub struct TerminalModes {
     pub show_cursor: bool,
     /// Mouse reporting mode
     pub mouse_mode: MouseMode,
-    /// SGR mouse encoding (mode 1006) - uses CSI < format instead of X10
-    pub sgr_mouse: bool,
+    /// Mouse-coordinate encoding selected by DEC private modes 1006, 1015,
+    /// and 1016.
+    #[serde(default)]
+    pub mouse_encoding: MouseEncoding,
     /// Alternate scroll mode (mode 1007): on the alternate screen, translate the
     /// scroll wheel into cursor-key input when the application isn't tracking the
     /// mouse. Enabled by default so pagers (less/man) scroll out of the box.
@@ -188,6 +190,20 @@ pub enum MouseMode {
     ButtonEvent,
     /// Any event tracking
     AnyEvent,
+}
+
+/// Encoding used for mouse reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseEncoding {
+    /// Legacy X11-compatible `CSI M` byte encoding.
+    #[default]
+    Normal,
+    /// SGR cell coordinates (DEC private mode 1006).
+    Sgr,
+    /// URXVT decimal cell coordinates (DEC private mode 1015).
+    Urxvt,
+    /// SGR pixel coordinates (DEC private mode 1016).
+    SgrPixels,
 }
 
 /// Clipboard selection type for OSC 52

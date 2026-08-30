@@ -18,7 +18,7 @@ use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
 use crate::screen::{
     ClearMode, ClipboardOperation, ClipboardSelection, ColorQuery, CursorStyle, LineClearMode,
-    MouseMode, Screen,
+    MouseEncoding, MouseMode, Screen,
 };
 use crate::sixel::{SixelDecoder, SixelImage};
 use crate::streaming_file::StreamingFileReceiver;
@@ -1936,10 +1936,9 @@ impl ScreenPerformer<'_> {
             7 => self.screen.modes.auto_wrap = set,
             // Reverse Wraparound Mode
             45 => self.screen.modes.reverse_wrap = set,
-            // X10 Mouse Reporting
-            9 => {
-                self.screen.modes.mouse_mode = if set { MouseMode::X10 } else { MouseMode::None };
-            }
+            // X10 Mouse Reporting. Foot recognizes this legacy mode but keeps
+            // it permanently reset.
+            9 => {}
             // DECTCEM - Show Cursor
             25 => self.screen.modes.show_cursor = set,
             // Cursor blinking mode
@@ -1953,37 +1952,24 @@ impl ScreenPerformer<'_> {
             // When reset (l): sixel scrolling ON (image at cursor, can scroll)
             80 => self.screen.modes.sixel_scrolling = !set,
             // Normal Mouse Tracking
-            1000 => {
-                self.screen.modes.mouse_mode = if set {
-                    MouseMode::Normal
-                } else {
-                    MouseMode::None
-                };
-            }
+            1000 => self.set_mouse_mode(MouseMode::Normal, set),
             // Button Event Mouse Tracking
-            1002 => {
-                self.screen.modes.mouse_mode = if set {
-                    MouseMode::ButtonEvent
-                } else {
-                    MouseMode::None
-                };
-            }
+            1002 => self.set_mouse_mode(MouseMode::ButtonEvent, set),
             // Any Event Mouse Tracking
-            1003 => {
-                self.screen.modes.mouse_mode = if set {
-                    MouseMode::AnyEvent
-                } else {
-                    MouseMode::None
-                };
-            }
+            1003 => self.set_mouse_mode(MouseMode::AnyEvent, set),
             // Focus Events
             1004 => self.screen.modes.focus_events = set,
             // UTF-8 Mouse Mode
             1005 => { /* UTF-8 encoding for mouse coordinates - not implemented */ }
-            // SGR Mouse Mode (extended coordinates)
-            1006 => self.screen.modes.sgr_mouse = set,
+            // Mouse-coordinate encodings are mutually exclusive. Resetting an
+            // inactive encoding does not disturb the active one, matching foot.
+            1006 => self.set_mouse_encoding(MouseEncoding::Sgr, set),
             // Alternate Scroll Mode: wheel -> cursor keys on the alternate screen
             1007 => self.screen.modes.alternate_scroll = set,
+            // URXVT decimal mouse encoding.
+            1015 => self.set_mouse_encoding(MouseEncoding::Urxvt, set),
+            // SGR pixel-coordinate mouse encoding.
+            1016 => self.set_mouse_encoding(MouseEncoding::SgrPixels, set),
             // Alternate Screen Buffer.  Mode 47 is the older xterm spelling.
             47 | 1047 => {
                 if set {
@@ -2044,7 +2030,6 @@ impl ScreenPerformer<'_> {
             6 => self.screen.modes.origin_mode,
             7 => self.screen.modes.auto_wrap,
             45 => self.screen.modes.reverse_wrap,
-            9 => self.screen.modes.mouse_mode == MouseMode::X10,
             12 => self.screen.cursor.blink,
             25 => self.screen.modes.show_cursor,
             47 | 1047 | 1049 => self.screen.modes.alternate_screen,
@@ -2055,15 +2040,17 @@ impl ScreenPerformer<'_> {
             1002 => self.screen.modes.mouse_mode == MouseMode::ButtonEvent,
             1003 => self.screen.modes.mouse_mode == MouseMode::AnyEvent,
             1004 => self.screen.modes.focus_events,
-            1006 => self.screen.modes.sgr_mouse,
+            1006 => self.screen.modes.mouse_encoding == MouseEncoding::Sgr,
             1007 => self.screen.modes.alternate_scroll,
+            1015 => self.screen.modes.mouse_encoding == MouseEncoding::Urxvt,
+            1016 => self.screen.modes.mouse_encoding == MouseEncoding::SgrPixels,
             2004 => self.screen.modes.bracketed_paste,
             2026 => self.screen.modes.application_sync_updates,
             2031 => self.screen.modes.theme_change_reports,
             2033 => self.screen.modes.visibility_change_reports,
             8452 => self.screen.modes.sixel_cursor_right,
             // Recognized legacy encodings which cterm deliberately never uses.
-            67 | 1001 | 1005 => return 4,
+            9 | 67 | 1001 | 1005 => return 4,
             _ => return 0,
         };
 
@@ -2071,6 +2058,22 @@ impl ScreenPerformer<'_> {
             1
         } else {
             2
+        }
+    }
+
+    fn set_mouse_encoding(&mut self, encoding: MouseEncoding, set: bool) {
+        if set {
+            self.screen.modes.mouse_encoding = encoding;
+        } else if self.screen.modes.mouse_encoding == encoding {
+            self.screen.modes.mouse_encoding = MouseEncoding::Normal;
+        }
+    }
+
+    fn set_mouse_mode(&mut self, mode: MouseMode, set: bool) {
+        if set {
+            self.screen.modes.mouse_mode = mode;
+        } else if self.screen.modes.mouse_mode == mode {
+            self.screen.modes.mouse_mode = MouseMode::None;
         }
     }
 
@@ -2783,9 +2786,17 @@ mod tests {
         assert_eq!(screen.modes.mouse_mode, MouseMode::Normal);
         parser.parse(&mut screen, b"\x1b[?1002h"); // button-event tracking
         assert_eq!(screen.modes.mouse_mode, MouseMode::ButtonEvent);
+        parser.parse(&mut screen, b"\x1b[?1000l"); // inactive reset is ignored
+        assert_eq!(screen.modes.mouse_mode, MouseMode::ButtonEvent);
         parser.parse(&mut screen, b"\x1b[?1006h"); // SGR encoding
-        assert!(screen.modes.sgr_mouse);
-        parser.parse(&mut screen, b"\x1b[?1000l"); // disable tracking
+        assert_eq!(screen.modes.mouse_encoding, MouseEncoding::Sgr);
+        parser.parse(&mut screen, b"\x1b[?1015h"); // URXVT replaces SGR
+        assert_eq!(screen.modes.mouse_encoding, MouseEncoding::Urxvt);
+        parser.parse(&mut screen, b"\x1b[?1006l"); // inactive reset is ignored
+        assert_eq!(screen.modes.mouse_encoding, MouseEncoding::Urxvt);
+        parser.parse(&mut screen, b"\x1b[?1015l");
+        assert_eq!(screen.modes.mouse_encoding, MouseEncoding::Normal);
+        parser.parse(&mut screen, b"\x1b[?1002l"); // disable active tracking
         assert_eq!(screen.modes.mouse_mode, MouseMode::None);
     }
 
@@ -2830,6 +2841,22 @@ mod tests {
         parser.parse(&mut screen, b"\x1b[?1005$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?1005;4$y"]);
 
+        parser.parse(&mut screen, b"\x1b[?9$p");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?9;4$y"]);
+
+        parser.parse(
+            &mut screen,
+            b"\x1b[?1015h\x1b[?1006$p\x1b[?1015$p\x1b[?1016$p",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[?1006;2$y".to_vec(),
+                b"\x1b[?1015;1$y".to_vec(),
+                b"\x1b[?1016;2$y".to_vec(),
+            ]
+        );
+
         parser.parse(&mut screen, b"\x1b[?2026$p");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[?2026;2$y"]);
     }
@@ -2844,6 +2871,9 @@ mod tests {
         assert!(screen.modes.application_cursor);
         assert!(!screen.modes.reverse_wrap);
         assert!(screen.modes.bracketed_paste);
+
+        parser.parse(&mut screen, b"\x1b[?1016h\x1b[?1016s\x1b[?1006h\x1b[?1016r");
+        assert_eq!(screen.modes.mouse_encoding, MouseEncoding::SgrPixels);
 
         parser.parse(&mut screen, b"\x1b[8;12H\x1b[?1048s\x1b[1;1H\x1b[?1048r");
         assert_eq!((screen.cursor.row, screen.cursor.col), (7, 11));

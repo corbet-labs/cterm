@@ -28,7 +28,7 @@ use cterm_ui::theme::Theme;
 
 use crate::cg_renderer::CGRenderer;
 use crate::file_transfer::PendingFileManager;
-use crate::mouse::{self, MouseButton, MouseModifiers};
+use crate::mouse::{self, MouseButton, MouseEvent, MouseModifiers, MousePosition};
 use crate::notification_bar::{NotificationBar, NOTIFICATION_BAR_HEIGHT};
 use crate::{clipboard, keycode};
 
@@ -183,6 +183,8 @@ pub struct TerminalViewIvars {
     auto_scroll_direction: Cell<i32>,
     /// Last mouse column during auto-scroll drag
     auto_scroll_col: Cell<usize>,
+    /// Last native pointer position used to coalesce cell-based motion reports.
+    last_mouse_position: Cell<Option<MousePosition>>,
     /// Timer for auto-scroll during selection drag
     auto_scroll_timer: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
     /// Template name (if this view was created from a template)
@@ -523,7 +525,7 @@ define_class!(
             }
 
             // Forward the press to a tracking application (Shift bypasses).
-            if self.report_mouse_button(event, MouseButton::Left, false) {
+            if self.report_mouse_event(event, MouseEvent::Press(MouseButton::Left)) {
                 // Track the drag so mouseDragged/mouseUp keep reporting.
                 self.ivars().is_selecting.set(true);
                 return;
@@ -565,7 +567,7 @@ define_class!(
             self.stop_auto_scroll();
 
             // Forward the release to a tracking application (Shift bypasses).
-            if self.report_mouse_button(event, MouseButton::Release, false) {
+            if self.report_mouse_event(event, MouseEvent::Release(MouseButton::Left)) {
                 return;
             }
 
@@ -612,7 +614,7 @@ define_class!(
             // Forward drag motion to a tracking application (ButtonEvent /
             // AnyEvent modes); Shift bypasses so a Shift-drag extends a local
             // text selection instead.
-            if self.report_mouse_button(event, MouseButton::Left, true) {
+            if self.report_mouse_event(event, MouseEvent::Motion(Some(MouseButton::Left))) {
                 return;
             }
 
@@ -689,7 +691,7 @@ define_class!(
 
             let terminal = self.ivars().terminal.lock();
             let mouse_mode = terminal.screen().modes.mouse_mode;
-            let sgr_mouse = terminal.screen().modes.sgr_mouse;
+            let mouse_encoding = terminal.screen().modes.mouse_encoding;
             let in_alternate_screen = terminal.screen().modes.alternate_screen;
             let alternate_scroll = terminal.screen().modes.alternate_scroll;
             drop(terminal);
@@ -713,12 +715,15 @@ define_class!(
                     for _ in 0..count {
                         if let Some(seq) = mouse::encode_mouse_event(
                             mouse_mode,
-                            sgr_mouse,
-                            button,
-                            col,
-                            row,
+                            mouse_encoding,
+                            MouseEvent::Press(button),
+                            MousePosition::new(
+                                col,
+                                row,
+                                location.x.floor() as i32,
+                                location.y.floor() as i32,
+                            ),
                             modifiers,
-                            false,
                         ) {
                             self.write_to_pty(&seq);
                         }
@@ -802,6 +807,13 @@ define_class!(
 
             let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
             let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+
+            let mouse_mode = self.ivars().terminal.lock().screen().modes.mouse_mode;
+            if mouse_mode == cterm_core::MouseMode::AnyEvent
+                && self.report_mouse_event(event, MouseEvent::Motion(None))
+            {
+                return;
+            }
 
             // Check if we're over a hyperlink
             let terminal = self.ivars().terminal.lock();
@@ -1073,7 +1085,7 @@ define_class!(
         fn right_mouse_down(&self, event: &NSEvent) {
             // A tracking application gets the right button; only fall through to
             // cterm's context menus when reporting is off or Shift is held.
-            if self.report_mouse_button(event, MouseButton::Right, false) {
+            if self.report_mouse_event(event, MouseEvent::Press(MouseButton::Right)) {
                 return;
             }
 
@@ -1113,13 +1125,13 @@ define_class!(
         /// Forward right-button release to a tracking application.
         #[unsafe(method(rightMouseUp:))]
         fn right_mouse_up(&self, event: &NSEvent) {
-            self.report_mouse_button(event, MouseButton::Release, false);
+            self.report_mouse_event(event, MouseEvent::Release(MouseButton::Right));
         }
 
         /// Forward right-button drag motion to a tracking application.
         #[unsafe(method(rightMouseDragged:))]
         fn right_mouse_dragged(&self, event: &NSEvent) {
-            self.report_mouse_button(event, MouseButton::Right, true);
+            self.report_mouse_event(event, MouseEvent::Motion(Some(MouseButton::Right)));
         }
 
         /// Forward middle-button (and other) press to a tracking application.
@@ -1128,7 +1140,7 @@ define_class!(
             // Only the middle button (buttonNumber 2) is reported; ignore the
             // rest so we don't misencode extra mouse buttons.
             if event.buttonNumber() == 2 {
-                self.report_mouse_button(event, MouseButton::Middle, false);
+                self.report_mouse_event(event, MouseEvent::Press(MouseButton::Middle));
             }
         }
 
@@ -1136,7 +1148,7 @@ define_class!(
         #[unsafe(method(otherMouseUp:))]
         fn other_mouse_up(&self, event: &NSEvent) {
             if event.buttonNumber() == 2 {
-                self.report_mouse_button(event, MouseButton::Release, false);
+                self.report_mouse_event(event, MouseEvent::Release(MouseButton::Middle));
             }
         }
 
@@ -1144,7 +1156,7 @@ define_class!(
         #[unsafe(method(otherMouseDragged:))]
         fn other_mouse_dragged(&self, event: &NSEvent) {
             if event.buttonNumber() == 2 {
-                self.report_mouse_button(event, MouseButton::Middle, true);
+                self.report_mouse_event(event, MouseEvent::Motion(Some(MouseButton::Middle)));
             }
         }
 
@@ -1478,6 +1490,7 @@ impl TerminalView {
             is_selecting: Cell::new(false),
             auto_scroll_direction: Cell::new(0),
             auto_scroll_col: Cell::new(0),
+            last_mouse_position: Cell::new(None),
             auto_scroll_timer: RefCell::new(None),
             template_name: RefCell::new(options.template_name),
             session_id: RefCell::new(None),
@@ -2453,26 +2466,45 @@ impl TerminalView {
     /// (xterm/VTE convention) so text selection, scrollback, and context menus
     /// keep working while an app grabs the mouse. When this returns `false` the
     /// caller falls back to cterm's own local handling.
-    fn report_mouse_button(&self, event: &NSEvent, button: MouseButton, is_drag: bool) -> bool {
-        let shift = event
+    fn report_mouse_event(&self, native_event: &NSEvent, event: MouseEvent) -> bool {
+        let shift = native_event
             .modifierFlags()
             .contains(objc2_app_kit::NSEventModifierFlags::Shift);
         let terminal = self.ivars().terminal.lock();
         let mouse_mode = terminal.screen().modes.mouse_mode;
-        let sgr_mouse = terminal.screen().modes.sgr_mouse;
+        let mouse_encoding = terminal.screen().modes.mouse_encoding;
         drop(terminal);
 
         if shift || !mouse::should_capture_mouse(mouse_mode) {
             return false;
         }
 
-        let location = self.convert_point_from_view(event.locationInWindow(), None);
+        let location = self.convert_point_from_view(native_event.locationInWindow(), None);
         let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
         let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
-        let modifiers = self.get_mouse_modifiers(event);
+        let position = MousePosition::new(
+            col,
+            row,
+            location.x.floor() as i32,
+            location.y.floor() as i32,
+        );
+        let modifiers = self.get_mouse_modifiers(native_event);
+
+        let previous = self.ivars().last_mouse_position.replace(Some(position));
+        if matches!(event, MouseEvent::Motion(_))
+            && previous.is_some_and(|previous| {
+                if mouse_encoding == cterm_core::MouseEncoding::SgrPixels {
+                    (previous.pixel_x, previous.pixel_y) == (position.pixel_x, position.pixel_y)
+                } else {
+                    (previous.col, previous.row) == (position.col, position.row)
+                }
+            })
+        {
+            return true;
+        }
 
         if let Some(seq) =
-            mouse::encode_mouse_event(mouse_mode, sgr_mouse, button, col, row, modifiers, is_drag)
+            mouse::encode_mouse_event(mouse_mode, mouse_encoding, event, position, modifiers)
         {
             self.write_to_pty(&seq);
         }
