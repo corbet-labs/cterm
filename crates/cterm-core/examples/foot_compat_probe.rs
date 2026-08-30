@@ -101,6 +101,7 @@ mod unix {
 
         stdout.write_all(b"\x1b[0m\x1b[r\x1b[H\x1b]110\x1b\\")?;
         stdout.flush()?;
+        report.push_str("complete=1\n");
         fs::write(output_path, report)?;
         Ok(())
     }

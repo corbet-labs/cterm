@@ -85,7 +85,7 @@ run_probe() {
     app_pid=$!
 
     for _attempt in $(seq 1 100); do
-        if [ -s "$report" ]; then
+        if [ -s "$report" ] && grep -qFx 'complete=1' "$report"; then
             break
         fi
         if ! kill -0 "$app_pid" 2>/dev/null; then
@@ -94,26 +94,12 @@ run_probe() {
         sleep 0.1
     done
 
-    if [ ! -s "$report" ]; then
+    if [ ! -s "$report" ] || ! grep -qFx 'complete=1' "$report"; then
         printf 'ERROR: %s did not complete the compatibility probe\n' "$terminal" >&2
-        tail -100 "$stderr_log" >&2 || true
-        exit 1
-    fi
-
-    if kill -0 "$app_pid" 2>/dev/null; then
-        # A partial report means the probe reached at least one case but is
-        # still blocked on a later reply. Preserve the exact progress in logs.
-        for _attempt in $(seq 1 30); do
-            if ! kill -0 "$app_pid" 2>/dev/null; then
-                break
-            fi
-            sleep 0.1
-        done
-    fi
-
-    if kill -0 "$app_pid" 2>/dev/null; then
-        printf 'ERROR: %s compatibility probe stopped after:\n' "$terminal" >&2
-        cat "$report" >&2
+        if [ -s "$report" ]; then
+            printf '%s compatibility probe stopped after:\n' "$terminal" >&2
+            cat "$report" >&2
+        fi
         tail -100 "$stderr_log" >&2 || true
         exit 1
     fi
