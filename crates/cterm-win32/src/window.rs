@@ -2,17 +2,18 @@
 //!
 //! Manages the main window, tabs, terminal rendering, and message handling.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, UpdateWindow, HBRUSH, PAINTSTRUCT,
+    BeginPaint, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, HBRUSH, PAINTSTRUCT,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -29,6 +30,10 @@ use cterm_core::screen::{FileTransferOperation, MouseEncoding, MouseMode, Screen
 use cterm_core::term::{Key, Modifiers as CoreModifiers, Terminal, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
 use cterm_ui::events::{Action, Modifiers};
+use cterm_ui::pane::{
+    PaneBranch, PaneDirection, PaneId, PaneLayout, PaneRect, PaneTree, SplitDirection, SplitRatio,
+    SplitRequest,
+};
 use cterm_ui::theme::Theme;
 use winapi::um::winuser;
 
@@ -38,7 +43,7 @@ use crate::keycode;
 use crate::menu::{self, MenuAction};
 use crate::mouse::{self, MouseState};
 use crate::notification_bar::{NotificationAction, NotificationBar};
-use crate::tab_bar::{TabBar, TAB_BAR_HEIGHT};
+use crate::tab_bar::TabBar;
 use crate::terminal_canvas::TerminalRenderer;
 
 /// Custom window messages
@@ -48,6 +53,7 @@ pub const WM_APP_TITLE_CHANGED: u32 = WM_APP + 3;
 pub const WM_APP_BELL: u32 = WM_APP + 4;
 pub const WM_APP_DESKTOP_NOTIFICATION: u32 = WM_APP + 5;
 pub const WM_APP_NATIVE_NOTIFICATION: u32 = WM_APP + 6;
+pub const WM_APP_DAEMON_SESSION_READY: u32 = WM_APP + 7;
 
 /// Commands sent to the daemon I/O thread
 pub enum DaemonCmd {
@@ -62,6 +68,104 @@ pub enum DaemonCmd {
     SetTabColor(String),
     SetTemplateName(String),
     SetFrontendState(cterm_core::FrontendState),
+    ClearAlert,
+    /// Detach this frontend while leaving the daemon-owned session alive.
+    Close,
+    /// Destroy the daemon-owned session as part of an explicit UI close.
+    Destroy,
+}
+
+type RemoteDaemonEndpoint = (cterm_client::RemoteManager, String, String, bool);
+
+#[derive(Clone)]
+struct DaemonPaneContext {
+    remote: Option<RemoteDaemonEndpoint>,
+    remote_name: Option<String>,
+    daemon_socket: Option<std::path::PathBuf>,
+    shell: Option<String>,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    term: Option<String>,
+    ssh: Option<cterm_client::SshParams>,
+}
+
+impl DaemonPaneContext {
+    fn from_options(
+        options: &cterm_client::CreateSessionOpts,
+        remote: Option<RemoteDaemonEndpoint>,
+    ) -> Self {
+        Self {
+            remote_name: remote.as_ref().map(|(_, name, _, _)| name.clone()),
+            remote,
+            daemon_socket: None,
+            shell: options.shell.clone(),
+            args: options.args.clone(),
+            env: options.env.clone(),
+            term: options.term.clone(),
+            ssh: options.ssh.clone(),
+        }
+    }
+
+    fn local_default() -> Self {
+        Self {
+            remote: None,
+            remote_name: None,
+            daemon_socket: None,
+            shell: None,
+            args: Vec::new(),
+            env: Vec::new(),
+            term: None,
+            ssh: None,
+        }
+    }
+
+    fn launch_context(&self) -> cterm_app::upgrade::PaneLaunchContext {
+        cterm_app::upgrade::PaneLaunchContext::capture(&cterm_client::CreateSessionOpts {
+            shell: self.shell.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+            term: self.term.clone(),
+            ssh: self.ssh.clone(),
+            ..Default::default()
+        })
+    }
+
+    fn apply_launch_context(&mut self, launch: &cterm_app::upgrade::PaneLaunchContext) {
+        let mut options = cterm_client::CreateSessionOpts::default();
+        launch.apply_to(&mut options);
+        self.shell = options.shell;
+        self.args = options.args;
+        self.env = options.env;
+        self.term = options.term;
+        self.ssh = options.ssh;
+    }
+}
+
+#[derive(Clone)]
+enum PaneBackendContext {
+    LocalPty,
+    Daemon(Box<DaemonPaneContext>),
+}
+
+struct DaemonSessionReady {
+    session_id: String,
+    daemon_socket: Option<std::path::PathBuf>,
+}
+
+struct DaemonTabMetadata {
+    title: String,
+    color: Option<String>,
+    background_color: Option<String>,
+    title_locked: bool,
+    template_name: Option<String>,
+    keep_open: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneDivider {
+    path: Vec<PaneBranch>,
+    direction: SplitDirection,
+    split_rect: PaneRect,
 }
 
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
@@ -151,23 +255,123 @@ fn mapped_terminal_key(
     Some(functional)
 }
 
-/// Tab entry
+fn send_terminal_focus_event(terminal: &Arc<Mutex<Terminal>>, focused: bool) {
+    let mut terminal = terminal.lock().unwrap();
+    if terminal.screen().modes.focus_events {
+        let sequence = if focused { b"\x1b[I" } else { b"\x1b[O" };
+        if let Err(error) = terminal.write(sequence) {
+            log::error!("Failed to send pane focus event: {error}");
+        }
+    }
+}
+
+/// One live terminal session displayed by a pane.
+pub struct PaneEntry {
+    pub source_id: u64,
+    pub terminal: Arc<Mutex<Terminal>>,
+    /// Last display title associated with this pane.
+    pub title: String,
+    #[allow(dead_code)]
+    pub reader_handle: Option<thread::JoinHandle<()>>,
+    /// Session ID for daemon-backed panes.
+    pub session_id: Option<String>,
+    /// Concrete daemon socket or named pipe used to reattach this pane.
+    pub daemon_socket: Option<std::path::PathBuf>,
+    /// Whether this pane's display title is locked against OSC updates.
+    pub title_locked: bool,
+    /// Template identity used to create this pane, when known.
+    pub template_name: Option<String>,
+    /// Keep this pane in the layout after its child exits.
+    pub keep_open: bool,
+    /// Whether this pane has an unacknowledged bell while it was unfocused.
+    pub has_bell: bool,
+    /// Command sender for daemon-backed panes.
+    pub daemon_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<DaemonCmd>>,
+    backend: PaneBackendContext,
+}
+
+impl PaneEntry {
+    fn shutdown(&mut self) {
+        if let Some(sender) = self.daemon_cmd_tx.take() {
+            let _ = sender.send(DaemonCmd::Close);
+        }
+        if let Ok(mut terminal) = self.terminal.lock() {
+            // Dropping the owning PTY terminates a local child and wakes the
+            // cloned reader handle. Daemon sessions deliberately survive UI
+            // teardown and detach through DaemonCmd::Close above.
+            drop(terminal.take_pty());
+        }
+    }
+
+    fn destroy(&mut self) {
+        if let Some(sender) = self.daemon_cmd_tx.take() {
+            let _ = sender.send(DaemonCmd::Destroy);
+        }
+        if let Ok(mut terminal) = self.terminal.lock() {
+            drop(terminal.take_pty());
+        }
+    }
+}
+
+impl Drop for PaneEntry {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Tab entry.
 pub struct TabEntry {
     pub id: u64,
     pub title: String,
-    pub terminal: Arc<Mutex<Terminal>>,
     pub color: Option<String>,
     pub background_color: Option<String>,
     pub has_bell: bool,
     /// Whether title was explicitly set (locks out OSC updates)
     pub title_locked: bool,
-    #[allow(dead_code)]
-    pub reader_handle: Option<thread::JoinHandle<()>>,
-    /// Session ID for daemon-backed tabs
-    pub session_id: Option<String>,
-    /// Command sender for daemon-backed tabs (write/resize)
-    #[allow(dead_code)]
-    pub daemon_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<DaemonCmd>>,
+    pub pane_layout: PaneLayout,
+    pub panes: BTreeMap<PaneId, PaneEntry>,
+}
+
+impl TabEntry {
+    fn new(
+        id: u64,
+        title: String,
+        color: Option<String>,
+        background_color: Option<String>,
+        title_locked: bool,
+        pane: PaneEntry,
+    ) -> Self {
+        let pane_layout = PaneLayout::new();
+        let panes = BTreeMap::from([(pane_layout.active(), pane)]);
+        Self {
+            id,
+            title,
+            color,
+            background_color,
+            has_bell: false,
+            title_locked,
+            pane_layout,
+            panes,
+        }
+    }
+
+    fn active_pane(&self) -> Option<&PaneEntry> {
+        self.panes.get(&self.pane_layout.active())
+    }
+
+    fn active_pane_mut(&mut self) -> Option<&mut PaneEntry> {
+        self.panes.get_mut(&self.pane_layout.active())
+    }
+
+    fn active_terminal(&self) -> Option<Arc<Mutex<Terminal>>> {
+        self.active_pane().map(|pane| Arc::clone(&pane.terminal))
+    }
+
+    fn pane_id_for_source(&self, source_id: u64) -> Option<PaneId> {
+        self.panes
+            .iter()
+            .find_map(|(id, pane)| (pane.source_id == source_id).then_some(*id))
+    }
 }
 
 /// Window state
@@ -179,6 +383,7 @@ pub struct WindowState {
     pub tabs: Vec<TabEntry>,
     pub active_tab_index: usize,
     pub next_tab_id: AtomicU64,
+    next_source_id: AtomicU64,
     pub renderer: Option<TerminalRenderer>,
     pub tab_bar: TabBar,
     pub notification_bar: NotificationBar,
@@ -194,6 +399,7 @@ pub struct WindowState {
     /// Last reported pointer position, used to coalesce cell-based motion while
     /// retaining every pixel transition in mode 1016.
     last_reported_mouse_position: Option<MousePosition>,
+    pane_divider_drag: Option<PaneDivider>,
     /// Key releases paired with key-down events consumed by application
     /// shortcuts must not leak into enhanced keyboard reporting.
     suppressed_key_releases: HashSet<u16>,
@@ -240,6 +446,7 @@ impl WindowState {
             tabs: Vec::new(),
             active_tab_index: 0,
             next_tab_id: AtomicU64::new(0),
+            next_source_id: AtomicU64::new(1),
             renderer: None,
             tab_bar,
             notification_bar,
@@ -249,6 +456,7 @@ impl WindowState {
             mouse_report_button: None,
             last_mouse_pos: (0.0, 0.0),
             last_reported_mouse_position: None,
+            pane_divider_drag: None,
             suppressed_key_releases: HashSet::new(),
             reported_keys: HashMap::new(),
             enhanced_text_keys: HashSet::new(),
@@ -267,6 +475,10 @@ impl WindowState {
         let renderer = TerminalRenderer::new(self.hwnd, &self.theme, font_family, font_size)?;
         self.renderer = Some(renderer);
         Ok(())
+    }
+
+    fn allocate_source_id(&self) -> u64 {
+        self.next_source_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Create a new tab
@@ -310,71 +522,28 @@ impl WindowState {
         self.new_tab_with_options(opts, initial_title, false)
     }
 
-    /// Create a local PTY tab from an argv-safe process specification.
+    /// Create a daemon-backed tab from an argv-safe process specification.
+    ///
+    /// Normal desktop tabs deliberately use ctermd as well as managed tabs so
+    /// every live Windows session can be handed to a replacement UI process.
     pub fn new_tab_with_options(
         &mut self,
         opts: cterm_client::CreateSessionOpts,
         initial_title: String,
         title_locked: bool,
     ) -> Result<u64, Box<dyn std::error::Error>> {
-        let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
-
-        // Get terminal size
-        let (cols, rows) = self.terminal_size();
-        let (pixel_width, pixel_height) = self.terminal_pixel_size();
-
-        // Create terminal
-        let screen_config = ScreenConfig {
-            scrollback_lines: self.config.general.scrollback_lines,
-        };
-
-        let pty_config = PtyConfig {
-            size: PtySize {
-                cols: cols as u16,
-                rows: rows as u16,
-                pixel_width: pixel_width.min(u16::MAX as u32) as u16,
-                pixel_height: pixel_height.min(u16::MAX as u32) as u16,
+        Ok(self.spawn_daemon_tab_configured(
+            opts,
+            DaemonTabMetadata {
+                title: initial_title,
+                color: None,
+                background_color: None,
+                title_locked,
+                template_name: None,
+                keep_open: false,
             },
-            shell: opts.shell,
-            args: opts.args,
-            cwd: opts.cwd.map(std::path::PathBuf::from),
-            env: opts.env,
-            term: opts.term,
-        };
-
-        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
-        terminal.set_base_palette(terminal_palette(&self.theme, None));
-        terminal.set_frontend_state(cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
-            ..Default::default()
-        });
-        let terminal = Arc::new(Mutex::new(terminal));
-
-        // Start PTY reader thread
-        let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
-
-        let entry = TabEntry {
-            id: tab_id,
-            title: initial_title.clone(),
-            terminal,
-            color: None,
-            background_color: None,
-            has_bell: false,
-            title_locked,
-            reader_handle: Some(reader_handle),
-            session_id: None,
-            daemon_cmd_tx: None,
-        };
-
-        self.tabs.push(entry);
-        self.active_tab_index = self.tabs.len() - 1;
-        self.set_window_visibility(self.window_visibility);
-
-        // Update tab bar with shell basename
-        self.tab_bar.add_tab(tab_id, &initial_title);
-        self.tab_bar.set_active(tab_id);
-
-        Ok(tab_id)
+            None,
+        ))
     }
 
     /// Create a new tab from a template
@@ -388,198 +557,51 @@ impl WindowState {
                 std::io::Error::other("secondary sessions are disabled in managed mode").into(),
             );
         }
-        // If the template specifies a remote, use a daemon-backed tab
-        if let Some(ref remote_name) = template.remote {
-            let remote_cfg = self
+        #[cfg(not(unix))]
+        if template.remote.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "remote daemon templates are not supported by the Windows transport",
+            )
+            .into());
+        }
+        let remote = if let Some(ref remote_name) = template.remote {
+            let remote_config = self
                 .config
                 .remotes
                 .iter()
                 .find(|r| r.name == *remote_name)
-                .cloned();
-            if remote_cfg.is_none() {
-                log::error!(
-                    "Remote '{}' not found in config, creating locally",
-                    remote_name
-                );
-            }
-
-            let remote = remote_cfg.map(|r| {
-                (
-                    self.remote_manager.clone(),
-                    r.name.clone(),
-                    r.host.clone(),
-                    r.ssh_compression,
-                )
-            });
-            let (cols, rows) = self.terminal_size();
-            let opts = cterm_client::CreateSessionOpts {
-                cols: cols as u32,
-                rows: rows as u32,
-                shell: template.command.clone(),
-                args: template.args.clone(),
-                cwd: template
-                    .working_directory
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string()),
-                env: template
-                    .env
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                // SSH tabs open a native puressh connection on the daemon.
-                ssh: template.ssh.as_ref().map(|s| s.to_ssh_params()),
-                ..Default::default()
-            };
-            let tab_id = self.spawn_daemon_tab(
-                opts,
-                template.name.clone(),
-                template.color.clone(),
-                template.background_color.clone(),
-                template.keep_open,
-                remote,
-            );
-            return Ok(tab_id);
-        }
-
-        let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
-
-        // Get terminal size
-        let (cols, rows) = self.terminal_size();
-
-        // Create terminal
-        let screen_config = ScreenConfig {
-            scrollback_lines: self.config.general.scrollback_lines,
-        };
-
-        // Build the shell command and args from the template
-        let (shell, args) = if let Some(ref docker) = template.docker {
-            // Docker tab
-            match docker.mode {
-                cterm_app::config::DockerMode::Exec => {
-                    // Docker exec into container
-                    let container = docker.container.clone().unwrap_or_default();
-                    let shell_cmd = docker
-                        .shell
-                        .clone()
-                        .unwrap_or_else(|| "/bin/sh".to_string());
-                    (
-                        Some("docker".to_string()),
-                        vec!["exec".to_string(), "-it".to_string(), container, shell_cmd],
+                .cloned()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("remote '{remote_name}' is not configured"),
                     )
-                }
-                cterm_app::config::DockerMode::Run
-                | cterm_app::config::DockerMode::DevContainer => {
-                    // Docker run image
-                    let image = docker.image.clone().unwrap_or_else(|| "ubuntu".to_string());
-                    let mut run_args = vec!["run".to_string(), "-it".to_string()];
-                    if docker.auto_remove {
-                        run_args.push("--rm".to_string());
-                    }
-                    run_args.push(image);
-                    (Some("docker".to_string()), run_args)
-                }
-            }
-        } else if let Some(ref cmd) = template.command {
-            // Use template command
-            (Some(cmd.clone()), template.args.clone())
+                })?;
+
+            Some((
+                self.remote_manager.clone(),
+                remote_config.name,
+                remote_config.host,
+                remote_config.ssh_compression,
+            ))
         } else {
-            // Use default shell
-            (self.config.general.default_shell.clone(), Vec::new())
+            None
         };
-
-        let pty_config = PtyConfig {
-            size: PtySize {
-                cols: cols as u16,
-                rows: rows as u16,
-                pixel_width: (self
-                    .renderer
-                    .as_ref()
-                    .map(|r| r.cell_dimensions().width)
-                    .unwrap_or(8.0)
-                    * cols as f32)
-                    .round()
-                    .clamp(1.0, u16::MAX as f32) as u16,
-                pixel_height: (self
-                    .renderer
-                    .as_ref()
-                    .map(|r| r.cell_dimensions().height)
-                    .unwrap_or(16.0)
-                    * rows as f32)
-                    .round()
-                    .clamp(1.0, u16::MAX as f32) as u16,
+        let (cols, rows) = self.terminal_size();
+        let options = template_session_options(template, &self.config, cols as u32, rows as u32);
+        Ok(self.spawn_daemon_tab_configured(
+            options,
+            DaemonTabMetadata {
+                title: template.name.clone(),
+                color: template.color.clone(),
+                background_color: template.background_color.clone(),
+                title_locked: true,
+                template_name: Some(template.name.clone()),
+                keep_open: template.keep_open,
             },
-            shell,
-            args,
-            cwd: template
-                .working_directory
-                .clone()
-                .or_else(|| self.config.general.working_directory.clone()),
-            env: template
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .chain(
-                    self.config
-                        .general
-                        .env
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone())),
-                )
-                .collect(),
-            term: self.config.general.term.clone(),
-        };
-
-        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
-        terminal.set_base_palette(terminal_palette(
-            &self.theme,
-            template.background_color.as_deref(),
-        ));
-        terminal.set_frontend_state(cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
-            ..Default::default()
-        });
-        let terminal = Arc::new(Mutex::new(terminal));
-
-        // Start PTY reader thread
-        let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
-
-        let entry = TabEntry {
-            id: tab_id,
-            title: template.name.clone(),
-            terminal,
-            color: template.color.clone(),
-            background_color: template.background_color.clone(),
-            has_bell: false,
-            title_locked: true, // Lock title for template tabs
-            reader_handle: Some(reader_handle),
-            session_id: None,
-            daemon_cmd_tx: None,
-        };
-
-        self.tabs.push(entry);
-        self.active_tab_index = self.tabs.len() - 1;
-        self.set_window_visibility(self.window_visibility);
-
-        // Update tab bar
-        self.tab_bar.add_tab(tab_id, &template.name);
-        self.tab_bar.set_active(tab_id);
-
-        // Set tab color if specified
-        if let Some(ref color_hex) = template.color {
-            let rgb = parse_hex_color(color_hex);
-            self.tab_bar.set_color(tab_id, rgb);
-        }
-
-        // Apply background color override from template
-        if let Some(ref bg) = template.background_color {
-            if let Some(ref mut renderer) = self.renderer {
-                renderer.set_background_override(Some(bg));
-            }
-        }
-
-        self.invalidate();
-
-        Ok(tab_id)
+            remote,
+        ))
     }
 
     /// Create a new tab for Docker (exec into container or run image)
@@ -593,13 +615,6 @@ impl WindowState {
                 std::io::Error::other("secondary sessions are disabled in managed mode").into(),
             );
         }
-        let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
-        let (cols, rows) = self.terminal_size();
-
-        let screen_config = ScreenConfig {
-            scrollback_lines: self.config.general.scrollback_lines,
-        };
-
         // Build the docker command based on selection
         let (shell, args, title) = match &selection {
             crate::docker_dialog::DockerSelection::ExecContainer(container) => (
@@ -631,30 +646,15 @@ impl WindowState {
             }
         };
 
-        let pty_config = PtyConfig {
-            size: PtySize {
-                cols: cols as u16,
-                rows: rows as u16,
-                pixel_width: (self
-                    .renderer
-                    .as_ref()
-                    .map(|r| r.cell_dimensions().width)
-                    .unwrap_or(8.0)
-                    * cols as f32)
-                    .round()
-                    .clamp(1.0, u16::MAX as f32) as u16,
-                pixel_height: (self
-                    .renderer
-                    .as_ref()
-                    .map(|r| r.cell_dimensions().height)
-                    .unwrap_or(16.0)
-                    * rows as f32)
-                    .round()
-                    .clamp(1.0, u16::MAX as f32) as u16,
-            },
+        let opts = cterm_client::CreateSessionOpts {
             shell,
             args,
-            cwd: self.config.general.working_directory.clone(),
+            cwd: self
+                .config
+                .general
+                .working_directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             env: self
                 .config
                 .general
@@ -663,41 +663,20 @@ impl WindowState {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             term: self.config.general.term.clone(),
-        };
-
-        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
-        terminal.set_base_palette(terminal_palette(&self.theme, None));
-        terminal.set_frontend_state(cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
             ..Default::default()
-        });
-        let terminal = Arc::new(Mutex::new(terminal));
-
-        let reader_handle = self.start_pty_reader(tab_id, Arc::clone(&terminal));
-
-        let entry = TabEntry {
-            id: tab_id,
-            title: title.clone(),
-            terminal,
-            color: None,
-            background_color: None,
-            has_bell: false,
-            title_locked: true, // Lock title for docker tabs
-            reader_handle: Some(reader_handle),
-            session_id: None,
-            daemon_cmd_tx: None,
         };
-
-        self.tabs.push(entry);
-        self.active_tab_index = self.tabs.len() - 1;
-        self.set_window_visibility(self.window_visibility);
-
-        self.tab_bar.add_tab(tab_id, &title);
-        self.tab_bar.set_active(tab_id);
-
-        self.invalidate();
-
-        Ok(tab_id)
+        Ok(self.spawn_daemon_tab_configured(
+            opts,
+            DaemonTabMetadata {
+                title,
+                color: None,
+                background_color: None,
+                title_locked: true,
+                template_name: None,
+                keep_open: false,
+            },
+            None,
+        ))
     }
 
     /// Create a new daemon-backed tab
@@ -708,20 +687,54 @@ impl WindowState {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_daemon_tab(
         &mut self,
-        mut opts: cterm_client::CreateSessionOpts,
+        opts: cterm_client::CreateSessionOpts,
         title: String,
         color: Option<String>,
         background_color: Option<String>,
-        _keep_open: bool,
+        keep_open: bool,
         remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
     ) -> u64 {
+        self.spawn_daemon_tab_configured(
+            opts,
+            DaemonTabMetadata {
+                title,
+                color,
+                background_color,
+                title_locked: true,
+                template_name: None,
+                keep_open,
+            },
+            remote,
+        )
+    }
+
+    fn spawn_daemon_tab_configured(
+        &mut self,
+        mut opts: cterm_client::CreateSessionOpts,
+        metadata: DaemonTabMetadata,
+        remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
+    ) -> u64 {
+        let DaemonTabMetadata {
+            title,
+            color,
+            background_color,
+            title_locked,
+            template_name,
+            keep_open,
+        } = metadata;
         let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
         let (cols, rows) = self.terminal_size();
         let (pixel_width, pixel_height) = self.terminal_pixel_size();
 
-        // Older call sites initialize only rows and columns. Populate the new
-        // pixel fields at the shared create boundary so every daemon-backed tab
-        // starts with the real viewport geometry.
+        // Older call sites leave some or all geometry fields empty. Populate
+        // them at the shared create boundary so every daemon-backed tab starts
+        // with the real viewport geometry.
+        if opts.cols == 0 {
+            opts.cols = cols as u32;
+        }
+        if opts.rows == 0 {
+            opts.rows = rows as u32;
+        }
         if opts.pixel_width == 0 {
             opts.pixel_width = pixel_width;
         }
@@ -730,6 +743,11 @@ impl WindowState {
         }
         opts.base_palette = Some(terminal_palette(&self.theme, background_color.as_deref()));
         opts.frontend_state.appearance = self.theme.appearance();
+        opts.frontend_state.visibility = self.window_visibility;
+        let backend = PaneBackendContext::Daemon(Box::new(DaemonPaneContext::from_options(
+            &opts,
+            remote.clone(),
+        )));
 
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
@@ -753,24 +771,49 @@ impl WindowState {
 
         let terminal = Arc::new(Mutex::new(terminal));
 
-        let entry = TabEntry {
-            id: tab_id,
-            title: title.clone(),
-            terminal: Arc::clone(&terminal),
-            color: color.clone(),
-            background_color: background_color.clone(),
-            has_bell: false,
-            title_locked: true,
-            reader_handle: None,
-            session_id: None,
-            daemon_cmd_tx: Some(cmd_tx),
-        };
+        let source_id = self.allocate_source_id();
+        let previous_focus = self
+            .tabs
+            .get(self.active_tab_index)
+            .map(|tab| (self.active_tab_index, tab.pane_layout.active()));
+        let had_focus = self.window_has_focus();
+        let entry = TabEntry::new(
+            tab_id,
+            title.clone(),
+            color.clone(),
+            background_color.clone(),
+            title_locked,
+            PaneEntry {
+                source_id,
+                terminal: Arc::clone(&terminal),
+                title: title.clone(),
+                reader_handle: None,
+                session_id: None,
+                daemon_socket: None,
+                title_locked,
+                template_name: template_name.clone(),
+                keep_open,
+                has_bell: false,
+                daemon_cmd_tx: Some(cmd_tx),
+                backend,
+            },
+        );
 
         self.tabs.push(entry);
         self.active_tab_index = self.tabs.len() - 1;
+        if had_focus {
+            if let Some((tab_index, pane_id)) = previous_focus {
+                self.send_pane_focus_event_in_tab(tab_index, pane_id, false);
+            }
+            let pane_id = self.tabs[self.active_tab_index].pane_layout.active();
+            self.send_pane_focus_event(pane_id, true);
+        }
         self.set_window_visibility(self.window_visibility);
         self.tab_bar.add_tab(tab_id, &title);
         self.tab_bar.set_active(tab_id);
+        for index in 0..self.tabs.len() {
+            self.resize_tab_panes(index);
+        }
 
         if let Some(ref color_hex) = color {
             let rgb = parse_hex_color(color_hex);
@@ -785,14 +828,20 @@ impl WindowState {
 
         let hwnd = self.hwnd.0 as usize;
         let reader_handle =
-            start_daemon_create_thread(hwnd, tab_id, terminal, opts, remote, cmd_rx);
+            start_daemon_create_thread(hwnd, source_id, terminal, opts, remote, None, cmd_rx);
 
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-            tab.reader_handle = Some(reader_handle);
+            let pane = tab
+                .active_pane_mut()
+                .expect("a newly created tab has one active pane");
+            pane.reader_handle = Some(reader_handle);
             // Send metadata to daemon (queued until session is created)
-            if let Some(ref tx) = tab.daemon_cmd_tx {
-                if !title.is_empty() {
-                    let _ = tx.send(DaemonCmd::SetTemplateName(title));
+            if let Some(ref tx) = pane.daemon_cmd_tx {
+                if title_locked && !title.is_empty() {
+                    let _ = tx.send(DaemonCmd::SetTitle(title));
+                }
+                if let Some(template_name) = template_name {
+                    let _ = tx.send(DaemonCmd::SetTemplateName(template_name));
                 }
                 if let Some(ref c) = color {
                     let _ = tx.send(DaemonCmd::SetTabColor(c.clone()));
@@ -862,25 +911,67 @@ impl WindowState {
             Some(ref ct) if !ct.is_empty() => (ct.clone(), true),
             _ => (title, false),
         };
+        let attached_context = DaemonPaneContext::from_options(
+            &cterm_client::CreateSessionOpts {
+                shell: self.config.general.default_shell.clone(),
+                args: self.config.general.shell_args.clone(),
+                env: self
+                    .config
+                    .general
+                    .env
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                term: self.config.general.term.clone(),
+                ..Default::default()
+            },
+            None,
+        );
 
-        let entry = TabEntry {
-            id: tab_id,
-            title: display_title.clone(),
-            terminal: Arc::clone(&terminal),
-            color: color.clone(),
-            background_color: None,
-            has_bell: false,
+        let source_id = self.allocate_source_id();
+        let previous_focus = self
+            .tabs
+            .get(self.active_tab_index)
+            .map(|tab| (self.active_tab_index, tab.pane_layout.active()));
+        let had_focus = self.window_has_focus();
+        let entry = TabEntry::new(
+            tab_id,
+            display_title.clone(),
+            color.clone(),
+            None,
             title_locked,
-            reader_handle: None,
-            session_id: Some(session_id.to_string()),
-            daemon_cmd_tx: Some(cmd_tx),
-        };
+            PaneEntry {
+                source_id,
+                terminal: Arc::clone(&terminal),
+                title: display_title.clone(),
+                reader_handle: None,
+                session_id: Some(session_id.to_string()),
+                daemon_socket: None,
+                title_locked,
+                template_name: None,
+                keep_open: false,
+                has_bell: false,
+                daemon_cmd_tx: Some(cmd_tx),
+                backend: PaneBackendContext::Daemon(Box::new(attached_context)),
+            },
+        );
 
         self.tabs.push(entry);
         self.active_tab_index = self.tabs.len() - 1;
+        if had_focus {
+            if let Some((tab_index, pane_id)) = previous_focus {
+                self.send_pane_focus_event_in_tab(tab_index, pane_id, false);
+            }
+            let pane_id = self.tabs[self.active_tab_index].pane_layout.active();
+            self.send_pane_focus_event(pane_id, true);
+            self.clear_active_pane_bell();
+        }
         self.set_window_visibility(self.window_visibility);
         self.tab_bar.add_tab(tab_id, &display_title);
         self.tab_bar.set_active(tab_id);
+        for index in 0..self.tabs.len() {
+            self.resize_tab_panes(index);
+        }
 
         if let Some(ref color_hex) = color {
             let rgb = parse_hex_color(color_hex);
@@ -891,7 +982,7 @@ impl WindowState {
         let sid = session_id.to_string();
         let reader_handle = start_daemon_attach_thread(
             hwnd,
-            tab_id,
+            source_id,
             terminal,
             sid,
             cols as u32,
@@ -903,17 +994,182 @@ impl WindowState {
         );
 
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-            tab.reader_handle = Some(reader_handle);
+            tab.active_pane_mut()
+                .expect("a newly attached tab has one active pane")
+                .reader_handle = Some(reader_handle);
         }
 
         self.invalidate();
         tab_id
     }
 
+    fn restored_daemon_context(
+        &self,
+        pane_state: &cterm_app::upgrade::PaneUpgradeState,
+        daemon_socket: Option<std::path::PathBuf>,
+        cols: usize,
+        rows: usize,
+    ) -> DaemonPaneContext {
+        let remote = pane_state.remote_name.as_ref().and_then(|name| {
+            self.config
+                .remotes
+                .iter()
+                .find(|remote| remote.name == *name)
+                .map(|remote| {
+                    (
+                        self.remote_manager.clone(),
+                        remote.name.clone(),
+                        remote.host.clone(),
+                        remote.ssh_compression,
+                    )
+                })
+        });
+        let mut context = DaemonPaneContext::local_default();
+        context.shell = self.config.general.default_shell.clone();
+        context.args = self.config.general.shell_args.clone();
+        context.env = self
+            .config
+            .general
+            .env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        context.term = self.config.general.term.clone();
+        context.remote = remote;
+        context.remote_name.clone_from(&pane_state.remote_name);
+        context.daemon_socket = daemon_socket;
+        if let Some(template) = pane_state.template_name.as_ref().and_then(|name| {
+            self.config
+                .sticky_tabs
+                .iter()
+                .find(|template| template.name == *name)
+        }) {
+            let options =
+                template_session_options(template, &self.config, cols as u32, rows as u32);
+            context.shell = options.shell;
+            context.args = options.args;
+            context.env = options.env;
+            context.term = options.term;
+            context.ssh = options.ssh;
+        }
+        if let Some(launch) = pane_state.launch_context.as_ref() {
+            context.apply_launch_context(launch);
+        }
+        context
+    }
+
+    fn make_attached_pane(
+        &self,
+        pane_state: &cterm_app::upgrade::PaneUpgradeState,
+        screen_snapshot: Option<cterm_proto::proto::GetScreenResponse>,
+        daemon_socket: Option<std::path::PathBuf>,
+        alerted: bool,
+    ) -> Option<PaneEntry> {
+        let session_id = pane_state.session_id.as_ref()?;
+        let (cols, rows) = self.terminal_size();
+        let (pixel_width, pixel_height) = self.terminal_pixel_size();
+        let screen_config = ScreenConfig {
+            scrollback_lines: self.config.general.scrollback_lines,
+        };
+        let base_palette = terminal_palette(&self.theme, None);
+        let frontend_state = cterm_core::FrontendState {
+            appearance: self.theme.appearance(),
+            visibility: self.window_visibility,
+        };
+        let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.set_base_palette(base_palette.clone());
+        terminal.set_frontend_state(frontend_state);
+        if let Some(ref screen) = screen_snapshot {
+            cterm_app::daemon_session::apply_screen_snapshot(&mut terminal, screen);
+        }
+        terminal.resize_with_pixels(
+            cols,
+            rows,
+            pixel_width.min(u16::MAX as u32) as u16,
+            pixel_height.min(u16::MAX as u32) as u16,
+        );
+
+        let (command_sender, command_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<DaemonCmd>();
+        let write_sender = command_sender.clone();
+        terminal.set_write_fn(Box::new(move |data: &[u8]| {
+            let _ = write_sender.send(DaemonCmd::Write(data.to_vec()));
+            Ok(())
+        }));
+        let terminal = Arc::new(Mutex::new(terminal));
+        let source_id = self.allocate_source_id();
+
+        let context = self.restored_daemon_context(pane_state, daemon_socket.clone(), cols, rows);
+        let reader_handle = start_daemon_attach_thread(
+            self.hwnd.0 as usize,
+            source_id,
+            Arc::clone(&terminal),
+            session_id.clone(),
+            cols as u32,
+            rows as u32,
+            command_receiver,
+            daemon_socket.clone(),
+            base_palette,
+            frontend_state,
+        );
+        Some(PaneEntry {
+            source_id,
+            terminal,
+            title: pane_state.title.clone(),
+            reader_handle: Some(reader_handle),
+            session_id: Some(session_id.clone()),
+            daemon_socket,
+            title_locked: pane_state.title_locked,
+            template_name: pane_state.template_name.clone(),
+            keep_open: pane_state.keep_open,
+            has_bell: alerted,
+            daemon_cmd_tx: Some(command_sender),
+            backend: PaneBackendContext::Daemon(Box::new(context)),
+        })
+    }
+
+    fn make_unavailable_remote_pane(
+        &self,
+        pane_state: &cterm_app::upgrade::PaneUpgradeState,
+        reason: &str,
+    ) -> Option<PaneEntry> {
+        let session_id = pane_state.session_id.clone()?;
+        let (cols, rows) = self.terminal_size();
+        let screen_config = ScreenConfig {
+            scrollback_lines: self.config.general.scrollback_lines,
+        };
+        let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.set_base_palette(terminal_palette(&self.theme, None));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: self.theme.appearance(),
+            visibility: self.window_visibility,
+        });
+        let message = format!(
+            "\r\ncterm preserved remote session {session_id}, but this Windows build cannot attach it:\r\n{reason}\r\n"
+        );
+        let _ = terminal.process(message.as_bytes());
+        Some(PaneEntry {
+            source_id: self.allocate_source_id(),
+            terminal: Arc::new(Mutex::new(terminal)),
+            title: pane_state.title.clone(),
+            reader_handle: None,
+            session_id: Some(session_id),
+            daemon_socket: pane_state.daemon_socket.clone(),
+            title_locked: pane_state.title_locked,
+            template_name: pane_state.template_name.clone(),
+            keep_open: true,
+            has_bell: true,
+            daemon_cmd_tx: None,
+            backend: PaneBackendContext::Daemon(Box::new(
+                self.restored_daemon_context(pane_state, None, cols, rows),
+            )),
+        })
+    }
+
     /// Start the PTY reader thread
     fn start_pty_reader(
         &self,
-        tab_id: u64,
+        source_id: u64,
         terminal: Arc<Mutex<Terminal>>,
     ) -> thread::JoinHandle<()> {
         let hwnd = self.hwnd.0 as usize;
@@ -925,16 +1181,17 @@ impl WindowState {
             let term = terminal.lock().unwrap();
             term.pty().and_then(|pty| pty.try_clone_reader().ok())
         };
-        let sync_watchdog = spawn_synchronized_update_watchdog(hwnd, tab_id, Arc::clone(&terminal));
+        let sync_watchdog =
+            spawn_synchronized_update_watchdog(hwnd, source_id, Arc::clone(&terminal));
 
         thread::spawn(move || {
             let Some(mut reader) = pty_reader else {
-                log::error!("Failed to clone PTY reader for tab {}", tab_id);
+                log::error!("Failed to clone PTY reader for pane source {}", source_id);
                 unsafe {
                     let _ = PostMessageW(
                         Some(HWND(hwnd as *mut _)),
                         WM_APP_PTY_EXIT,
-                        WPARAM(tab_id as usize),
+                        WPARAM(source_id as usize),
                         LPARAM(0),
                     );
                 }
@@ -971,7 +1228,7 @@ impl WindowState {
                                     let _ = PostMessageW(
                                         Some(HWND(hwnd as *mut _)),
                                         WM_APP_TITLE_CHANGED,
-                                        WPARAM(tab_id as usize),
+                                        WPARAM(source_id as usize),
                                         LPARAM(0),
                                     );
                                 }
@@ -980,19 +1237,19 @@ impl WindowState {
                                 let _ = PostMessageW(
                                     Some(HWND(hwnd as *mut _)),
                                     WM_APP_BELL,
-                                    WPARAM(tab_id as usize),
+                                    WPARAM(source_id as usize),
                                     LPARAM(0),
                                 );
                             },
                             TerminalEvent::DesktopNotification(notification) => {
-                                post_desktop_notification(hwnd, tab_id, notification);
+                                post_desktop_notification(hwnd, source_id, notification);
                             }
                             TerminalEvent::ProcessExited(_) => {
                                 unsafe {
                                     let _ = PostMessageW(
                                         Some(HWND(hwnd as *mut _)),
                                         WM_APP_PTY_EXIT,
-                                        WPARAM(tab_id as usize),
+                                        WPARAM(source_id as usize),
                                         LPARAM(0),
                                     );
                                 }
@@ -1008,7 +1265,7 @@ impl WindowState {
                 let _ = sync_watchdog.send(sync_deadline);
 
                 if content_changed {
-                    post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                    post_message(hwnd, WM_APP_PTY_DATA, source_id);
                 }
             }
 
@@ -1017,21 +1274,67 @@ impl WindowState {
                 let _ = PostMessageW(
                     Some(HWND(hwnd as *mut _)),
                     WM_APP_PTY_EXIT,
-                    WPARAM(tab_id as usize),
+                    WPARAM(source_id as usize),
                     LPARAM(0),
                 );
             }
         })
     }
 
-    /// Check if any tab has a running foreground process
-    ///
-    /// Note: On Windows, process monitoring is not yet implemented,
-    /// so this always returns false.
+    /// Check if any pane has a running foreground process.
     pub fn has_running_process(&self) -> bool {
-        // Windows doesn't have foreground process detection yet
-        // TODO: Implement Windows process monitoring
-        false
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.values())
+            .any(Self::pane_has_running_process)
+    }
+
+    fn pane_has_running_process(pane: &PaneEntry) -> bool {
+        #[cfg(unix)]
+        if pane
+            .terminal
+            .lock()
+            .is_ok_and(|terminal| terminal.has_foreground_process())
+        {
+            return true;
+        }
+        let Some(session_id) = pane.session_id.clone() else {
+            return false;
+        };
+        let daemon_socket = pane.daemon_socket.clone();
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return false;
+        };
+        runtime.block_on(async move {
+            let connection = match daemon_socket {
+                Some(path) => cterm_client::DaemonConnection::connect_unix(&path, false).await,
+                None => cterm_client::DaemonConnection::connect_local().await,
+            };
+            let Ok(connection) = connection else {
+                return false;
+            };
+            connection
+                .get_session(&session_id)
+                .await
+                .is_ok_and(|session| session.has_foreground_process)
+        })
+    }
+
+    fn confirm_close_panes<'a>(&self, panes: impl Iterator<Item = &'a PaneEntry>) -> bool {
+        if self.skip_close_confirm || !self.config.general.confirm_close_with_running {
+            return true;
+        }
+        if !panes.into_iter().any(Self::pane_has_running_process) {
+            return true;
+        }
+        crate::dialogs::show_confirm(
+            self.hwnd.0 as *mut _,
+            "Close terminal?",
+            "A process is still running. Are you sure you want to close it?",
+        )
     }
 
     /// Check if we should confirm before closing
@@ -1046,11 +1349,561 @@ impl WindowState {
         self.has_running_process()
     }
 
+    /// Capture every daemon-backed pane for seamless process replacement.
+    pub fn collect_upgrade_state(&self) -> cterm_app::upgrade::WindowUpgradeState {
+        let mut state = cterm_app::upgrade::WindowUpgradeState::new();
+        let mut rect = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        state.x = rect.left;
+        state.y = rect.top;
+        state.width = rect.right.saturating_sub(rect.left);
+        state.height = rect.bottom.saturating_sub(rect.top);
+        state.maximized = unsafe { IsZoomed(self.hwnd).as_bool() };
+        let style = unsafe { GetWindowLongW(self.hwnd, GWL_STYLE) } as u32;
+        state.fullscreen = style & (WS_CAPTION.0 | WS_THICKFRAME.0) == 0;
+        state.active_tab = self.active_tab_index;
+
+        for tab in &self.tabs {
+            let mut tab_state = cterm_app::upgrade::TabUpgradeState::new(tab.id);
+            tab_state.title = tab.title.clone();
+            tab_state.custom_title = tab
+                .active_pane()
+                .is_some_and(|pane| pane.title_locked)
+                .then(|| tab.title.clone());
+            tab_state.color = tab.color.clone();
+            tab_state.pane_layout = Some(tab.pane_layout.clone());
+            for pane_id in tab.pane_layout.pane_ids() {
+                let Some(pane) = tab.panes.get(&pane_id) else {
+                    continue;
+                };
+                let terminal = pane.terminal.lock().unwrap();
+                let mut pane_state =
+                    cterm_app::upgrade::PaneUpgradeState::new(pane.session_id.clone());
+                pane_state.title = if pane.title_locked && !pane.title.is_empty() {
+                    pane.title.clone()
+                } else {
+                    let title = terminal.screen().title.clone();
+                    if title.is_empty() {
+                        pane.title.clone()
+                    } else {
+                        title
+                    }
+                };
+                pane_state.title_locked = pane.title_locked;
+                pane_state.template_name = pane.template_name.clone();
+                pane_state.cwd = terminal
+                    .foreground_cwd()
+                    .map(|path| path.to_string_lossy().into_owned());
+                pane_state.keep_open = pane.keep_open;
+                pane_state.daemon_socket = pane.daemon_socket.clone();
+                pane_state.remote_name = match &pane.backend {
+                    PaneBackendContext::Daemon(context) => context.remote_name.clone(),
+                    PaneBackendContext::LocalPty => None,
+                };
+                pane_state.launch_context = match &pane.backend {
+                    PaneBackendContext::Daemon(context) => Some(context.launch_context()),
+                    PaneBackendContext::LocalPty => None,
+                };
+                tab_state.panes.push(pane_state);
+            }
+            if let Some(active) = tab.active_pane().and_then(|pane| pane.session_id.as_ref()) {
+                tab_state.session_id = Some(active.clone());
+            }
+            if let Some(active) = tab.active_pane() {
+                tab_state.template_name = active.template_name.clone();
+                tab_state.keep_open = active.keep_open;
+                tab_state.cwd = active
+                    .terminal
+                    .lock()
+                    .ok()
+                    .and_then(|terminal| terminal.foreground_cwd())
+                    .map(|path| path.to_string_lossy().into_owned());
+            }
+            state.tabs.push(tab_state);
+        }
+        state
+    }
+
+    fn create_default_pane(&self) -> Result<PaneEntry, Box<dyn std::error::Error>> {
+        let cwd = self
+            .active_terminal()
+            .and_then(|terminal| terminal.lock().ok()?.foreground_cwd())
+            .or_else(|| self.config.general.working_directory.clone());
+        let backend = self
+            .tabs
+            .get(self.active_tab_index)
+            .and_then(TabEntry::active_pane)
+            .map(|pane| pane.backend.clone())
+            .ok_or_else(|| std::io::Error::other("there is no active pane"))?;
+        match backend {
+            PaneBackendContext::LocalPty => self.create_local_pane(cwd),
+            PaneBackendContext::Daemon(context) => {
+                #[cfg(not(unix))]
+                if context.remote.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "remote daemon panes are not supported by the Windows transport",
+                    )
+                    .into());
+                }
+                self.create_daemon_pane(*context, cwd)
+            }
+        }
+    }
+
+    fn create_local_pane(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<PaneEntry, Box<dyn std::error::Error>> {
+        let (cols, rows) = self.terminal_size();
+        let (pixel_width, pixel_height) = self.terminal_pixel_size();
+        let pty_config = PtyConfig {
+            size: PtySize {
+                cols: cols.min(u16::MAX as usize) as u16,
+                rows: rows.min(u16::MAX as usize) as u16,
+                pixel_width: pixel_width.min(u16::MAX as u32) as u16,
+                pixel_height: pixel_height.min(u16::MAX as u32) as u16,
+            },
+            shell: self.config.general.default_shell.clone(),
+            args: self.config.general.shell_args.clone(),
+            cwd,
+            env: self
+                .config
+                .general
+                .env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            term: self.config.general.term.clone(),
+        };
+        let screen_config = ScreenConfig {
+            scrollback_lines: self.config.general.scrollback_lines,
+        };
+        let background = self
+            .tabs
+            .get(self.active_tab_index)
+            .and_then(|tab| tab.background_color.as_deref());
+        let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        terminal.set_base_palette(terminal_palette(&self.theme, background));
+        terminal.set_frontend_state(cterm_core::FrontendState {
+            appearance: self.theme.appearance(),
+            visibility: self.window_visibility,
+        });
+        let terminal = Arc::new(Mutex::new(terminal));
+        let source_id = self.allocate_source_id();
+        let reader_handle = self.start_pty_reader(source_id, Arc::clone(&terminal));
+        Ok(PaneEntry {
+            source_id,
+            terminal,
+            title: "Terminal".to_string(),
+            reader_handle: Some(reader_handle),
+            session_id: None,
+            daemon_socket: None,
+            title_locked: false,
+            template_name: None,
+            keep_open: false,
+            has_bell: false,
+            daemon_cmd_tx: None,
+            backend: PaneBackendContext::LocalPty,
+        })
+    }
+
+    fn create_daemon_pane(
+        &self,
+        context: DaemonPaneContext,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<PaneEntry, Box<dyn std::error::Error>> {
+        let (cols, rows) = self.terminal_size();
+        let (pixel_width, pixel_height) = self.terminal_pixel_size();
+        let background = self
+            .tabs
+            .get(self.active_tab_index)
+            .and_then(|tab| tab.background_color.as_deref());
+        let frontend_state = cterm_core::FrontendState {
+            appearance: self.theme.appearance(),
+            visibility: self.window_visibility,
+        };
+        let options = cterm_client::CreateSessionOpts {
+            cols: cols as u32,
+            rows: rows as u32,
+            pixel_width,
+            pixel_height,
+            shell: context.shell.clone(),
+            args: context.args.clone(),
+            cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
+            env: context.env.clone(),
+            term: context.term.clone(),
+            ssh: context.ssh.clone(),
+            base_palette: Some(terminal_palette(&self.theme, background)),
+            frontend_state,
+        };
+
+        let screen_config = ScreenConfig {
+            scrollback_lines: self.config.general.scrollback_lines,
+        };
+        let mut terminal = Terminal::new(cols, rows, screen_config);
+        terminal.set_base_palette(terminal_palette(&self.theme, background));
+        terminal.set_frontend_state(frontend_state);
+        terminal.resize_with_pixels(
+            cols,
+            rows,
+            pixel_width.min(u16::MAX as u32) as u16,
+            pixel_height.min(u16::MAX as u32) as u16,
+        );
+        let (command_sender, command_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<DaemonCmd>();
+        let write_sender = command_sender.clone();
+        terminal.set_write_fn(Box::new(move |data: &[u8]| {
+            let _ = write_sender.send(DaemonCmd::Write(data.to_vec()));
+            Ok(())
+        }));
+        let terminal = Arc::new(Mutex::new(terminal));
+        let source_id = self.allocate_source_id();
+        let reader_handle = start_daemon_create_thread(
+            self.hwnd.0 as usize,
+            source_id,
+            Arc::clone(&terminal),
+            options,
+            context.remote.clone(),
+            context.daemon_socket.clone(),
+            command_receiver,
+        );
+        Ok(PaneEntry {
+            source_id,
+            terminal,
+            title: "Terminal".to_string(),
+            reader_handle: Some(reader_handle),
+            session_id: None,
+            daemon_socket: None,
+            title_locked: false,
+            template_name: None,
+            keep_open: false,
+            has_bell: false,
+            daemon_cmd_tx: Some(command_sender),
+            backend: PaneBackendContext::Daemon(Box::new(context)),
+        })
+    }
+
+    pub fn split_active_pane(&mut self, direction: SplitDirection) {
+        if crate::get_args().managed {
+            log::warn!("Ignoring split-pane request in managed mode");
+            return;
+        }
+        let previous = self
+            .tabs
+            .get(self.active_tab_index)
+            .map(|tab| tab.pane_layout.active());
+        let mut pane = match self.create_default_pane() {
+            Ok(pane) => pane,
+            Err(error) => {
+                log::error!("Failed to create pane session: {error}");
+                return;
+            }
+        };
+        let source_id = pane.source_id;
+        let Some(tab) = self.tabs.get_mut(self.active_tab_index) else {
+            return;
+        };
+        let pane_id = match tab.pane_layout.split_active(SplitRequest {
+            direction,
+            ..SplitRequest::default()
+        }) {
+            Ok(pane_id) => pane_id,
+            Err(error) => {
+                pane.destroy();
+                log::error!("Failed to split pane: {error}");
+                return;
+            }
+        };
+        tab.panes.insert(pane_id, pane);
+        log::info!(
+            "Split tab {} {:?}: pane {} source {}",
+            tab.id,
+            direction,
+            pane_id,
+            source_id
+        );
+        if self.window_has_focus() {
+            if let Some(previous) = previous {
+                self.send_pane_focus_event(previous, false);
+            }
+            self.send_pane_focus_event(pane_id, true);
+            self.clear_active_pane_bell();
+        }
+        self.refresh_active_tab_title();
+        self.resize_tab_panes(self.active_tab_index);
+        self.set_window_visibility(self.window_visibility);
+        self.invalidate();
+    }
+
+    pub fn close_active_pane(&mut self) {
+        let Some(tab) = self.tabs.get(self.active_tab_index) else {
+            return;
+        };
+        if tab.pane_layout.len() == 1 {
+            let tab_id = tab.id;
+            self.close_tab(tab_id);
+            return;
+        }
+        if !self.confirm_close_panes(tab.active_pane().into_iter()) {
+            return;
+        }
+
+        let had_focus = self.window_has_focus();
+        let (tab_id, pane_id, next_pane_id, mut removed) = {
+            let tab = &mut self.tabs[self.active_tab_index];
+            let pane_id = tab.pane_layout.active();
+            if let Err(error) = tab.pane_layout.close_active() {
+                log::error!("Failed to close pane: {error}");
+                return;
+            }
+            (
+                tab.id,
+                pane_id,
+                tab.pane_layout.active(),
+                tab.panes.remove(&pane_id),
+            )
+        };
+        if had_focus {
+            if let Some(pane) = removed.as_ref() {
+                send_terminal_focus_event(&pane.terminal, false);
+            }
+            self.send_pane_focus_event(next_pane_id, true);
+            self.clear_active_pane_bell();
+        }
+        if let Some(pane) = removed.as_mut() {
+            pane.destroy();
+        }
+        drop(removed);
+        log::info!("Closed pane {} in tab {}", pane_id, tab_id);
+        self.refresh_active_tab_title();
+        self.resize_tab_panes(self.active_tab_index);
+        self.invalidate();
+    }
+
+    fn close_pane_source(&mut self, source_id: u64) {
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return;
+        };
+        if self.tabs[tab_index]
+            .panes
+            .get(&pane_id)
+            .is_some_and(|pane| pane.keep_open)
+        {
+            log::info!("Keeping exited pane {} open", pane_id);
+            return;
+        }
+        if self.tabs[tab_index].pane_layout.len() == 1 {
+            let tab_id = self.tabs[tab_index].id;
+            self.close_tab(tab_id);
+            return;
+        }
+        let was_focused = tab_index == self.active_tab_index
+            && self.tabs[tab_index].pane_layout.active() == pane_id
+            && self.window_has_focus();
+        let (next_pane_id, mut removed) = {
+            let tab = &mut self.tabs[tab_index];
+            if let Err(error) = tab.pane_layout.close(pane_id) {
+                log::error!("Failed to remove exited pane: {error}");
+                return;
+            }
+            (tab.pane_layout.active(), tab.panes.remove(&pane_id))
+        };
+        if was_focused {
+            if let Some(pane) = removed.as_ref() {
+                send_terminal_focus_event(&pane.terminal, false);
+            }
+            self.send_pane_focus_event_in_tab(tab_index, next_pane_id, true);
+            self.clear_pane_bell(tab_index, next_pane_id);
+        } else {
+            self.refresh_tab_bell(tab_index);
+        }
+        if let Some(pane) = removed.as_mut() {
+            pane.destroy();
+        }
+        drop(removed);
+        if tab_index == self.active_tab_index {
+            self.refresh_active_tab_title();
+        }
+        self.resize_tab_panes(tab_index);
+        self.invalidate();
+    }
+
+    pub fn focus_pane(&mut self, direction: PaneDirection) {
+        let bounds = self.pane_bounds();
+        let previous = self
+            .tabs
+            .get(self.active_tab_index)
+            .map(|tab| tab.pane_layout.active());
+        let moved = self
+            .tabs
+            .get_mut(self.active_tab_index)
+            .and_then(|tab| tab.pane_layout.focus_direction(direction, bounds));
+        if moved.is_none() {
+            return;
+        }
+        if let Some(active) = moved {
+            if self.window_has_focus() {
+                if let Some(previous) = previous {
+                    self.send_pane_focus_event(previous, false);
+                }
+                self.send_pane_focus_event(active, true);
+                self.clear_active_pane_bell();
+            }
+            log::info!("Focused pane {} {:?}", active, direction);
+        }
+        self.refresh_active_tab_title();
+        // Directional focus exits zoom mode, so all panes need their split sizes.
+        self.resize_tab_panes(self.active_tab_index);
+        self.invalidate();
+    }
+
+    pub fn resize_active_pane(&mut self, direction: PaneDirection) {
+        let bounds = self.pane_bounds();
+        let amount = self
+            .renderer
+            .as_ref()
+            .map(|renderer| match direction {
+                PaneDirection::Left | PaneDirection::Right => {
+                    renderer.cell_dimensions().width.round().max(1.0) as u32
+                }
+                PaneDirection::Up | PaneDirection::Down => {
+                    renderer.cell_dimensions().height.round().max(1.0) as u32
+                }
+            })
+            .unwrap_or(8);
+        let changed = self.tabs.get_mut(self.active_tab_index).is_some_and(|tab| {
+            tab.pane_layout
+                .adjust_active_size(direction, amount, bounds)
+        });
+        if changed {
+            if let Some(tab) = self.tabs.get(self.active_tab_index) {
+                log::info!(
+                    "Resized pane {} {:?} in tab {}",
+                    tab.pane_layout.active(),
+                    direction,
+                    tab.id
+                );
+            }
+            self.resize_tab_panes(self.active_tab_index);
+            self.invalidate();
+        }
+    }
+
+    pub fn toggle_active_pane_zoom(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab_index) else {
+            return;
+        };
+        let zoomed = tab.pane_layout.toggle_zoom();
+        log::info!("Pane zoom {} in tab {}", zoomed, tab.id);
+        self.resize_tab_panes(self.active_tab_index);
+        self.invalidate();
+    }
+
+    fn window_has_focus(&self) -> bool {
+        unsafe { GetFocus() == self.hwnd }
+    }
+
+    fn send_pane_focus_event_in_tab(&self, tab_index: usize, pane_id: PaneId, focused: bool) {
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get(&pane_id) else {
+            return;
+        };
+        send_terminal_focus_event(&pane.terminal, focused);
+    }
+
+    fn send_pane_focus_event(&self, pane_id: PaneId, focused: bool) {
+        self.send_pane_focus_event_in_tab(self.active_tab_index, pane_id, focused);
+    }
+
+    fn refresh_tab_bell(&mut self, tab_index: usize) {
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            return;
+        };
+        tab.has_bell = tab.panes.values().any(|pane| pane.has_bell);
+        self.tab_bar.set_bell(tab.id, tab.has_bell);
+    }
+
+    fn clear_pane_bell(&mut self, tab_index: usize, pane_id: PaneId) {
+        let sender = self
+            .tabs
+            .get_mut(tab_index)
+            .and_then(|tab| tab.panes.get_mut(&pane_id))
+            .and_then(|pane| {
+                pane.has_bell = false;
+                pane.daemon_cmd_tx.clone()
+            });
+        if let Some(sender) = sender {
+            let _ = sender.send(DaemonCmd::ClearAlert);
+        }
+        self.refresh_tab_bell(tab_index);
+    }
+
+    fn clear_active_pane_bell(&mut self) {
+        let Some(pane_id) = self
+            .tabs
+            .get(self.active_tab_index)
+            .map(|tab| tab.pane_layout.active())
+        else {
+            return;
+        };
+        self.clear_pane_bell(self.active_tab_index, pane_id);
+    }
+
+    fn refresh_active_tab_title(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab_index) else {
+            return;
+        };
+        let Some(pane) = tab.active_pane() else {
+            return;
+        };
+        let title_locked = pane.title_locked;
+        let title = if title_locked {
+            pane.title.clone()
+        } else {
+            let screen_title = pane.terminal.lock().unwrap().screen().title.clone();
+            if screen_title.is_empty() {
+                pane.title.clone()
+            } else {
+                screen_title
+            }
+        };
+        tab.title_locked = title_locked;
+        if !title.is_empty() {
+            tab.title = title.clone();
+            if let Some(pane) = tab.active_pane_mut() {
+                pane.title = title.clone();
+            }
+            self.tab_bar.set_title(tab.id, &title);
+        }
+    }
+
     /// Close a tab
     pub fn close_tab(&mut self, tab_id: u64) {
         if let Some(index) = self.tabs.iter().position(|t| t.id == tab_id) {
-            self.tabs.remove(index);
+            if !self.confirm_close_panes(self.tabs[index].panes.values()) {
+                return;
+            }
+            let old_active_index = self.active_tab_index;
+            let was_active = index == old_active_index;
+            let had_focus = was_active && self.window_has_focus();
+            if had_focus {
+                let pane_id = self.tabs[index].pane_layout.active();
+                self.send_pane_focus_event_in_tab(index, pane_id, false);
+            }
+            let mut removed = self.tabs.remove(index);
+            for pane in removed.panes.values_mut() {
+                pane.destroy();
+            }
+            drop(removed);
             self.tab_bar.remove_tab(tab_id);
+            for index in 0..self.tabs.len() {
+                self.resize_tab_panes(index);
+            }
 
             if self.tabs.is_empty() {
                 // Close window
@@ -1058,13 +1911,28 @@ impl WindowState {
                     let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 };
             } else {
-                // Adjust active tab index
-                if self.active_tab_index >= self.tabs.len() {
-                    self.active_tab_index = self.tabs.len() - 1;
-                }
+                self.active_tab_index = if index < old_active_index {
+                    old_active_index - 1
+                } else if was_active {
+                    old_active_index.min(self.tabs.len() - 1)
+                } else {
+                    old_active_index
+                };
                 let new_active_id = self.tabs[self.active_tab_index].id;
                 self.tab_bar.set_active(new_active_id);
                 self.set_window_visibility(self.window_visibility);
+                if had_focus {
+                    let pane_id = self.tabs[self.active_tab_index].pane_layout.active();
+                    self.send_pane_focus_event(pane_id, true);
+                    self.clear_active_pane_bell();
+                }
+                self.refresh_active_tab_title();
+                if let Some(ref mut renderer) = self.renderer {
+                    renderer.set_background_override(
+                        self.tabs[self.active_tab_index].background_color.as_deref(),
+                    );
+                }
+                self.invalidate();
             }
         }
     }
@@ -1072,12 +1940,25 @@ impl WindowState {
     /// Switch to tab
     pub fn switch_to_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
+            let previous_index = self.active_tab_index;
+            let changed = index != previous_index;
+            let had_focus = self.window_has_focus();
+            if changed && had_focus {
+                let pane_id = self.tabs[previous_index].pane_layout.active();
+                self.send_pane_focus_event_in_tab(previous_index, pane_id, false);
+            }
             self.active_tab_index = index;
             let tab_id = self.tabs[index].id;
             self.tab_bar.set_active(tab_id);
-            self.tab_bar.clear_bell(tab_id);
-            self.tabs[index].has_bell = false;
             self.set_window_visibility(self.window_visibility);
+            if had_focus {
+                let pane_id = self.tabs[index].pane_layout.active();
+                if changed {
+                    self.send_pane_focus_event(pane_id, true);
+                }
+                self.clear_active_pane_bell();
+            }
+            self.refresh_active_tab_title();
 
             // Apply per-tab background color override
             if let Some(ref mut renderer) = self.renderer {
@@ -1128,7 +2009,52 @@ impl WindowState {
     pub fn active_terminal(&self) -> Option<Arc<Mutex<Terminal>>> {
         self.tabs
             .get(self.active_tab_index)
-            .map(|t| Arc::clone(&t.terminal))
+            .and_then(TabEntry::active_terminal)
+    }
+
+    fn source_location(&self, source_id: u64) -> Option<(usize, PaneId)> {
+        self.tabs.iter().enumerate().find_map(|(tab_index, tab)| {
+            tab.pane_id_for_source(source_id)
+                .map(|pane_id| (tab_index, pane_id))
+        })
+    }
+
+    fn pane_bounds(&self) -> PaneRect {
+        let (width, height) = self.terminal_pixel_size();
+        PaneRect::new(0, 0, width, height)
+    }
+
+    fn resize_tab_panes(&self, tab_index: usize) {
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+        let bounds = self.pane_bounds();
+        for positioned in tab.pane_layout.layout(bounds) {
+            let Some(pane) = tab.panes.get(&positioned.id) else {
+                continue;
+            };
+            let pixel_width = positioned.rect.width.max(1);
+            let pixel_height = positioned.rect.height.max(1);
+            let (cols, rows) = if let Some(renderer) = &self.renderer {
+                renderer.terminal_size(pixel_width, pixel_height)
+            } else {
+                (80, 24)
+            };
+            pane.terminal.lock().unwrap().resize_with_pixels(
+                cols,
+                rows,
+                pixel_width.min(u16::MAX as u32) as u16,
+                pixel_height.min(u16::MAX as u32) as u16,
+            );
+            if let Some(sender) = &pane.daemon_cmd_tx {
+                let _ = sender.send(DaemonCmd::Resize {
+                    cols: cols as u32,
+                    rows: rows as u32,
+                    pixel_width,
+                    pixel_height,
+                });
+            }
+        }
     }
 
     /// Send focus event to the active terminal if focus events mode is enabled (DECSET 1004)
@@ -1178,26 +2104,8 @@ impl WindowState {
             renderer.resize(width, height).ok();
         }
 
-        // Resize all terminals
-        let (cols, rows) = self.terminal_size();
-        let (pixel_width, pixel_height) = self.terminal_pixel_size();
-        for tab in &self.tabs {
-            let mut term = tab.terminal.lock().unwrap();
-            term.resize_with_pixels(
-                cols,
-                rows,
-                pixel_width.min(u16::MAX as u32) as u16,
-                pixel_height.min(u16::MAX as u32) as u16,
-            );
-            // Forward resize to daemon if this is a daemon-backed tab
-            if let Some(ref tx) = tab.daemon_cmd_tx {
-                let _ = tx.send(DaemonCmd::Resize {
-                    cols: cols as u32,
-                    rows: rows as u32,
-                    pixel_width,
-                    pixel_height,
-                });
-            }
+        for index in 0..self.tabs.len() {
+            self.resize_tab_panes(index);
         }
     }
 
@@ -1212,20 +2120,22 @@ impl WindowState {
             } else {
                 cterm_core::WindowVisibility::Hidden
             };
-            let mut terminal = tab.terminal.lock().unwrap();
-            let mut state = terminal.screen().frontend_state();
-            if state.visibility == visibility {
-                continue;
-            }
-            state.visibility = visibility;
-            if tab.daemon_cmd_tx.is_some() {
-                let _ = terminal.set_frontend_state_collecting(state);
-            } else {
-                terminal.set_frontend_state(state);
-            }
-            drop(terminal);
-            if let Some(sender) = &tab.daemon_cmd_tx {
-                let _ = sender.send(DaemonCmd::SetFrontendState(state));
+            for pane in tab.panes.values() {
+                let mut terminal = pane.terminal.lock().unwrap();
+                let mut state = terminal.screen().frontend_state();
+                if state.visibility == visibility {
+                    continue;
+                }
+                state.visibility = visibility;
+                if pane.daemon_cmd_tx.is_some() {
+                    let _ = terminal.set_frontend_state_collecting(state);
+                } else {
+                    terminal.set_frontend_state(state);
+                }
+                drop(terminal);
+                if let Some(sender) = &pane.daemon_cmd_tx {
+                    let _ = sender.send(DaemonCmd::SetFrontendState(state));
+                }
             }
         }
     }
@@ -1238,6 +2148,9 @@ impl WindowState {
 
         if let Some(ref mut renderer) = self.renderer {
             renderer.update_dpi(dpi).ok();
+        }
+        for index in 0..self.tabs.len() {
+            self.resize_tab_panes(index);
         }
     }
 
@@ -1253,23 +2166,56 @@ impl WindowState {
 
     /// Render the window
     pub fn render(&mut self) -> windows::core::Result<()> {
-        if self.renderer.is_none() {
+        let Some(tab) = self.tabs.get(self.active_tab_index) else {
             return Ok(());
+        };
+        let y_offset = self.terminal_y_offset() as u32;
+        let panes: Vec<_> = tab
+            .pane_layout
+            .layout(self.pane_bounds())
+            .into_iter()
+            .filter_map(|positioned| {
+                tab.panes
+                    .get(&positioned.id)
+                    .map(|pane| (positioned, Arc::clone(&pane.terminal), pane.has_bell))
+            })
+            .collect();
+        let Some((_, first_terminal, _)) = panes.first() else {
+            return Ok(());
+        };
+        let chrome_width = self.pane_bounds().width as f32;
+        let tab_bar_height = self.tab_bar.height() as f32;
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        let tab_bar = &mut self.tab_bar;
+        let notification_bar = &mut self.notification_bar;
+
+        {
+            let terminal = first_terminal.lock().unwrap();
+            renderer.begin_frame(terminal.screen());
         }
-
-        // Get the active terminal first (before borrowing renderer)
-        let terminal = self.active_terminal();
-
-        // Render active terminal
-        if let Some(terminal) = terminal {
-            let term = terminal.lock().unwrap();
-            // Now get the renderer and render
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.render(term.screen())?;
+        let draw_result = (|| {
+            for (positioned, terminal, alerted) in &panes {
+                let terminal = terminal.lock().unwrap();
+                let mut rect = positioned.rect;
+                rect.y = rect.y.saturating_add(y_offset);
+                renderer.render_pane(terminal.screen(), rect, positioned.is_active, *alerted)?;
             }
-        }
-
-        Ok(())
+            if let Some((target, dwrite, text_format)) = renderer.chrome_resources() {
+                tab_bar.render(&target, &dwrite, chrome_width, &text_format)?;
+                notification_bar.render_at(
+                    &target,
+                    &dwrite,
+                    chrome_width,
+                    &text_format,
+                    tab_bar_height,
+                )?;
+            }
+            Ok::<(), windows::core::Error>(())
+        })();
+        let end_result = renderer.end_frame();
+        draw_result.and(end_result)
     }
 
     /// Handle a physical keyboard event. Text-producing keys deliberately stay
@@ -1384,6 +2330,11 @@ impl WindowState {
                     self.close_tab(id);
                 }
             }
+            Action::SplitPane(direction) => self.split_active_pane(direction),
+            Action::ClosePane => self.close_active_pane(),
+            Action::FocusPane(direction) => self.focus_pane(direction),
+            Action::ResizePane(direction) => self.resize_active_pane(direction),
+            Action::TogglePaneZoom => self.toggle_active_pane_zoom(),
             Action::NextTab => self.next_tab(),
             Action::PrevTab => self.prev_tab(),
             Action::NextAlertedTab => self.next_alerted_tab(),
@@ -1506,7 +2457,14 @@ impl WindowState {
                     {
                         // Create a new tab with the selected template
                         log::info!("Quick open selected: {}", template.name);
-                        self.new_tab_from_template(&template).ok();
+                        if let Err(error) = self.new_tab_from_template(&template) {
+                            log::error!("Failed to open template '{}': {error}", template.name);
+                            crate::dialogs::show_warning(
+                                self.hwnd.0 as *mut _,
+                                "Template unavailable",
+                                &error.to_string(),
+                            );
+                        }
                     }
                 }
                 MenuAction::DockerPicker => {
@@ -1561,6 +2519,20 @@ impl WindowState {
                 MenuAction::SendSignalKill => self.send_signal(9), // SIGKILL
                 MenuAction::SendSignalHup => self.send_signal(1), // SIGHUP
                 MenuAction::SendSignalTerm => self.send_signal(15), // SIGTERM
+                MenuAction::SplitPaneHorizontal => {
+                    self.split_active_pane(SplitDirection::Horizontal)
+                }
+                MenuAction::SplitPaneVertical => self.split_active_pane(SplitDirection::Vertical),
+                MenuAction::ClosePane => self.close_active_pane(),
+                MenuAction::FocusPaneLeft => self.focus_pane(PaneDirection::Left),
+                MenuAction::FocusPaneRight => self.focus_pane(PaneDirection::Right),
+                MenuAction::FocusPaneUp => self.focus_pane(PaneDirection::Up),
+                MenuAction::FocusPaneDown => self.focus_pane(PaneDirection::Down),
+                MenuAction::ResizePaneLeft => self.resize_active_pane(PaneDirection::Left),
+                MenuAction::ResizePaneRight => self.resize_active_pane(PaneDirection::Right),
+                MenuAction::ResizePaneUp => self.resize_active_pane(PaneDirection::Up),
+                MenuAction::ResizePaneDown => self.resize_active_pane(PaneDirection::Down),
+                MenuAction::TogglePaneZoom => self.toggle_active_pane_zoom(),
                 MenuAction::PrevTab => self.prev_tab(),
                 MenuAction::NextTab => self.next_tab(),
                 MenuAction::NextAlertedTab => self.next_alerted_tab(),
@@ -1603,15 +2575,36 @@ impl WindowState {
                         log::warn!("Ignoring debug relaunch request in managed mode");
                         return;
                     }
-                    // Re-launch the application (for testing upgrade)
                     if let Ok(exe) = std::env::current_exe() {
-                        std::process::Command::new(exe).spawn().ok();
+                        let window_state = self.collect_upgrade_state();
+                        if !upgrade_window_is_handoff_ready(&window_state) {
+                            log::warn!(
+                                "Deferring debug relaunch until every pane has a daemon session ID"
+                            );
+                            crate::dialogs::show_warning(
+                                self.hwnd.0 as *mut _,
+                                "Relaunch not ready",
+                                "A terminal session is still starting. Try relaunching again in a moment.",
+                            );
+                            return;
+                        }
+                        let mut upgrade_state = cterm_app::upgrade::UpgradeState::new();
+                        upgrade_state.windows.push(window_state);
+                        match cterm_app::upgrade::execute_upgrade(&exe, &upgrade_state) {
+                            Ok(()) => {
+                                self.skip_close_confirm = true;
+                                unsafe {
+                                    let _ = PostMessageW(
+                                        Some(self.hwnd),
+                                        WM_CLOSE,
+                                        WPARAM(0),
+                                        LPARAM(0),
+                                    );
+                                };
+                            }
+                            Err(error) => log::error!("Failed to relaunch cterm: {error}"),
+                        }
                     }
-                    // Skip close confirmation during relaunch
-                    self.skip_close_confirm = true;
-                    unsafe {
-                        let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                    };
                 }
                 MenuAction::DebugDumpState => {
                     log::info!("=== Debug State Dump ===");
@@ -1718,18 +2711,35 @@ impl WindowState {
                     }
                 }
                 MenuAction::SSHConnect => {
-                    if let Some(host) =
-                        crate::session_dialog::show_ssh_dialog(self.hwnd.0 as *mut _)
+                    #[cfg(not(unix))]
+                    crate::dialogs::show_warning(
+                        self.hwnd.0 as *mut _,
+                        "Remote transport unavailable",
+                        "Remote daemon connections are not supported by the current Windows transport.",
+                    );
+                    #[cfg(unix)]
                     {
-                        log::info!("SSH connecting to: {}", host);
-                        let (cols, rows) = self.terminal_size();
-                        let opts = cterm_client::CreateSessionOpts {
-                            cols: cols as u32,
-                            rows: rows as u32,
-                            ..Default::default()
-                        };
-                        let remote = Some((self.remote_manager.clone(), host.clone(), host, true));
-                        self.spawn_daemon_tab(opts, "SSH".to_string(), None, None, false, remote);
+                        if let Some(host) =
+                            crate::session_dialog::show_ssh_dialog(self.hwnd.0 as *mut _)
+                        {
+                            log::info!("SSH connecting to: {}", host);
+                            let (cols, rows) = self.terminal_size();
+                            let opts = cterm_client::CreateSessionOpts {
+                                cols: cols as u32,
+                                rows: rows as u32,
+                                ..Default::default()
+                            };
+                            let remote =
+                                Some((self.remote_manager.clone(), host.clone(), host, true));
+                            self.spawn_daemon_tab(
+                                opts,
+                                "SSH".to_string(),
+                                None,
+                                None,
+                                false,
+                                remote,
+                            );
+                        }
                     }
                 }
                 MenuAction::ManageRemotes => {
@@ -1750,8 +2760,15 @@ impl WindowState {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.title = new_title.clone();
                     tab.title_locked = true;
+                    if let Some(pane) = tab.active_pane_mut() {
+                        pane.title_locked = true;
+                        pane.title = new_title.clone();
+                    }
                     // Persist to daemon
-                    if let Some(ref tx) = tab.daemon_cmd_tx {
+                    if let Some(tx) = tab
+                        .active_pane()
+                        .and_then(|pane| pane.daemon_cmd_tx.as_ref())
+                    {
                         let _ = tx.send(DaemonCmd::SetTitle(new_title.clone()));
                     }
                     self.tab_bar.set_title(tab_id, &new_title);
@@ -1770,7 +2787,10 @@ impl WindowState {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.color = color_result.clone();
                     // Persist to daemon
-                    if let Some(ref tx) = tab.daemon_cmd_tx {
+                    if let Some(tx) = tab
+                        .active_pane()
+                        .and_then(|pane| pane.daemon_cmd_tx.as_ref())
+                    {
                         let _ = tx.send(DaemonCmd::SetTabColor(
                             color_result.as_deref().unwrap_or("").to_string(),
                         ));
@@ -1890,24 +2910,8 @@ impl WindowState {
 
     /// Called when font size changes to resize terminals
     fn on_font_size_changed(&mut self) {
-        let (cols, rows) = self.terminal_size();
-        let (pixel_width, pixel_height) = self.terminal_pixel_size();
-        for tab in &self.tabs {
-            let mut term = tab.terminal.lock().unwrap();
-            term.resize_with_pixels(
-                cols,
-                rows,
-                pixel_width.min(u16::MAX as u32) as u16,
-                pixel_height.min(u16::MAX as u32) as u16,
-            );
-            if let Some(ref tx) = tab.daemon_cmd_tx {
-                let _ = tx.send(DaemonCmd::Resize {
-                    cols: cols as u32,
-                    rows: rows as u32,
-                    pixel_width,
-                    pixel_height,
-                });
-            }
+        for index in 0..self.tabs.len() {
+            self.resize_tab_panes(index);
         }
         self.invalidate();
     }
@@ -1971,10 +2975,11 @@ impl WindowState {
     }
 
     /// Handle PTY data received
-    pub fn on_pty_data(&mut self, tab_id: u64) {
+    pub fn on_pty_data(&mut self, source_id: u64) {
+        let notification_was_visible = self.notification_bar.is_visible();
         // Check for file transfers from the terminal
-        if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-            if let Ok(mut terminal) = tab.terminal.lock() {
+        if let Some((tab_index, pane_id)) = self.source_location(source_id) {
+            if let Ok(mut terminal) = self.tabs[tab_index].panes[&pane_id].terminal.lock() {
                 let transfers = terminal.screen_mut().take_file_transfers();
                 for transfer in transfers {
                     match transfer {
@@ -2007,73 +3012,226 @@ impl WindowState {
             }
         }
 
+        if self.notification_bar.is_visible() != notification_was_visible {
+            for index in 0..self.tabs.len() {
+                self.resize_tab_panes(index);
+            }
+        }
+
         // Invalidate to redraw
         self.invalidate();
     }
 
     /// Handle PTY exit
-    pub fn on_pty_exit(&mut self, tab_id: u64) {
-        self.close_tab(tab_id);
+    pub fn on_pty_exit(&mut self, source_id: u64) {
+        self.close_pane_source(source_id);
     }
 
-    /// Handle bell
-    pub fn on_bell(&mut self, tab_id: u64) {
-        // Only show bell indicator if this tab is not the current tab
-        let is_current_tab = self
-            .tabs
-            .get(self.active_tab_index)
-            .map(|t| t.id == tab_id)
-            .unwrap_or(false);
-
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-            if !is_current_tab {
-                tab.has_bell = true;
-                self.tab_bar.set_bell(tab_id, true);
-                // Invalidate to redraw the tab bar with the bell indicator
-                self.invalidate();
-            }
+    fn on_daemon_session_ready(&mut self, source_id: u64, ready: DaemonSessionReady) {
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return;
+        };
+        let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+            return;
+        };
+        log::info!(
+            "Pane source {} attached to daemon session {}",
+            source_id,
+            ready.session_id
+        );
+        pane.session_id = Some(ready.session_id);
+        pane.daemon_socket = ready.daemon_socket.clone();
+        if let PaneBackendContext::Daemon(context) = &mut pane.backend {
+            context.daemon_socket = ready.daemon_socket;
         }
     }
 
+    /// Handle bell
+    pub fn on_bell(&mut self, source_id: u64) {
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return;
+        };
+        let is_focused_pane = tab_index == self.active_tab_index
+            && self.tabs[tab_index].pane_layout.active() == pane_id
+            && self.window_has_focus();
+        if is_focused_pane {
+            self.clear_pane_bell(tab_index, pane_id);
+        } else {
+            if let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) {
+                pane.has_bell = true;
+            }
+            self.refresh_tab_bell(tab_index);
+        }
+        // Redraw both the tab marker and the alerted pane border.
+        self.invalidate();
+    }
+
     /// Handle title change from terminal
-    pub fn on_title_changed(&mut self, tab_id: u64) {
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-            // Don't update if title is locked (user-set or template)
-            if tab.title_locked {
+    pub fn on_title_changed(&mut self, source_id: u64) {
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            // OSC titles never overwrite a title explicitly locked for this pane.
+            if tab.panes[&pane_id].title_locked {
                 return;
             }
 
             // Get title from terminal's screen
             let new_title = {
-                let term = tab.terminal.lock().unwrap();
+                let term = tab.panes[&pane_id].terminal.lock().unwrap();
                 term.screen().title.clone()
             };
 
             if !new_title.is_empty() {
-                tab.title = new_title.clone();
-                self.tab_bar.set_title(tab_id, &new_title);
+                tab.panes
+                    .get_mut(&pane_id)
+                    .expect("the source pane exists")
+                    .title = new_title.clone();
+                if tab.pane_layout.active() == pane_id {
+                    tab.title = new_title.clone();
+                    tab.title_locked = false;
+                    self.tab_bar.set_title(tab.id, &new_title);
+                }
             }
         }
     }
 
     /// Get the vertical offset from window top to terminal content area
     fn terminal_y_offset(&self) -> f32 {
-        let tab_bar_height = self.dpi.scale_f32(TAB_BAR_HEIGHT as f32);
+        let tab_bar_height = self.tab_bar.height() as f32;
         let notification_height = self.notification_bar.height() as f32;
         tab_bar_height + notification_height
     }
 
-    /// Get the hyperlink URI at a window pixel position, if any
-    fn hyperlink_at(&self, x: f32, y: f32) -> Option<String> {
+    fn pane_at_client_point(&self, x: f32, y: f32) -> Option<(PaneId, PaneRect)> {
         let y_offset = self.terminal_y_offset();
-        if y < y_offset {
+        if x < 0.0 || y < y_offset {
             return None;
         }
+        let tab = self.tabs.get(self.active_tab_index)?;
+        pane_at_layout_point(
+            &tab.pane_layout,
+            self.pane_bounds(),
+            x.floor() as u32,
+            (y - y_offset).floor() as u32,
+        )
+    }
+
+    fn divider_at_client_point(&self, x: f32, y: f32) -> Option<PaneDivider> {
+        let offset = self.terminal_y_offset();
+        if x < 0.0 || y < offset {
+            return None;
+        }
+        let tab = self.tabs.get(self.active_tab_index)?;
+        if tab.pane_layout.zoomed().is_some() {
+            return None;
+        }
+        divider_at_tree_point(
+            &tab.pane_layout.tree(),
+            self.pane_bounds(),
+            x.floor() as u32,
+            (y - offset).floor() as u32,
+        )
+    }
+
+    fn begin_divider_drag(&mut self, x: f32, y: f32) -> bool {
+        let Some(divider) = self.divider_at_client_point(x, y) else {
+            return false;
+        };
+        self.mouse_report_button = None;
+        self.pane_divider_drag = Some(divider);
+        unsafe {
+            let _ = SetCapture(self.hwnd);
+        }
+        true
+    }
+
+    fn update_divider_drag(&mut self, x: f32, y: f32) -> bool {
+        let Some(divider) = self.pane_divider_drag.clone() else {
+            return false;
+        };
+        let local_y = y - self.terminal_y_offset();
+        let basis_points = match divider.direction {
+            SplitDirection::Horizontal => {
+                ratio_at_coordinate(x, divider.split_rect.x as f32, divider.split_rect.width)
+            }
+            SplitDirection::Vertical => ratio_at_coordinate(
+                local_y,
+                divider.split_rect.y as f32,
+                divider.split_rect.height,
+            ),
+        };
+        let Ok(ratio) = SplitRatio::from_basis_points(basis_points) else {
+            return true;
+        };
+        let changed = self
+            .tabs
+            .get_mut(self.active_tab_index)
+            .and_then(|tab| tab.pane_layout.set_split_ratio(&divider.path, ratio).ok())
+            .unwrap_or(false);
+        if changed {
+            self.resize_tab_panes(self.active_tab_index);
+            self.invalidate();
+        }
+        true
+    }
+
+    fn end_divider_drag(&mut self) -> bool {
+        if self.pane_divider_drag.take().is_none() {
+            return false;
+        }
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        true
+    }
+
+    fn focus_pane_at_client_point(&mut self, x: f32, y: f32) -> bool {
+        let Some((pane_id, _)) = self.pane_at_client_point(x, y) else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get(self.active_tab_index) else {
+            return false;
+        };
+        let previous = tab.pane_layout.active();
+        if previous == pane_id {
+            if self.window_has_focus() {
+                self.clear_active_pane_bell();
+            }
+            return true;
+        }
+        let had_focus = self.window_has_focus();
+        if had_focus {
+            self.send_pane_focus_event(previous, false);
+        }
+        if self.tabs[self.active_tab_index]
+            .pane_layout
+            .set_active(pane_id)
+            .is_err()
+        {
+            return false;
+        }
+        if had_focus {
+            self.send_pane_focus_event(pane_id, true);
+            self.clear_active_pane_bell();
+        }
+        self.refresh_active_tab_title();
+        self.resize_tab_panes(self.active_tab_index);
+        self.invalidate();
+        true
+    }
+
+    /// Get the hyperlink URI at a window pixel position, if any
+    fn hyperlink_at(&self, x: f32, y: f32) -> Option<String> {
+        let (pane_id, rect) = self.pane_at_client_point(x, y)?;
         let renderer = self.renderer.as_ref()?;
         let cell_dims = renderer.cell_dimensions();
-        let terminal = self.active_terminal()?;
-        let term = terminal.lock().unwrap();
-        let (col, row) = mouse::pixel_to_cell(x as i32, (y - y_offset) as i32, &cell_dims, 0);
+        let tab = self.tabs.get(self.active_tab_index)?;
+        let term = tab.panes.get(&pane_id)?.terminal.lock().unwrap();
+        let local_x = x - rect.x as f32;
+        let local_y = y - self.terminal_y_offset() - rect.y as f32;
+        let (col, row) = mouse::pixel_to_cell(local_x as i32, local_y as i32, &cell_dims, 0);
         term.screen()
             .get_cell(row, col)
             .and_then(|c| c.hyperlink.as_ref())
@@ -2104,13 +3262,14 @@ impl WindowState {
     /// Map client coordinates to both terminal-cell and terminal-local pixel
     /// coordinates. Pixel rows exclude tab and notification chrome.
     fn terminal_mouse_position(&self, x: f32, y: f32) -> Option<MousePosition> {
-        let y_offset = self.terminal_y_offset();
-        if y < y_offset {
+        let (pane_id, rect) = self.pane_at_client_point(x, y)?;
+        let tab = self.tabs.get(self.active_tab_index)?;
+        if pane_id != tab.pane_layout.active() {
             return None;
         }
         let cell_dims = self.renderer.as_ref()?.cell_dimensions();
-        let pixel_x = x.floor() as i32;
-        let pixel_y = (y - y_offset).floor() as i32;
+        let pixel_x = (x - rect.x as f32).floor() as i32;
+        let pixel_y = (y - self.terminal_y_offset() - rect.y as f32).floor() as i32;
         let (col, row) = mouse::pixel_to_cell(pixel_x, pixel_y, &cell_dims, 0);
         Some(MousePosition::new(col, row, pixel_x, pixel_y))
     }
@@ -2154,9 +3313,24 @@ impl WindowState {
     }
 
     pub fn on_mouse_down(&mut self, x: f32, y: f32) {
-        // Check if click is in notification bar area
-        let tab_bar_height = self.dpi.scale_f32(TAB_BAR_HEIGHT as f32);
+        let tab_bar_height = self.tab_bar.height() as f32;
         let notification_height = self.notification_bar.height() as f32;
+
+        if y < tab_bar_height && self.tab_bar.is_visible() {
+            let (tab_id, close, new_tab) = self.tab_bar.hit_test(x, y);
+            if new_tab {
+                if let Err(error) = self.new_tab() {
+                    log::error!("Failed to create tab: {error}");
+                }
+            } else if let Some(tab_id) = tab_id {
+                if close {
+                    self.close_tab(tab_id);
+                } else if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
+                    self.switch_to_tab(index);
+                }
+            }
+            return;
+        }
 
         // Notification bar is right below tab bar
         if y >= tab_bar_height && y < tab_bar_height + notification_height {
@@ -2165,6 +3339,14 @@ impl WindowState {
             if let Some(action) = self.notification_bar.hit_test(x, rel_y) {
                 self.handle_notification_action(action);
             }
+            return;
+        }
+
+        if self.begin_divider_drag(x, y) {
+            return;
+        }
+
+        if !self.focus_pane_at_client_point(x, y) {
             return;
         }
 
@@ -2194,6 +3376,9 @@ impl WindowState {
 
     /// Handle mouse button release.
     pub fn on_mouse_up(&mut self, x: f32, y: f32) {
+        if self.end_divider_drag() {
+            return;
+        }
         // If a press was forwarded to a mouse-tracking app, report the release.
         if let Some(button) = self.mouse_report_button.take() {
             self.forward_mouse_event(ReportMouseEvent::Release(button), x, y);
@@ -2202,6 +3387,9 @@ impl WindowState {
 
     /// Handle middle-button press.
     pub fn on_middle_down(&mut self, x: f32, y: f32) {
+        if !self.focus_pane_at_client_point(x, y) {
+            return;
+        }
         if !shift_pressed()
             && self.mouse_tracking_active()
             && self.forward_mouse_event(ReportMouseEvent::Press(ReportButton::Middle), x, y)
@@ -2213,23 +3401,56 @@ impl WindowState {
 
     /// Handle mouse wheel: forward to a tracking app, translate to cursor keys on
     /// the alternate screen (alternate-scroll), or scroll the local scrollback.
-    pub fn on_wheel(&mut self, delta: i32) {
+    pub fn on_wheel(&mut self, delta: i32, x: f32, y: f32) {
+        self.last_mouse_pos = (x, y);
         let up = delta > 0;
         let shift = shift_pressed();
-        let Some(terminal) = self.active_terminal() else {
+        let Some((pane_id, rect)) = self.pane_at_client_point(x, y) else {
+            return;
+        };
+        let Some(terminal) = self
+            .tabs
+            .get(self.active_tab_index)
+            .and_then(|tab| tab.panes.get(&pane_id))
+            .map(|pane| Arc::clone(&pane.terminal))
+        else {
             return;
         };
 
         if !shift {
             // 1) Application is tracking the mouse: forward a wheel report.
-            if self.mouse_tracking_active() {
-                let (x, y) = self.last_mouse_pos;
+            let tracking = terminal.lock().unwrap().screen().modes.mouse_mode != MouseMode::None;
+            if tracking {
                 let button = if up {
                     ReportButton::WheelUp
                 } else {
                     ReportButton::WheelDown
                 };
-                self.forward_mouse_event(ReportMouseEvent::Press(button), x, y);
+                let Some(cell_dims) = self
+                    .renderer
+                    .as_ref()
+                    .map(|renderer| renderer.cell_dimensions())
+                else {
+                    return;
+                };
+                let pixel_x = (x - rect.x as f32).floor() as i32;
+                let pixel_y = (y - self.terminal_y_offset() - rect.y as f32).floor() as i32;
+                let (col, row) = mouse::pixel_to_cell(pixel_x, pixel_y, &cell_dims, 0);
+                let position = MousePosition::new(col, row, pixel_x, pixel_y);
+                let mut term = terminal.lock().unwrap();
+                let mode = term.screen().modes.mouse_mode;
+                let encoding = term.screen().modes.mouse_encoding;
+                if let Some(sequence) = encode_mouse_event(
+                    mode,
+                    encoding,
+                    ReportMouseEvent::Press(button),
+                    position,
+                    current_mouse_modifiers(),
+                ) {
+                    let _ = term.write(&sequence);
+                }
+                drop(term);
+                self.invalidate();
                 return;
             }
 
@@ -2269,6 +3490,10 @@ impl WindowState {
     pub fn on_mouse_move(&mut self, x: f32, y: f32) {
         self.last_mouse_pos = (x, y);
 
+        if self.update_divider_drag(x, y) {
+            return;
+        }
+
         // Forward held-button or all-motion reporting. Cell encodings are
         // coalesced by cell; mode 1016 preserves every pixel transition.
         if !shift_pressed() {
@@ -2300,11 +3525,22 @@ impl WindowState {
         }
         self.last_reported_mouse_position = self.terminal_mouse_position(x, y);
 
-        let has_link = self.hyperlink_at(x, y).is_some();
+        let divider = self.divider_at_client_point(x, y);
+        let has_link = divider.is_none() && self.hyperlink_at(x, y).is_some();
 
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor};
-            let cursor = if has_link {
+            let cursor = if let Some(divider) = divider {
+                LoadCursorW(
+                    None,
+                    if divider.direction == SplitDirection::Horizontal {
+                        IDC_SIZEWE
+                    } else {
+                        IDC_SIZENS
+                    },
+                )
+                .unwrap_or_default()
+            } else if has_link {
                 LoadCursorW(None, IDC_HAND).unwrap_or_default()
             } else {
                 LoadCursorW(None, IDC_IBEAM).unwrap_or_default()
@@ -2316,7 +3552,7 @@ impl WindowState {
     /// Handle right-click for context menu
     pub fn on_right_click(&mut self, x: f32, y: f32) {
         // Check if click is in tab bar area
-        let tab_bar_height = self.dpi.scale_f32(TAB_BAR_HEIGHT as f32);
+        let tab_bar_height = self.tab_bar.height() as f32;
 
         if y < tab_bar_height && self.tab_bar.is_visible() {
             // Hit test the tab bar
@@ -2324,6 +3560,10 @@ impl WindowState {
             if let Some(tab_id) = tab_id {
                 self.show_tab_context_menu(tab_id, x as i32, y as i32);
             }
+            return;
+        }
+
+        if !self.focus_pane_at_client_point(x, y) {
             return;
         }
 
@@ -2491,10 +3731,18 @@ impl WindowState {
             // Update tab title
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                 // Persist to daemon
-                if let Some(ref tx) = tab.daemon_cmd_tx {
+                if let Some(tx) = tab
+                    .active_pane()
+                    .and_then(|pane| pane.daemon_cmd_tx.as_ref())
+                {
                     let _ = tx.send(DaemonCmd::SetTitle(new_title.clone()));
                 }
                 tab.title = new_title.clone();
+                tab.title_locked = true;
+                if let Some(pane) = tab.active_pane_mut() {
+                    pane.title = new_title.clone();
+                    pane.title_locked = true;
+                }
             }
             self.tab_bar.set_title(tab_id, &new_title);
             self.invalidate();
@@ -2509,7 +3757,10 @@ impl WindowState {
             let rgb = color_opt.as_ref().and_then(|hex| parse_hex_color(hex));
             if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                 // Persist to daemon
-                if let Some(ref tx) = tab.daemon_cmd_tx {
+                if let Some(tx) = tab
+                    .active_pane()
+                    .and_then(|pane| pane.daemon_cmd_tx.as_ref())
+                {
                     let _ = tx.send(DaemonCmd::SetTabColor(
                         color_opt.as_deref().unwrap_or("").to_string(),
                     ));
@@ -2534,6 +3785,9 @@ impl WindowState {
                 NotificationAction::Discard => {
                     self.file_manager.discard(file_id);
                     self.notification_bar.hide();
+                    for index in 0..self.tabs.len() {
+                        self.resize_tab_panes(index);
+                    }
                     self.invalidate();
                 }
             }
@@ -2572,6 +3826,9 @@ impl WindowState {
         }
 
         self.notification_bar.hide();
+        for index in 0..self.tabs.len() {
+            self.resize_tab_panes(index);
+        }
         self.invalidate();
     }
 }
@@ -2793,30 +4050,132 @@ pub fn create_window_from_upgrade(
 
     let mut any_restored = false;
     for tab_state in &window_state.tabs {
-        let Some(ref session_id) = tab_state.session_id else {
-            log::warn!("Tab '{}' has no session_id, skipping", tab_state.title);
-            continue;
-        };
-
-        match rt.block_on(async {
-            let conn = cterm_client::DaemonConnection::connect_local().await?;
-            conn.attach_session(session_id, 80, 24).await
-        }) {
-            Ok((_handle, screen)) => {
-                log::info!("Reconnected to session {}", session_id);
-                state.attach_session_tab(
-                    session_id,
-                    tab_state.title.clone(),
-                    tab_state.custom_title.clone(),
-                    tab_state.color.clone(),
-                    screen,
-                );
-                any_restored = true;
+        let (layout, pane_states) = match upgrade_pane_records(tab_state) {
+            Ok(records) => records,
+            Err(error) => {
+                log::error!("Cannot restore tab '{}': {error}", tab_state.title);
+                continue;
             }
-            Err(e) => {
-                log::error!("Failed to reconnect session {}: {}", session_id, e);
+        };
+        let pane_ids = layout.pane_ids();
+
+        let mut restored = Vec::with_capacity(pane_states.len());
+        for pane_state in &pane_states {
+            let Some(session_id) = pane_state.session_id.as_ref() else {
+                log::error!(
+                    "Cannot restore a non-daemon pane in tab '{}'",
+                    tab_state.title
+                );
+                restored.clear();
+                break;
+            };
+            #[cfg(not(unix))]
+            if let Some(remote_name) = pane_state.remote_name.as_deref() {
+                let reason = format!(
+                    "remote '{remote_name}' requires a transport that is currently unavailable on Windows"
+                );
+                log::error!("Failed to reconnect session {session_id}: {reason}");
+                if let Some(pane) = state.make_unavailable_remote_pane(pane_state, &reason) {
+                    restored.push(pane);
+                    continue;
+                }
+                restored.clear();
+                break;
+            }
+            let connection = rt.block_on(async {
+                if let Some(remote_name) = pane_state.remote_name.as_ref() {
+                    let remote = config
+                        .remotes
+                        .iter()
+                        .find(|remote| remote.name == *remote_name)
+                        .ok_or_else(|| format!("remote '{remote_name}' is not configured"))?;
+                    state
+                        .remote_manager
+                        .get_or_connect(&remote.name, &remote.host, remote.ssh_compression)
+                        .await
+                        .map_err(|error| error.to_string())
+                } else if let Some(path) = pane_state.daemon_socket.as_ref() {
+                    cterm_client::DaemonConnection::connect_unix(path, false)
+                        .await
+                        .map_err(|error| error.to_string())
+                } else {
+                    cterm_client::DaemonConnection::connect_local()
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            });
+            let connection = match connection {
+                Ok(connection) => connection,
+                Err(error) => {
+                    log::error!("Failed to reconnect session {session_id}: {error}");
+                    restored.clear();
+                    break;
+                }
+            };
+            let alerted = rt
+                .block_on(connection.get_session(session_id))
+                .map(|session| session.alerted)
+                .unwrap_or(false);
+            match rt.block_on(connection.attach_session(session_id, 80, 24)) {
+                Ok((handle, screen)) => {
+                    let socket = handle
+                        .socket_path()
+                        .map(std::path::Path::to_path_buf)
+                        .or_else(|| pane_state.daemon_socket.clone());
+                    if let Some(pane) =
+                        state.make_attached_pane(pane_state, screen, socket, alerted)
+                    {
+                        restored.push(pane);
+                    }
+                    // attach_session fetched the snapshot and incremented the
+                    // daemon's client count. The pane reader owns a distinct
+                    // no-snapshot attachment, so release this temporary one.
+                    if let Err(error) = rt.block_on(handle.detach()) {
+                        log::warn!(
+                            "Failed to detach snapshot handle for session {session_id}: {error}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    log::error!("Failed to reconnect session {session_id}: {error}");
+                    restored.clear();
+                    break;
+                }
             }
         }
+        if restored.len() != pane_ids.len() {
+            continue;
+        }
+
+        let panes: BTreeMap<_, _> = pane_ids.into_iter().zip(restored).collect();
+        let has_bell = panes.values().any(|pane| pane.has_bell);
+        let title_locked = tab_state.custom_title.is_some();
+        state.tabs.push(TabEntry {
+            id: tab_state.id,
+            title: tab_state.title.clone(),
+            color: tab_state.color.clone(),
+            background_color: None,
+            has_bell,
+            title_locked,
+            pane_layout: layout,
+            panes,
+        });
+        state.tab_bar.add_tab(tab_state.id, &tab_state.title);
+        state.tab_bar.set_bell(tab_state.id, has_bell);
+        if let Some(color) = tab_state.color.as_deref().and_then(parse_hex_color) {
+            state.tab_bar.set_color(tab_state.id, Some(color));
+        }
+        any_restored = true;
+    }
+
+    if let Some(next_id) = state
+        .tabs
+        .iter()
+        .map(|tab| tab.id)
+        .max()
+        .and_then(|id| id.checked_add(1))
+    {
+        state.next_tab_id.store(next_id, Ordering::SeqCst);
     }
 
     // If no sessions were restored, create a fresh tab
@@ -2828,8 +4187,11 @@ pub fn create_window_from_upgrade(
     }
 
     // Restore active tab
-    if window_state.active_tab > 0 && window_state.active_tab < state.tabs.len() {
-        state.switch_to_tab(window_state.active_tab);
+    if !state.tabs.is_empty() {
+        state.switch_to_tab(window_state.active_tab.min(state.tabs.len() - 1));
+        for index in 0..state.tabs.len() {
+            state.resize_tab_panes(index);
+        }
     }
 
     // Store state pointer in window
@@ -2861,6 +4223,7 @@ fn start_daemon_create_thread(
     terminal: Arc<Mutex<Terminal>>,
     opts: cterm_client::CreateSessionOpts,
     remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
+    daemon_socket: Option<std::path::PathBuf>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCmd>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -2886,6 +4249,15 @@ fn start_daemon_create_thread(
                         return;
                     }
                 }
+            } else if let Some(ref path) = daemon_socket {
+                match cterm_client::DaemonConnection::connect_unix(path, false).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::error!("Failed to connect to daemon {}: {}", path.display(), e);
+                        post_tab_exit(hwnd, tab_id);
+                        return;
+                    }
+                }
             } else {
                 match cterm_client::DaemonConnection::connect_local().await {
                     Ok(c) => c,
@@ -2905,6 +4277,15 @@ fn start_daemon_create_thread(
                     return;
                 }
             };
+
+            post_daemon_session_ready(
+                hwnd,
+                tab_id,
+                DaemonSessionReady {
+                    session_id: session.session_id().to_string(),
+                    daemon_socket: session.socket_path().map(std::path::Path::to_path_buf),
+                },
+            );
 
             run_daemon_io_loop(hwnd, tab_id, terminal, session, cmd_rx).await;
         });
@@ -2990,8 +4371,12 @@ async fn run_daemon_io_loop(
     session: cterm_client::SessionHandle,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCmd>,
 ) {
+    // Shared cancellation for process exit and explicit frontend detach.
+    let exit_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
     // Spawn command handler for write/resize
     let cmd_session = session.clone();
+    let exit_notify_command = std::sync::Arc::clone(&exit_notify);
     tokio::spawn(async move {
         // Try to open a streaming-input RPC for low-latency keystroke
         // delivery. Falls back to batched fire-and-forget write_input
@@ -3082,12 +4467,28 @@ async fn run_daemon_io_loop(
                         log::error!("Failed to update daemon frontend state: {error}");
                     }
                 }
+                DaemonCmd::ClearAlert => {
+                    if let Err(error) = cmd_session.clear_alert().await {
+                        log::warn!("Failed to clear daemon bell alert: {error}");
+                    }
+                }
+                DaemonCmd::Close => {
+                    if let Err(error) = cmd_session.detach().await {
+                        log::warn!("Failed to detach daemon session: {error}");
+                    }
+                    exit_notify_command.notify_one();
+                    break;
+                }
+                DaemonCmd::Destroy => {
+                    if let Err(error) = cmd_session.destroy().await {
+                        log::warn!("Failed to destroy daemon session: {error}");
+                    }
+                    exit_notify_command.notify_one();
+                    break;
+                }
             }
         }
     });
-
-    // Notify used to cancel the output stream when process exits
-    let exit_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
     // Subscribe to event stream (process exit, etc.)
     let event_session = session.clone();
@@ -3239,6 +4640,21 @@ fn post_tab_exit(hwnd: usize, tab_id: u64) {
     post_message(hwnd, WM_APP_PTY_EXIT, tab_id);
 }
 
+fn post_daemon_session_ready(hwnd: usize, source_id: u64, ready: DaemonSessionReady) {
+    let ready = Box::into_raw(Box::new(ready));
+    let posted = unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_APP_DAEMON_SESSION_READY,
+            WPARAM(source_id as usize),
+            LPARAM(ready as isize),
+        )
+    };
+    if posted.is_err() {
+        unsafe { drop(Box::from_raw(ready)) };
+    }
+}
+
 /// Window procedure
 /// Whether Shift is currently held (used to bypass mouse forwarding so local
 /// interaction — hyperlink menu, scrollback — keeps working under a tracking app).
@@ -3272,6 +4688,13 @@ fn mouse_position_changed(
     } else {
         (previous.col, previous.row) != (current.col, current.row)
     }
+}
+
+fn signed_point_from_lparam(value: isize) -> (i32, i32) {
+    (
+        (value & 0xFFFF) as u16 as i16 as i32,
+        ((value >> 16) & 0xFFFF) as u16 as i16 as i32,
+    )
 }
 
 extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -3419,10 +4842,25 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
 
+        WM_CAPTURECHANGED => {
+            state.pane_divider_drag = None;
+            LRESULT(0)
+        }
+
         WM_MOUSEWHEEL => {
             // High word of wParam is the signed wheel delta (multiple of 120).
             let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-            state.on_wheel(delta);
+            // Unlike button/move messages, WM_MOUSEWHEEL lParam is expressed in
+            // screen coordinates. Convert before pane hit-testing.
+            let (screen_x, screen_y) = signed_point_from_lparam(lparam.0);
+            let mut point = POINT {
+                x: screen_x,
+                y: screen_y,
+            };
+            unsafe {
+                let _ = ScreenToClient(hwnd, &mut point);
+            }
+            state.on_wheel(delta, point.x as f32, point.y as f32);
             LRESULT(0)
         }
 
@@ -3467,6 +4905,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
 
+        WM_APP_DAEMON_SESSION_READY => {
+            if lparam.0 != 0 {
+                let ready = unsafe { Box::from_raw(lparam.0 as *mut DaemonSessionReady) };
+                state.on_daemon_session_ready(wparam.0 as u64, *ready);
+            }
+            LRESULT(0)
+        }
+
         WM_APP_DESKTOP_NOTIFICATION => {
             if lparam.0 != 0 {
                 let notification = unsafe {
@@ -3485,6 +4931,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_SETFOCUS => {
             // Send focus in event to terminal if DECSET 1004 is enabled
             state.send_focus_event(true);
+            state.clear_active_pane_bell();
+            state.invalidate();
             LRESULT(0)
         }
 
@@ -3520,7 +4968,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         WM_DESTROY => {
             // Clean up
-            let state = unsafe { Box::from_raw(state_ptr) };
+            let mut state = unsafe { Box::from_raw(state_ptr) };
+            if !state.skip_close_confirm {
+                for tab in &mut state.tabs {
+                    for pane in tab.panes.values_mut() {
+                        pane.destroy();
+                    }
+                }
+            }
             drop(state);
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
             unsafe { PostQuitMessage(0) };
@@ -3529,6 +4984,161 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+fn pane_at_layout_point(
+    layout: &PaneLayout,
+    bounds: PaneRect,
+    x: u32,
+    y: u32,
+) -> Option<(PaneId, PaneRect)> {
+    layout.layout(bounds).into_iter().find_map(|pane| {
+        let right = pane.rect.x.saturating_add(pane.rect.width);
+        let bottom = pane.rect.y.saturating_add(pane.rect.height);
+        (x >= pane.rect.x && x < right && y >= pane.rect.y && y < bottom)
+            .then_some((pane.id, pane.rect))
+    })
+}
+
+fn upgrade_pane_records(
+    tab: &cterm_app::upgrade::TabUpgradeState,
+) -> Result<(PaneLayout, Vec<cterm_app::upgrade::PaneUpgradeState>), String> {
+    match (&tab.pane_layout, tab.panes.is_empty()) {
+        (Some(layout), false) if layout.pane_ids().len() == tab.panes.len() => {
+            Ok((layout.clone(), tab.panes.clone()))
+        }
+        (Some(layout), false) => Err(format!(
+            "layout has {} panes but state has {} records",
+            layout.pane_ids().len(),
+            tab.panes.len()
+        )),
+        (_, true) => {
+            let mut pane = cterm_app::upgrade::PaneUpgradeState::new(tab.session_id.clone());
+            pane.title = tab.title.clone();
+            pane.title_locked = tab.custom_title.is_some();
+            pane.template_name = tab.template_name.clone();
+            pane.cwd = tab.cwd.clone();
+            pane.keep_open = tab.keep_open;
+            Ok((PaneLayout::new(), vec![pane]))
+        }
+        (None, false) => Err("pane records have no layout".to_string()),
+    }
+}
+
+fn upgrade_window_is_handoff_ready(window: &cterm_app::upgrade::WindowUpgradeState) -> bool {
+    !window.tabs.is_empty()
+        && window.tabs.iter().all(|tab| {
+            !tab.panes.is_empty()
+                && tab
+                    .panes
+                    .iter()
+                    .all(|pane| pane.session_id.as_ref().is_some_and(|id| !id.is_empty()))
+        })
+}
+
+fn divider_at_tree_point(tree: &PaneTree, bounds: PaneRect, x: u32, y: u32) -> Option<PaneDivider> {
+    fn visit(
+        tree: &PaneTree,
+        rect: PaneRect,
+        x: u32,
+        y: u32,
+        path: &mut Vec<PaneBranch>,
+    ) -> Option<PaneDivider> {
+        let PaneTree::Split {
+            direction,
+            first_ratio,
+            first,
+            second,
+        } = tree
+        else {
+            return None;
+        };
+        let (first_rect, second_rect, divider_coordinate) =
+            split_pane_rect(rect, *direction, *first_ratio);
+
+        path.push(PaneBranch::First);
+        let first_hit = visit(first, first_rect, x, y, path);
+        path.pop();
+        if first_hit.is_some() {
+            return first_hit;
+        }
+        path.push(PaneBranch::Second);
+        let second_hit = visit(second, second_rect, x, y, path);
+        path.pop();
+        if second_hit.is_some() {
+            return second_hit;
+        }
+
+        const HIT_RADIUS: u32 = 3;
+        let inside = x >= rect.x
+            && x < rect.x.saturating_add(rect.width)
+            && y >= rect.y
+            && y < rect.y.saturating_add(rect.height);
+        let near = match direction {
+            SplitDirection::Horizontal => x.abs_diff(divider_coordinate) <= HIT_RADIUS,
+            SplitDirection::Vertical => y.abs_diff(divider_coordinate) <= HIT_RADIUS,
+        };
+        (inside && near).then(|| PaneDivider {
+            path: path.clone(),
+            direction: *direction,
+            split_rect: rect,
+        })
+    }
+
+    visit(tree, bounds, x, y, &mut Vec::new())
+}
+
+fn split_pane_rect(
+    rect: PaneRect,
+    direction: SplitDirection,
+    ratio: SplitRatio,
+) -> (PaneRect, PaneRect, u32) {
+    let first_extent = |total: u32| match total {
+        0 => 0,
+        1 => 1,
+        _ => ((u64::from(total) * u64::from(ratio.basis_points()) / 10_000) as u32)
+            .clamp(1, total - 1),
+    };
+    match direction {
+        SplitDirection::Horizontal => {
+            let first_width = first_extent(rect.width);
+            let divider = rect.x.saturating_add(first_width);
+            (
+                PaneRect::new(rect.x, rect.y, first_width, rect.height),
+                PaneRect::new(
+                    divider,
+                    rect.y,
+                    rect.width.saturating_sub(first_width),
+                    rect.height,
+                ),
+                divider,
+            )
+        }
+        SplitDirection::Vertical => {
+            let first_height = first_extent(rect.height);
+            let divider = rect.y.saturating_add(first_height);
+            (
+                PaneRect::new(rect.x, rect.y, rect.width, first_height),
+                PaneRect::new(
+                    rect.x,
+                    divider,
+                    rect.width,
+                    rect.height.saturating_sub(first_height),
+                ),
+                divider,
+            )
+        }
+    }
+}
+
+fn ratio_at_coordinate(coordinate: f32, origin: f32, extent: u32) -> u16 {
+    if extent <= 1 {
+        return SplitRatio::HALF.basis_points();
+    }
+    (((coordinate - origin) / extent as f32 * 10_000.0).round() as i32).clamp(
+        i32::from(SplitRatio::MIN.basis_points()),
+        i32::from(SplitRatio::MAX.basis_points()),
+    ) as u16
 }
 
 /// Parse a hex color string (e.g., "#e74c3c") to Rgb
@@ -3552,6 +5162,50 @@ fn terminal_palette(theme: &Theme, background: Option<&str>) -> ColorPalette {
         palette.background = background;
     }
     palette
+}
+
+fn template_session_options(
+    template: &cterm_app::config::StickyTabConfig,
+    config: &Config,
+    cols: u32,
+    rows: u32,
+) -> cterm_client::CreateSessionOpts {
+    let (configured_shell, configured_args) = template.get_command_args();
+    let shell = configured_shell.or_else(|| config.general.default_shell.clone());
+    let args = if template.docker.is_none() && template.command.is_none() {
+        config.general.shell_args.clone()
+    } else {
+        configured_args
+    };
+    cterm_client::CreateSessionOpts {
+        cols,
+        rows,
+        shell,
+        args,
+        cwd: template
+            .working_directory
+            .as_ref()
+            .or(config.general.working_directory.as_ref())
+            .map(|path| path.to_string_lossy().into_owned()),
+        // Preserve the existing Win32 template environment order. The daemon
+        // collects this into a map, so configured defaults replace duplicate
+        // template entries exactly as the former local PTY path did.
+        env: template
+            .env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .chain(
+                config
+                    .general
+                    .env
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            )
+            .collect(),
+        term: config.general.term.clone(),
+        ssh: template.ssh.as_ref().map(|ssh| ssh.to_ssh_params()),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -3636,5 +5290,210 @@ mod tests {
             mapped_terminal_key(0x32, Modifiers::ALT, true, false),
             Some(Key::Char('2'))
         );
+    }
+
+    #[test]
+    fn pane_hit_testing_tracks_split_and_zoom_geometry() {
+        let mut layout = PaneLayout::new();
+        let first = layout.active();
+        let second = layout
+            .split_active(SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..SplitRequest::default()
+            })
+            .unwrap();
+        let bounds = PaneRect::new(0, 0, 100, 40);
+
+        assert_eq!(
+            pane_at_layout_point(&layout, bounds, 10, 10).unwrap().0,
+            first
+        );
+        assert_eq!(
+            pane_at_layout_point(&layout, bounds, 90, 10).unwrap().0,
+            second
+        );
+
+        layout.zoom(first).unwrap();
+        assert_eq!(
+            pane_at_layout_point(&layout, bounds, 90, 10).unwrap().0,
+            first
+        );
+    }
+
+    #[test]
+    fn divider_hit_testing_returns_stable_nested_split_paths() {
+        let mut layout = PaneLayout::new();
+        layout
+            .split_active(SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..SplitRequest::default()
+            })
+            .unwrap();
+        layout
+            .split_active(SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..SplitRequest::default()
+            })
+            .unwrap();
+        let bounds = PaneRect::new(0, 0, 100, 40);
+
+        let root = divider_at_tree_point(&layout.tree(), bounds, 50, 5).unwrap();
+        assert_eq!(root.direction, SplitDirection::Horizontal);
+        assert!(root.path.is_empty());
+
+        let nested = divider_at_tree_point(&layout.tree(), bounds, 75, 20).unwrap();
+        assert_eq!(nested.direction, SplitDirection::Vertical);
+        assert_eq!(nested.path, vec![PaneBranch::Second]);
+        assert_eq!(nested.split_rect, PaneRect::new(50, 0, 50, 40));
+    }
+
+    #[test]
+    fn divider_drag_ratios_are_bounded_and_deterministic() {
+        assert_eq!(ratio_at_coordinate(25.0, 0.0, 100), 2_500);
+        assert_eq!(ratio_at_coordinate(-50.0, 0.0, 100), 500);
+        assert_eq!(ratio_at_coordinate(150.0, 0.0, 100), 9_500);
+        assert_eq!(ratio_at_coordinate(10.0, 10.0, 1), 5_000);
+    }
+
+    #[test]
+    fn wheel_lparam_preserves_signed_screen_coordinates() {
+        let x = -120_i16;
+        let y = 340_i16;
+        let packed = (u16::from_ne_bytes(x.to_ne_bytes()) as isize)
+            | ((u16::from_ne_bytes(y.to_ne_bytes()) as isize) << 16);
+        assert_eq!(signed_point_from_lparam(packed), (-120, 340));
+    }
+
+    #[test]
+    fn upgrade_records_follow_layout_preorder_and_legacy_falls_back() {
+        let mut layout = PaneLayout::new();
+        layout
+            .split_active(SplitRequest {
+                direction: SplitDirection::Horizontal,
+                ..SplitRequest::default()
+            })
+            .unwrap();
+        let mut tab = cterm_app::upgrade::TabUpgradeState::new(9);
+        tab.pane_layout = Some(layout.clone());
+        tab.panes = vec![
+            cterm_app::upgrade::PaneUpgradeState::new(Some("left".to_string())),
+            cterm_app::upgrade::PaneUpgradeState::new(Some("right".to_string())),
+        ];
+        let (restored_layout, records) = upgrade_pane_records(&tab).unwrap();
+        assert_eq!(restored_layout.pane_ids(), layout.pane_ids());
+        assert_eq!(records[0].session_id.as_deref(), Some("left"));
+        assert_eq!(records[1].session_id.as_deref(), Some("right"));
+
+        let mut legacy = cterm_app::upgrade::TabUpgradeState::new(10);
+        legacy.title = "legacy".to_string();
+        legacy.session_id = Some("only".to_string());
+        let (legacy_layout, records) = upgrade_pane_records(&legacy).unwrap();
+        assert_eq!(legacy_layout.len(), 1);
+        assert_eq!(records[0].session_id.as_deref(), Some("only"));
+        assert_eq!(records[0].title, "legacy");
+    }
+
+    #[test]
+    fn seamless_handoff_waits_for_every_daemon_session_id() {
+        let mut window = cterm_app::upgrade::WindowUpgradeState::new();
+        let mut tab = cterm_app::upgrade::TabUpgradeState::new(1);
+        tab.pane_layout = Some(PaneLayout::new());
+        tab.panes = vec![cterm_app::upgrade::PaneUpgradeState::new(None)];
+        window.tabs.push(tab);
+        assert!(!upgrade_window_is_handoff_ready(&window));
+
+        window.tabs[0].panes[0].session_id = Some("daemon-session".to_string());
+        assert!(upgrade_window_is_handoff_ready(&window));
+
+        window.tabs[0]
+            .panes
+            .push(cterm_app::upgrade::PaneUpgradeState::new(None));
+        assert!(!upgrade_window_is_handoff_ready(&window));
+    }
+
+    #[test]
+    fn template_daemon_options_preserve_process_contract() {
+        let mut config = Config::default();
+        config.general.default_shell = Some("configured-shell.exe".to_string());
+        config.general.shell_args = vec!["--configured".to_string()];
+        config.general.working_directory = Some(std::path::PathBuf::from(r"C:\configured"));
+        config
+            .general
+            .env
+            .insert("FROM_CONFIG".to_string(), "yes".to_string());
+        config.general.term = Some("xterm-direct".to_string());
+
+        let template = cterm_app::config::StickyTabConfig {
+            command: Some("program.exe".to_string()),
+            args: vec!["two words".to_string(), "--literal".to_string()],
+            working_directory: Some(std::path::PathBuf::from(r"C:\template")),
+            env: std::collections::HashMap::from([(
+                "FROM_TEMPLATE".to_string(),
+                "yes".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let options = template_session_options(&template, &config, 132, 43);
+        assert_eq!(options.cols, 132);
+        assert_eq!(options.rows, 43);
+        assert_eq!(options.shell.as_deref(), Some("program.exe"));
+        assert_eq!(options.args, ["two words", "--literal"]);
+        assert_eq!(options.cwd.as_deref(), Some(r"C:\template"));
+        assert!(options
+            .env
+            .contains(&("FROM_CONFIG".to_string(), "yes".to_string())));
+        assert!(options
+            .env
+            .contains(&("FROM_TEMPLATE".to_string(), "yes".to_string())));
+        assert_eq!(options.term.as_deref(), Some("xterm-direct"));
+    }
+
+    #[test]
+    fn default_template_inherits_configured_shell_argv_and_cwd() {
+        let mut config = Config::default();
+        config.general.default_shell = Some("pwsh.exe".to_string());
+        config.general.shell_args = vec!["-NoLogo".to_string()];
+        config.general.working_directory = Some(std::path::PathBuf::from(r"C:\work"));
+
+        let options = template_session_options(
+            &cterm_app::config::StickyTabConfig::default(),
+            &config,
+            80,
+            24,
+        );
+        assert_eq!(options.shell.as_deref(), Some("pwsh.exe"));
+        assert_eq!(options.args, ["-NoLogo"]);
+        assert_eq!(options.cwd.as_deref(), Some(r"C:\work"));
+    }
+
+    #[test]
+    fn daemon_pane_launch_context_round_trips_for_post_upgrade_splits() {
+        let options = cterm_client::CreateSessionOpts {
+            shell: Some("pwsh.exe".to_string()),
+            args: vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
+            env: vec![("CTERM_TEST".to_string(), "one".to_string())],
+            term: Some("xterm-direct".to_string()),
+            ssh: Some(cterm_client::SshParams {
+                host: "server.example".to_string(),
+                port: 2222,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let original = DaemonPaneContext::from_options(&options, None);
+        let launch = original.launch_context();
+        let mut restored = DaemonPaneContext::local_default();
+        restored.apply_launch_context(&launch);
+
+        assert_eq!(restored.shell, original.shell);
+        assert_eq!(restored.args, original.args);
+        assert_eq!(restored.env, original.env);
+        assert_eq!(restored.term, original.term);
+        assert_eq!(
+            restored.ssh.as_ref().map(|ssh| ssh.host.as_str()),
+            Some("server.example")
+        );
+        assert_eq!(restored.ssh.as_ref().map(|ssh| ssh.port), Some(2222));
     }
 }

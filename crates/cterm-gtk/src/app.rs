@@ -73,6 +73,7 @@ pub fn build_ui(app: &Application) {
             window.window.fullscreen();
         }
         window.present();
+        window.start_wayland_pane_ci_driver();
     } else {
         // Normal startup - create the main window with a fresh session
         let opts = args.initial_session_options(&config, 80, 24);
@@ -91,6 +92,7 @@ pub fn build_ui(app: &Application) {
             window.window.fullscreen();
         }
         window.present();
+        window.start_wayland_pane_ci_driver();
     }
 }
 
@@ -121,6 +123,11 @@ fn apply_css(theme: &Theme) {
         /* Terminal drawing area - background handled by Cairo drawing */
         .terminal {{
             padding: 0;
+        }}
+
+        .terminal.pane-active {{
+            outline: 1px solid {border};
+            outline-offset: -1px;
         }}
 
         /* Tab bar styling */

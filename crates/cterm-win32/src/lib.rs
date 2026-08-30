@@ -74,8 +74,13 @@ pub fn run() {
 
     log::info!("Starting cterm (Windows native UI)");
 
+    let upgrade_state_path = args.upgrade_state.clone();
+    // Upgrade reconstruction creates ordinary windows and therefore needs the
+    // same global argument state as a normal launch.
+    let _ = APP_ARGS.set(args);
+
     // Check if we're in upgrade receiver mode
-    if let Some(ref state_path) = args.upgrade_state {
+    if let Some(ref state_path) = upgrade_state_path {
         log::info!(
             "Running in upgrade receiver mode with state file {}",
             state_path
@@ -83,9 +88,6 @@ pub fn run() {
         let exit_code = upgrade_receiver::run_receiver(state_path);
         std::process::exit(exit_code);
     }
-
-    // Store args for later access
-    let _ = APP_ARGS.set(args);
 
     // Set up DPI awareness
     dpi::setup_dpi_awareness();

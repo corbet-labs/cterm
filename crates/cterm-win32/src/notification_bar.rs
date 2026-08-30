@@ -165,6 +165,18 @@ impl NotificationBar {
         width: f32,
         text_format: &IDWriteTextFormat,
     ) -> windows::core::Result<()> {
+        self.render_at(rt, dwrite, width, text_format, 0.0)
+    }
+
+    /// Render the notification bar below other window chrome.
+    pub fn render_at(
+        &mut self,
+        rt: &ID2D1HwndRenderTarget,
+        dwrite: &IDWriteFactory,
+        width: f32,
+        text_format: &IDWriteTextFormat,
+        y_offset: f32,
+    ) -> windows::core::Result<()> {
         if !self.visible {
             return Ok(());
         }
@@ -180,9 +192,9 @@ impl NotificationBar {
         // Draw background
         let bg_rect = D2D_RECT_F {
             left: 0.0,
-            top: 0.0,
+            top: y_offset,
             right: width,
-            bottom: height,
+            bottom: y_offset + height,
         };
 
         // Use a slightly highlighted background
@@ -218,16 +230,22 @@ impl NotificationBar {
 
             let text_origin = D2D_POINT_2F {
                 x: self.dpi.scale_f32(BUTTON_MARGIN),
-                y: 0.0,
+                y: y_offset,
             };
             unsafe { base.DrawTextLayout(text_origin, &layout, &text_brush, Default::default()) };
         }
 
         // Draw buttons
+        let shift = |rect: &D2D_RECT_F| D2D_RECT_F {
+            left: rect.left,
+            top: rect.top + y_offset,
+            right: rect.right,
+            bottom: rect.bottom + y_offset,
+        };
         self.render_button(
             rt,
             dwrite,
-            &self.save_button_rect,
+            &shift(&self.save_button_rect),
             "Save",
             Rgb::new(0, 128, 0),
             text_format,
@@ -235,7 +253,7 @@ impl NotificationBar {
         self.render_button(
             rt,
             dwrite,
-            &self.save_as_button_rect,
+            &shift(&self.save_as_button_rect),
             "Save As...",
             Rgb::new(0, 100, 150),
             text_format,
@@ -243,7 +261,7 @@ impl NotificationBar {
         self.render_button(
             rt,
             dwrite,
-            &self.discard_button_rect,
+            &shift(&self.discard_button_rect),
             "Discard",
             Rgb::new(150, 50, 50),
             text_format,
@@ -254,10 +272,13 @@ impl NotificationBar {
         let border_brush = unsafe { base.CreateSolidColorBrush(&border_color, None)? };
         unsafe {
             base.DrawLine(
-                D2D_POINT_2F { x: 0.0, y: height },
+                D2D_POINT_2F {
+                    x: 0.0,
+                    y: y_offset + height,
+                },
                 D2D_POINT_2F {
                     x: width,
-                    y: height,
+                    y: y_offset + height,
                 },
                 &border_brush,
                 1.0,

@@ -271,6 +271,24 @@ pub struct PositionedPane {
     pub is_zoomed: bool,
 }
 
+/// Read-only snapshot of a pane layout's split topology.
+///
+/// Frontends can use this tree to construct native split containers and
+/// draggable dividers without depending on the layout's private mutation
+/// representation. Mutations still go through [`PaneLayout`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneTree {
+    /// A terminal pane.
+    Pane(PaneId),
+    /// A split with its first-side ratio and two children.
+    Split {
+        direction: SplitDirection,
+        first_ratio: SplitRatio,
+        first: Box<PaneTree>,
+        second: Box<PaneTree>,
+    },
+}
+
 /// Pane-tree operation failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PaneLayoutError {
@@ -280,10 +298,16 @@ pub enum PaneLayoutError {
     LastPane,
     #[error("pane ID space is exhausted")]
     IdExhausted,
+    #[error("split path does not identify a split")]
+    UnknownSplit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Branch {
+/// One step from a split node to one of its children.
+///
+/// A sequence of branches identifies a split in a [`PaneTree`]. The empty
+/// sequence identifies the root when the root itself is a split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PaneBranch {
     First,
     Second,
 }
@@ -300,6 +324,23 @@ enum PaneNode {
 }
 
 impl PaneNode {
+    fn snapshot(&self) -> PaneTree {
+        match self {
+            Self::Pane(id) => PaneTree::Pane(*id),
+            Self::Split {
+                direction,
+                first_ratio,
+                first,
+                second,
+            } => PaneTree::Split {
+                direction: *direction,
+                first_ratio: *first_ratio,
+                first: Box::new(first.snapshot()),
+                second: Box::new(second.snapshot()),
+            },
+        }
+    }
+
     fn contains(&self, id: PaneId) -> bool {
         match self {
             Self::Pane(candidate) => *candidate == id,
@@ -431,17 +472,17 @@ impl PaneNode {
         }
     }
 
-    fn path_to(&self, target: PaneId, path: &mut Vec<Branch>) -> bool {
+    fn path_to(&self, target: PaneId, path: &mut Vec<PaneBranch>) -> bool {
         match self {
             Self::Pane(id) => *id == target,
             Self::Split { first, second, .. } => {
-                path.push(Branch::First);
+                path.push(PaneBranch::First);
                 if first.path_to(target, path) {
                     return true;
                 }
                 path.pop();
 
-                path.push(Branch::Second);
+                path.push(PaneBranch::Second);
                 if second.path_to(target, path) {
                     return true;
                 }
@@ -451,31 +492,46 @@ impl PaneNode {
         }
     }
 
-    fn node_at_path<'a>(&'a self, path: &[Branch]) -> &'a Self {
+    fn node_at_path<'a>(&'a self, path: &[PaneBranch]) -> &'a Self {
         let mut node = self;
         for branch in path {
             node = match (node, branch) {
-                (Self::Split { first, .. }, Branch::First) => first,
-                (Self::Split { second, .. }, Branch::Second) => second,
+                (Self::Split { first, .. }, PaneBranch::First) => first,
+                (Self::Split { second, .. }, PaneBranch::Second) => second,
                 (Self::Pane(_), _) => unreachable!("pane paths only descend through splits"),
             };
         }
         node
     }
 
-    fn node_at_path_mut<'a>(&'a mut self, path: &[Branch]) -> &'a mut Self {
+    fn node_at_path_mut<'a>(&'a mut self, path: &[PaneBranch]) -> &'a mut Self {
         let mut node = self;
         for branch in path {
             node = match (node, branch) {
-                (Self::Split { first, .. }, Branch::First) => first,
-                (Self::Split { second, .. }, Branch::Second) => second,
+                (Self::Split { first, .. }, PaneBranch::First) => first,
+                (Self::Split { second, .. }, PaneBranch::Second) => second,
                 (Self::Pane(_), _) => unreachable!("pane paths only descend through splits"),
             };
         }
         node
     }
 
-    fn rect_at_path(&self, bounds: PaneRect, path: &[Branch]) -> PaneRect {
+    fn split_at_path_mut(&mut self, path: &[PaneBranch]) -> Option<&mut SplitRatio> {
+        let mut node = self;
+        for branch in path {
+            node = match (node, branch) {
+                (Self::Split { first, .. }, PaneBranch::First) => first,
+                (Self::Split { second, .. }, PaneBranch::Second) => second,
+                (Self::Pane(_), _) => return None,
+            };
+        }
+        match node {
+            Self::Split { first_ratio, .. } => Some(first_ratio),
+            Self::Pane(_) => None,
+        }
+    }
+
+    fn rect_at_path(&self, bounds: PaneRect, path: &[PaneBranch]) -> PaneRect {
         let mut node = self;
         let mut rect = bounds;
         for branch in path {
@@ -488,11 +544,11 @@ impl PaneNode {
                 } => {
                     let (first_rect, second_rect) = rect.split(*direction, *first_ratio);
                     match branch {
-                        Branch::First => {
+                        PaneBranch::First => {
                             node = first;
                             rect = first_rect;
                         }
-                        Branch::Second => {
+                        PaneBranch::Second => {
                             node = second;
                             rect = second_rect;
                         }
@@ -579,6 +635,32 @@ impl PaneLayout {
         let mut ids = Vec::with_capacity(self.len());
         self.root.collect_ids(&mut ids);
         ids
+    }
+
+    /// Return a read-only snapshot of the pane split topology.
+    pub fn tree(&self) -> PaneTree {
+        self.root.snapshot()
+    }
+
+    /// Set a native divider's ratio using its path in [`Self::tree`].
+    ///
+    /// Returns whether the ratio changed. An invalid path leaves the layout
+    /// untouched. Changing a divider exits zoom mode so the result is visible.
+    pub fn set_split_ratio(
+        &mut self,
+        path: &[PaneBranch],
+        ratio: SplitRatio,
+    ) -> Result<bool, PaneLayoutError> {
+        let first_ratio = self
+            .root
+            .split_at_path_mut(path)
+            .ok_or(PaneLayoutError::UnknownSplit)?;
+        if *first_ratio == ratio {
+            return Ok(false);
+        }
+        *first_ratio = ratio;
+        self.zoomed = None;
+        Ok(true)
     }
 
     /// Focus an existing pane.
@@ -1220,6 +1302,72 @@ mod tests {
         layout.split_active(SplitRequest::default()).unwrap();
         assert_eq!(layout.zoomed(), None);
         assert_eq!(layout.len(), 3);
+    }
+
+    #[test]
+    fn tree_snapshot_preserves_native_split_topology() {
+        let mut layout = PaneLayout::new();
+        let first = layout.active();
+        let right = layout
+            .split_active(SplitRequest {
+                direction: SplitDirection::Horizontal,
+                placement: SplitPlacement::Second,
+                ratio: SplitRatio::from_percent(40).unwrap(),
+            })
+            .unwrap();
+        let bottom_right = layout
+            .split_active(SplitRequest {
+                direction: SplitDirection::Vertical,
+                placement: SplitPlacement::Second,
+                ratio: SplitRatio::from_percent(25).unwrap(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            layout.tree(),
+            PaneTree::Split {
+                direction: SplitDirection::Horizontal,
+                first_ratio: SplitRatio::from_percent(60).unwrap(),
+                first: Box::new(PaneTree::Pane(first)),
+                second: Box::new(PaneTree::Split {
+                    direction: SplitDirection::Vertical,
+                    first_ratio: SplitRatio::from_percent(75).unwrap(),
+                    first: Box::new(PaneTree::Pane(right)),
+                    second: Box::new(PaneTree::Pane(bottom_right)),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn native_divider_ratio_updates_are_checked_and_persistent() {
+        let mut layout = PaneLayout::new();
+        layout.split_active(SplitRequest::default()).unwrap();
+        layout
+            .split_active(SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..SplitRequest::default()
+            })
+            .unwrap();
+        layout.toggle_zoom();
+
+        assert!(layout
+            .set_split_ratio(&[], SplitRatio::from_percent(70).unwrap())
+            .unwrap());
+        assert_eq!(layout.zoomed(), None);
+        assert!(layout
+            .set_split_ratio(&[PaneBranch::Second], SplitRatio::from_percent(30).unwrap(),)
+            .unwrap());
+        assert!(!layout
+            .set_split_ratio(&[PaneBranch::Second], SplitRatio::from_percent(30).unwrap(),)
+            .unwrap());
+
+        let expected = layout.clone();
+        assert_eq!(
+            layout.set_split_ratio(&[PaneBranch::First], SplitRatio::from_percent(20).unwrap(),),
+            Err(PaneLayoutError::UnknownSplit)
+        );
+        assert_eq!(layout, expected);
     }
 
     #[test]

@@ -47,12 +47,38 @@ pub fn get_args() -> &'static Args {
     APP_ARGS.get().expect("Args not initialized")
 }
 
+/// Whether the current UI is terminating after handing its daemon sessions to
+/// a replacement process. Native close delegates must not prompt in this path.
+pub fn is_relaunching() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(delegate) = app.delegate() else {
+        return false;
+    };
+    let delegate = unsafe { &*(Retained::as_ptr(&delegate) as *const AppDelegate) };
+    delegate.ivars().is_relaunching.get()
+}
+
 fn reject_managed_secondary_action(action: &str) -> bool {
     if get_args().managed {
         log::warn!("Ignoring {action} request in managed mode");
         true
     } else {
         false
+    }
+}
+
+async fn detach_snapshot_handles(sessions: &[cterm_app::daemon_reconnect::ReconnectedSession]) {
+    let detaches = sessions.iter().map(|session| async move {
+        let session_id = session.handle.session_id().to_string();
+        (session_id, session.handle.detach().await)
+    });
+    for (session_id, result) in futures::future::join_all(detaches).await {
+        if let Err(error) = result {
+            log::warn!("Failed to release snapshot attachment for {session_id}: {error}");
+        }
     }
 }
 
@@ -95,62 +121,69 @@ define_class!(
                 let config = self.ivars().config.clone();
                 let theme = self.ivars().theme.clone();
 
-                // Reconnect to daemon sessions from upgrade state
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build();
 
                 if let Ok(rt) = rt {
                     for window_state in upgrade_state.windows {
-                        for tab_state in &window_state.tabs {
-                            if let Some(ref session_id) = tab_state.session_id {
-                                match rt.block_on(async {
-                                    let conn = cterm_client::DaemonConnection::connect_local().await?;
-                                    conn.attach_session(session_id, 80, 24).await
-                                }) {
-                                    Ok((handle, screen)) => {
-                                        let recon = cterm_app::daemon_reconnect::ReconnectedSession {
-                                            handle,
-                                            title: tab_state.title.clone(),
-                                            custom_title: tab_state.custom_title.clone().unwrap_or_default(),
-                                            tab_color: tab_state.color.clone().unwrap_or_default(),
-                                            template_name: tab_state.template_name.clone().unwrap_or_default(),
-                                            screen,
-                                        };
-                                        let window = CtermWindow::from_daemon_with_screen(mtm, &config, &theme, recon);
+                        let mut restored_tabs = Vec::new();
+                        for (source_index, tab_state) in window_state.tabs.iter().enumerate() {
+                            let Some(window) = self.restore_upgrade_tab(
+                                mtm,
+                                &rt,
+                                &config,
+                                &theme,
+                                tab_state,
+                            ) else {
+                                continue;
+                            };
 
-                                        // Restore window frame from saved state
-                                        let frame = NSRect::new(
-                                            NSPoint::new(window_state.x as f64, window_state.y as f64),
-                                            NSSize::new(window_state.width as f64, window_state.height as f64),
-                                        );
-                                        window.setFrame_display(frame, true);
+                            let frame = NSRect::new(
+                                NSPoint::new(window_state.x as f64, window_state.y as f64),
+                                NSSize::new(
+                                    window_state.width as f64,
+                                    window_state.height as f64,
+                                ),
+                            );
+                            window.setFrame_display(frame, true);
 
-                                        // Restore tab color
-                                        if let Some(ref color) = tab_state.color {
-                                            window.set_tab_color(Some(color));
-                                        }
-
-                                        // Restore template name
-                                        if let Some(ref tpl_name) = tab_state.template_name {
-                                            if let Some(tv) = window.active_terminal() {
-                                                tv.set_template_name(Some(tpl_name.clone()));
-                                            }
-                                        }
-
-                                        // Restore fullscreen state
-                                        if window_state.fullscreen {
-                                            window.toggleFullScreen(None);
-                                        }
-
-                                        self.ivars().windows.borrow_mut().push(window.clone());
-                                        window.makeKeyAndOrderFront(None);
-                                    }
-                                    Err(e) => {
-                                        log::error!("Failed to reconnect session {}: {}", session_id, e);
-                                    }
-                                }
+                            if let Some(ref color) = tab_state.color {
+                                window.set_tab_color(Some(color));
                             }
+                            restored_tabs.push((source_index, window));
+                        }
+
+                        if restored_tabs.is_empty() {
+                            continue;
+                        }
+
+                        let selected_index = restored_tabs
+                            .iter()
+                            .position(|(source_index, _)| {
+                                *source_index == window_state.active_tab
+                            })
+                            .unwrap_or(0);
+                        let selected_window = restored_tabs[selected_index].1.clone();
+
+                        if restored_tabs.len() > 1 {
+                            if let Some(group) = restored_tabs[0].1.tabGroup() {
+                                for (_, window) in restored_tabs.iter().skip(1) {
+                                    group.addWindow(window);
+                                }
+                                group.setSelectedWindow(Some(&selected_window));
+                            }
+                        }
+
+                        for (_, window) in &restored_tabs {
+                            self.ivars().windows.borrow_mut().push(window.clone());
+                        }
+                        selected_window.makeKeyAndOrderFront(None);
+                        if window_state.maximized && !selected_window.isZoomed() {
+                            selected_window.performZoom(None);
+                        }
+                        if window_state.fullscreen {
+                            selected_window.toggleFullScreen(None);
                         }
                     }
 
@@ -180,9 +213,12 @@ define_class!(
                         if running_count > 0 {
                             log::info!("Found {} running daemon sessions, reconnecting...", running_count);
                             // Reconnect to all sessions
-                            let reconnected = rt.block_on(cterm_app::daemon_reconnect::reconnect_all_sessions());
+                            let reconnected = rt.block_on(
+                                cterm_app::daemon_reconnect::reconnect_all_sessions(),
+                            );
                             if let Ok(reconnected) = reconnected {
                                 if !reconnected.is_empty() {
+                                    rt.block_on(detach_snapshot_handles(&reconnected));
                                     let mut first = true;
                                     for recon in reconnected {
                                         let window = CtermWindow::from_daemon_with_screen(
@@ -286,11 +322,16 @@ define_class!(
                 let windows = self.ivars().windows.borrow();
                 windows
                     .iter()
-                    .filter_map(|window| {
-                        if let Some(terminal) = window.active_terminal() {
+                    .flat_map(|window| window.terminal_views())
+                    .filter_map(|terminal| {
+                        #[cfg(unix)]
+                        {
                             if terminal.has_foreground_process() {
                                 return terminal.foreground_process_name();
                             }
+                        }
+                        if terminal.session_id().is_some() {
+                            return terminal.daemon_foreground_process_name();
                         }
                         None
                     })
@@ -681,6 +722,7 @@ define_class!(
                                         cterm_client::DaemonConnection::connect_local().await?;
                                     let (handle, _) =
                                         conn.attach_session(&session_id, cols, rows).await?;
+                                    handle.detach().await?;
                                     Ok::<_, cterm_client::ClientError>(handle)
                                 }) {
                                     Ok(handle) => {
@@ -814,6 +856,8 @@ define_class!(
                                 template_name: String::new(),
                                 screen: None,
                             });
+                        } else {
+                            detach_snapshot_handles(&sessions).await;
                         }
 
                         Ok::<_, cterm_client::ClientError>(sessions)
@@ -1085,6 +1129,166 @@ impl AppDelegate {
         unsafe { msg_send![super(this), init] }
     }
 
+    fn reconnect_upgrade_pane(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        config: &Config,
+        pane: &cterm_app::upgrade::PaneUpgradeState,
+    ) -> Result<cterm_app::daemon_reconnect::ReconnectedSession, String> {
+        let session_id = pane
+            .session_id
+            .as_deref()
+            .ok_or_else(|| "pane has no daemon session ID".to_string())?;
+        let configured_remote = pane
+            .remote_name
+            .as_deref()
+            .map(|name| {
+                config
+                    .find_remote(name)
+                    .map(|remote| {
+                        (
+                            name.to_string(),
+                            remote.host.clone(),
+                            remote.ssh_compression,
+                        )
+                    })
+                    .ok_or_else(|| format!("configured remote '{name}' no longer exists"))
+            })
+            .transpose()?;
+        let daemon_socket = pane.daemon_socket.clone();
+        let remote_manager = self.ivars().remote_manager.clone();
+
+        let (handle, screen) = runtime
+            .block_on(async {
+                let connection = if let Some((name, host, compression)) = configured_remote {
+                    remote_manager
+                        .get_or_connect(&name, &host, compression)
+                        .await?
+                } else if let Some(path) = daemon_socket {
+                    cterm_client::DaemonConnection::connect_unix(&path, false).await?
+                } else {
+                    cterm_client::DaemonConnection::connect_local().await?
+                };
+                let (handle, screen) = connection.attach_session(session_id, 80, 24).await?;
+                handle.detach().await?;
+                Ok((handle, screen))
+            })
+            .map_err(|error| format!("failed to reconnect session {session_id}: {error}"))?;
+
+        Ok(cterm_app::daemon_reconnect::ReconnectedSession {
+            handle,
+            title: pane.title.clone(),
+            custom_title: pane
+                .title_locked
+                .then(|| pane.title.clone())
+                .unwrap_or_default(),
+            tab_color: String::new(),
+            template_name: pane.template_name.clone().unwrap_or_default(),
+            screen,
+        })
+    }
+
+    fn restore_upgrade_tab(
+        &self,
+        mtm: MainThreadMarker,
+        runtime: &tokio::runtime::Runtime,
+        config: &Config,
+        theme: &Theme,
+        tab_state: &cterm_app::upgrade::TabUpgradeState,
+    ) -> Option<Retained<CtermWindow>> {
+        if let Some(layout) = tab_state.pane_layout.as_ref() {
+            let pane_ids = layout.pane_ids();
+            if !tab_state.panes.is_empty() && pane_ids.len() == tab_state.panes.len() {
+                let reconnected = tab_state
+                    .panes
+                    .iter()
+                    .map(|pane| self.reconnect_upgrade_pane(runtime, config, pane))
+                    .collect::<Result<Vec<_>, _>>();
+                match reconnected {
+                    Ok(reconnected) => {
+                        return CtermWindow::from_daemon_panes(
+                            mtm,
+                            config,
+                            theme,
+                            tab_state,
+                            layout.clone(),
+                            reconnected,
+                        );
+                    }
+                    Err(error) => {
+                        log::error!("Cannot restore pane tab '{}': {error}", tab_state.title);
+                        return None;
+                    }
+                }
+            }
+            log::warn!(
+                "Invalid pane upgrade state for '{}'; falling back to its active-pane summary",
+                tab_state.title
+            );
+        }
+
+        let mut pane = cterm_app::upgrade::PaneUpgradeState::new(tab_state.session_id.clone());
+        pane.title = tab_state.title.clone();
+        pane.title_locked = tab_state.custom_title.is_some();
+        pane.template_name = tab_state.template_name.clone();
+        pane.cwd = tab_state.cwd.clone();
+        pane.keep_open = tab_state.keep_open;
+        let recon = match self.reconnect_upgrade_pane(runtime, config, &pane) {
+            Ok(recon) => recon,
+            Err(error) => {
+                log::error!("Cannot restore tab '{}': {error}", tab_state.title);
+                return None;
+            }
+        };
+        let window = CtermWindow::from_daemon_with_screen(mtm, config, theme, recon);
+        if let Some(terminal) = window.active_terminal() {
+            terminal.set_current_title(tab_state.title.clone());
+            terminal.set_keep_open(tab_state.keep_open);
+            terminal.set_template_name(tab_state.template_name.clone());
+        }
+        Some(window)
+    }
+
+    /// Return every tracked native window exactly once, preserving tab order
+    /// within each independent AppKit tab group.
+    fn tracked_window_groups(&self) -> Vec<Vec<Retained<CtermWindow>>> {
+        let windows = self.ivars().windows.borrow();
+        let mut visited = std::collections::HashSet::new();
+        let mut groups = Vec::new();
+
+        for seed in windows.iter() {
+            let seed_ptr = Retained::as_ptr(seed) as usize;
+            if visited.contains(&seed_ptr) {
+                continue;
+            }
+
+            let mut group = Vec::new();
+            if let Some(tab_group) = seed.tabGroup() {
+                for native_window in tab_group.windows().iter() {
+                    let native_ptr = Retained::as_ptr(&native_window);
+                    if let Some(window) = windows
+                        .iter()
+                        .find(|window| Retained::as_ptr(window) as *const NSWindow == native_ptr)
+                    {
+                        let window_ptr = Retained::as_ptr(window) as usize;
+                        if visited.insert(window_ptr) {
+                            group.push(window.clone());
+                        }
+                    }
+                }
+            }
+
+            if group.is_empty() && visited.insert(seed_ptr) {
+                group.push(seed.clone());
+            }
+            if !group.is_empty() {
+                groups.push(group);
+            }
+        }
+
+        groups
+    }
+
     /// Increment the bell count and update dock badge
     pub fn increment_bell_count(&self) {
         let count = self.ivars().bell_count.get() + 1;
@@ -1192,6 +1396,7 @@ impl AppDelegate {
                     template.name,
                     remote_name
                 );
+                return;
             }
         }
 
@@ -1260,44 +1465,47 @@ impl AppDelegate {
 
         let mut upgrade_state = UpgradeState::new();
 
-        // Get windows in tab order using macOS native tabbedWindows
-        let windows = self.ivars().windows.borrow();
-        let ordered_windows: Vec<Retained<CtermWindow>> =
-            if let Some(first_window) = windows.first() {
-                let tabbed: Option<Retained<objc2_foundation::NSArray<NSWindow>>> =
-                    unsafe { msg_send![&**first_window, tabbedWindows] };
+        let window_groups = self.tracked_window_groups();
+        let ordered_windows = window_groups
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect::<Vec<_>>();
 
-                if let Some(tabbed_windows) = tabbed {
-                    tabbed_windows
-                        .iter()
-                        .filter_map(|nswin| {
-                            let nswin_ptr = Retained::as_ptr(&nswin);
-                            windows
-                                .iter()
-                                .find(|w| Retained::as_ptr(*w) as *const NSWindow == nswin_ptr)
-                                .cloned()
-                        })
-                        .collect()
-                } else {
-                    windows.iter().cloned().collect()
-                }
-            } else {
-                Vec::new()
-            };
-        drop(windows);
-
-        for window in ordered_windows.iter() {
+        for group in &window_groups {
+            let selected_ptr = group
+                .first()
+                .and_then(|window| window.tabGroup())
+                .and_then(|tab_group| tab_group.selectedWindow())
+                .map(|window| Retained::as_ptr(&window));
+            let selected_index = selected_ptr
+                .and_then(|selected_ptr| {
+                    group.iter().position(|window| {
+                        Retained::as_ptr(window) as *const NSWindow == selected_ptr
+                    })
+                })
+                .unwrap_or(0);
+            let representative = &group[selected_index];
             let mut window_state = WindowUpgradeState::new();
 
-            let frame = window.frame();
+            let frame = representative.frame();
             window_state.x = frame.origin.x as i32;
             window_state.y = frame.origin.y as i32;
             window_state.width = frame.size.width as i32;
             window_state.height = frame.size.height as i32;
-            window_state.fullscreen = window.styleMask().contains(NSWindowStyleMask::FullScreen);
+            window_state.maximized = representative.isZoomed();
+            window_state.fullscreen = representative
+                .styleMask()
+                .contains(NSWindowStyleMask::FullScreen);
 
-            if let Some(terminal_view) = window.active_terminal() {
-                let mut tab_state = TabUpgradeState::new(0);
+            for (index, window) in group.iter().enumerate() {
+                let Some(terminal_view) = window.active_terminal() else {
+                    log::warn!(
+                        "Cannot relaunch while native tab {} is still being initialized",
+                        index
+                    );
+                    return;
+                };
+                let mut tab_state = TabUpgradeState::new(index as u64);
                 let title = window.title().to_string();
                 tab_state.title = title.clone();
                 if terminal_view.is_title_locked() {
@@ -1306,14 +1514,16 @@ impl AppDelegate {
                 tab_state.template_name = terminal_view.template_name();
                 tab_state.color = window.tab_color();
                 tab_state.session_id = terminal_view.session_id();
-                tab_state.cwd = terminal_view
-                    .terminal()
-                    .lock()
-                    .foreground_cwd()
-                    .map(|p| p.to_string_lossy().into_owned());
+                tab_state.cwd = terminal_view.foreground_cwd();
+                tab_state.keep_open = terminal_view.keep_open();
+                if let Some((layout, panes)) = window.pane_upgrade_state() {
+                    tab_state.pane_layout = Some(layout);
+                    tab_state.panes = panes;
+                }
 
                 window_state.tabs.push(tab_state);
             }
+            window_state.active_tab = selected_index;
 
             if !window_state.tabs.is_empty() {
                 upgrade_state.windows.push(window_state);
@@ -1333,6 +1543,9 @@ impl AppDelegate {
         match execute_upgrade(&binary, &upgrade_state) {
             Ok(()) => {
                 log::info!("Relaunch successful, terminating old process");
+                for window in &ordered_windows {
+                    window.preserve_panes_for_upgrade();
+                }
                 self.ivars().is_relaunching.set(true);
                 let mtm = MainThreadMarker::from(self);
                 let app = NSApplication::sharedApplication(mtm);
@@ -1419,8 +1632,13 @@ pub fn run() {
 
     log::info!("Starting cterm (native macOS)");
 
+    let upgrade_state_path = args.upgrade_state.clone();
+    // Upgrade reconstruction creates ordinary windows and therefore needs the
+    // same global argument state as a normal launch.
+    let _ = APP_ARGS.set(args);
+
     // Check if we're in upgrade receiver mode
-    if let Some(ref state_path) = args.upgrade_state {
+    if let Some(ref state_path) = upgrade_state_path {
         log::info!(
             "Running in upgrade receiver mode with state file: {}",
             state_path
@@ -1428,9 +1646,6 @@ pub fn run() {
         let exit_code = crate::upgrade_receiver::run_receiver(state_path);
         std::process::exit(exit_code);
     }
-
-    // Store args for later access
-    let _ = APP_ARGS.set(args);
 
     run_app_internal();
 }

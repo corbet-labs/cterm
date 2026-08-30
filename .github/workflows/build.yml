@@ -135,7 +135,7 @@ jobs:
       - name: Build cterm for UI tests
         run: cargo build -p cterm
 
-      - name: Run Wayland startup smoke test
+      - name: Run Wayland pane UI/action test
         run: |
           OUTPUT_DIR="${{ runner.temp }}/cterm_ui_test"
           mkdir -p "$OUTPUT_DIR"

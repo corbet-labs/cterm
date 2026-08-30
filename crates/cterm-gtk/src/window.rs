@@ -14,20 +14,42 @@ use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_ui::events::{Action, KeyCode, Modifiers};
 use cterm_ui::theme::Theme;
+use cterm_ui::{
+    PaneDirection, PaneId, PaneLayout, PaneTree, SplitDirection, SplitPlacement, SplitRatio,
+    SplitRequest,
+};
 
 use crate::dialogs;
 use crate::docker_dialog::{self, DockerSelection};
 use crate::menu;
 use crate::notification_bar::NotificationBar;
+use crate::pane::PaneSet;
 use crate::quick_open::QuickOpenOverlay;
 use crate::tab_bar::TabBar;
 use crate::terminal_widget::{frontend_palette, parse_rgb, CellDimensions, TerminalWidget};
 
-/// Tab entry tracking terminal and its ID
+/// One daemon-backed terminal session displayed in a pane.
+struct PaneEntry {
+    terminal: Rc<TerminalWidget>,
+    title: String,
+    title_locked: bool,
+    template_name: Option<String>,
+    keep_open: bool,
+    session_id: Option<String>,
+    daemon_socket: Option<std::path::PathBuf>,
+    remote_name: Option<String>,
+    /// Native SSH fallback for reconnect data that predates `launch_context`.
+    native_ssh: Option<cterm_client::SshParams>,
+    /// Stable process fields used to create sibling panes after UI handoff.
+    launch_context: Option<cterm_app::upgrade::PaneLaunchContext>,
+}
+
+/// Tab entry tracking a pane tree and its stable tab ID.
 struct TabEntry {
     id: u64,
     title: String,
-    terminal: TerminalWidget,
+    /// Cached active terminal for existing tab-oriented operations.
+    terminal: Rc<TerminalWidget>,
     /// Whether title was explicitly set (locks out OSC updates)
     title_locked: bool,
     /// Tab color override
@@ -41,16 +63,65 @@ struct TabEntry {
     /// can be torn down via the right-click "Disconnect" menu item, which kills
     /// the shared SSH tunnel and removes every tab with the same name.
     remote_name: Option<String>,
+    pane_container: GtkBox,
+    panes: PaneSet<PaneEntry>,
+}
+
+impl TabEntry {
+    fn active_pane_id(&self) -> PaneId {
+        self.panes.active_id()
+    }
+
+    fn activate_pane(&mut self, id: PaneId) -> bool {
+        let rebuild = self.panes.is_zoomed();
+        if self.panes.set_active(id).is_err() {
+            return false;
+        }
+        self.sync_active_pane(rebuild);
+        true
+    }
+
+    fn focus_pane(&mut self, direction: PaneDirection) -> Option<PaneId> {
+        let rebuild = self.panes.is_zoomed();
+        let id = self.panes.focus(direction)?;
+        self.sync_active_pane(rebuild);
+        Some(id)
+    }
+
+    fn sync_active_pane(&mut self, rebuild: bool) {
+        let pane = self.panes.active();
+        self.terminal = Rc::clone(&pane.terminal);
+        self.session_id = pane.session_id.clone();
+        self.daemon_socket = pane.daemon_socket.clone();
+        self.remote_name = pane.remote_name.clone();
+        if !self.title_locked && !pane.title_locked {
+            self.title = pane.title.clone();
+        }
+        if rebuild {
+            self.rebuild_panes();
+        } else {
+            self.panes
+                .update_styles(|pane| pane.terminal.widget().clone().upcast());
+        }
+    }
+
+    fn rebuild_panes(&self) {
+        self.panes.rebuild(&self.pane_container, |pane| {
+            pane.terminal.widget().clone().upcast()
+        });
+    }
 }
 
 fn report_window_visibility(tabs: &Rc<RefCell<Vec<TabEntry>>>, window_visible: bool) {
     for tab in tabs.borrow().iter() {
-        let visibility = if window_visible && tab.terminal.widget().is_mapped() {
-            cterm_core::WindowVisibility::Visible
-        } else {
-            cterm_core::WindowVisibility::Hidden
-        };
-        tab.terminal.set_window_visibility(visibility);
+        for (_, pane) in tab.panes.iter() {
+            let visibility = if window_visible && pane.terminal.widget().is_mapped() {
+                cterm_core::WindowVisibility::Visible
+            } else {
+                cterm_core::WindowVisibility::Hidden
+            };
+            pane.terminal.set_window_visibility(visibility);
+        }
     }
 }
 
@@ -70,6 +141,19 @@ pub struct CtermWindow {
     file_manager: Rc<RefCell<PendingFileManager>>,
     quick_open: QuickOpenOverlay,
     remote_manager: cterm_client::RemoteManager,
+}
+
+#[derive(Clone)]
+struct PaneActionContext {
+    notebook: Notebook,
+    tabs: Rc<RefCell<Vec<TabEntry>>>,
+    config: Rc<RefCell<Config>>,
+    theme: Theme,
+    tab_bar: TabBar,
+    window: ApplicationWindow,
+    has_bell: Rc<RefCell<bool>>,
+    file_manager: Rc<RefCell<PendingFileManager>>,
+    notification_bar: NotificationBar,
 }
 
 /// Show an error dialog when a seamless upgrade fails.
@@ -92,6 +176,183 @@ fn reject_managed_secondary_action(action: &str) -> bool {
     } else {
         false
     }
+}
+
+fn perform_pane_action(context: &PaneActionContext, action: Action) {
+    match action {
+        Action::SplitPane(direction) => spawn_daemon_pane(context, direction),
+        Action::ClosePane => {
+            let Some(page) = context.notebook.current_page() else {
+                return;
+            };
+            let Some((tab_id, pane_id, pane_count)) = context
+                .tabs
+                .borrow()
+                .get(page as usize)
+                .map(|tab| (tab.id, tab.active_pane_id(), tab.panes.len()))
+            else {
+                return;
+            };
+            if pane_count == 1 {
+                request_close_tab_by_id(
+                    &context.notebook,
+                    &context.tabs,
+                    &context.tab_bar,
+                    &context.window,
+                    &context.config,
+                    tab_id,
+                );
+            } else {
+                request_close_pane_by_id(
+                    &context.notebook,
+                    &context.tabs,
+                    &context.tab_bar,
+                    &context.window,
+                    &context.config,
+                    tab_id,
+                    pane_id,
+                );
+            }
+        }
+        Action::FocusPane(direction) => {
+            let terminal = {
+                let Some(page) = context.notebook.current_page() else {
+                    return;
+                };
+                let mut tabs = context.tabs.borrow_mut();
+                let Some(tab) = tabs.get_mut(page as usize) else {
+                    return;
+                };
+                if tab.focus_pane(direction).is_none() {
+                    return;
+                }
+                context.tab_bar.set_title(tab.id, &tab.title);
+                context.window.set_title(Some(&tab.title));
+                Rc::clone(&tab.terminal)
+            };
+            terminal.widget().grab_focus();
+        }
+        Action::ResizePane(direction) => {
+            let terminal = {
+                let Some(page) = context.notebook.current_page() else {
+                    return;
+                };
+                let mut tabs = context.tabs.borrow_mut();
+                let Some(tab) = tabs.get_mut(page as usize) else {
+                    return;
+                };
+                if !tab.panes.resize(direction, 400) {
+                    return;
+                }
+                tab.rebuild_panes();
+                Rc::clone(&tab.terminal)
+            };
+            terminal.widget().grab_focus();
+        }
+        Action::TogglePaneZoom => {
+            let terminal = {
+                let Some(page) = context.notebook.current_page() else {
+                    return;
+                };
+                let mut tabs = context.tabs.borrow_mut();
+                let Some(tab) = tabs.get_mut(page as usize) else {
+                    return;
+                };
+                tab.panes.toggle_zoom();
+                tab.rebuild_panes();
+                Rc::clone(&tab.terminal)
+            };
+            terminal.widget().grab_focus();
+        }
+        _ => {}
+    }
+}
+
+fn register_pane_actions(window: &ApplicationWindow, context: &PaneActionContext) {
+    for (name, action) in [
+        (
+            "split-pane-horizontal",
+            Action::SplitPane(SplitDirection::Horizontal),
+        ),
+        (
+            "split-pane-vertical",
+            Action::SplitPane(SplitDirection::Vertical),
+        ),
+        ("close-pane", Action::ClosePane),
+        ("focus-pane-left", Action::FocusPane(PaneDirection::Left)),
+        ("focus-pane-right", Action::FocusPane(PaneDirection::Right)),
+        ("focus-pane-up", Action::FocusPane(PaneDirection::Up)),
+        ("focus-pane-down", Action::FocusPane(PaneDirection::Down)),
+        ("resize-pane-left", Action::ResizePane(PaneDirection::Left)),
+        (
+            "resize-pane-right",
+            Action::ResizePane(PaneDirection::Right),
+        ),
+        ("resize-pane-up", Action::ResizePane(PaneDirection::Up)),
+        ("resize-pane-down", Action::ResizePane(PaneDirection::Down)),
+        ("toggle-pane-zoom", Action::TogglePaneZoom),
+    ] {
+        let context = context.clone();
+        let gtk_action = gio::SimpleAction::new(name, None);
+        gtk_action.connect_activate(move |_, _| perform_pane_action(&context, action.clone()));
+        window.add_action(&gtk_action);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PaneCiStep {
+    WaitInitial,
+    WaitHorizontalSplit,
+    WaitVerticalSplit,
+    Focus,
+    Resize,
+    Zoom,
+    Unzoom,
+    WaitClose,
+}
+
+#[derive(Clone)]
+struct PaneCiSnapshot {
+    pane_count: usize,
+    active: PaneId,
+    layout: PaneLayout,
+}
+
+fn pane_ci_snapshot(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+) -> Option<PaneCiSnapshot> {
+    let page = notebook.current_page()?;
+    let tabs = tabs.borrow();
+    let tab = tabs.get(page as usize)?;
+    Some(PaneCiSnapshot {
+        pane_count: tab.panes.len(),
+        active: tab.active_pane_id(),
+        layout: tab.panes.layout().clone(),
+    })
+}
+
+fn pane_ci_activate(window: &ApplicationWindow, name: &str) -> Result<(), String> {
+    let action = window
+        .lookup_action(name)
+        .ok_or_else(|| format!("window action '{name}' is not registered"))?;
+    if !action.is_enabled() {
+        return Err(format!("window action '{name}' is disabled"));
+    }
+    action.activate(None);
+    Ok(())
+}
+
+fn pane_ci_marker(marker: &str) {
+    log::info!("{marker}");
+    eprintln!("{marker}");
+}
+
+fn pane_ci_fail(step: PaneCiStep, reason: impl std::fmt::Display) -> ! {
+    let marker = format!("CTERM_PANE_CI FAIL step={step:?} reason={reason}");
+    log::error!("{marker}");
+    eprintln!("{marker}");
+    std::process::exit(2);
 }
 
 impl CtermWindow {
@@ -215,6 +476,15 @@ impl CtermWindow {
     /// Used for daemon reconnection where tabs will be added from existing sessions.
     /// The caller must add at least one tab before presenting the window.
     pub fn new_empty(app: &Application, config: &Config, theme: &Theme) -> Self {
+        Self::new_empty_with_remote_manager(app, config, theme, cterm_client::RemoteManager::new())
+    }
+
+    pub(crate) fn new_empty_with_remote_manager(
+        app: &Application,
+        config: &Config,
+        theme: &Theme,
+        remote_manager: cterm_client::RemoteManager,
+    ) -> Self {
         // Calculate cell dimensions for initial window sizing
         let cell_dims = calculate_initial_cell_dimensions(config);
 
@@ -278,7 +548,7 @@ impl CtermWindow {
             notification_bar,
             file_manager,
             quick_open,
-            remote_manager: cterm_client::RemoteManager::new(),
+            remote_manager,
         };
 
         cterm_window.setup_actions();
@@ -323,6 +593,7 @@ impl CtermWindow {
             &window.notification_bar,
             opts,
             title,
+            None,
             None,
             None,
             false,
@@ -373,6 +644,18 @@ impl CtermWindow {
         let tab_bar = self.tab_bar.clone();
         let has_bell = Rc::clone(&self.has_bell);
         let menu_bar = self.menu_bar.clone();
+        let pane_context = PaneActionContext {
+            notebook: notebook.clone(),
+            tabs: Rc::clone(&tabs),
+            config: Rc::clone(&config),
+            theme: theme.clone(),
+            tab_bar: tab_bar.clone(),
+            window: window.clone(),
+            has_bell: Rc::clone(&has_bell),
+            file_manager: Rc::clone(&self.file_manager),
+            notification_bar: self.notification_bar.clone(),
+        };
+        register_pane_actions(window, &pane_context);
 
         // File menu actions
         {
@@ -461,9 +744,10 @@ impl CtermWindow {
             let tabs = Rc::clone(&tabs);
             let tab_bar = tab_bar.clone();
             let window_clone = window.clone();
+            let config = Rc::clone(&config);
             let action = gio::SimpleAction::new("close-other-tabs", None);
             action.connect_activate(move |_, _| {
-                close_other_tabs(&notebook, &tabs, &tab_bar, &window_clone);
+                close_other_tabs(&notebook, &tabs, &tab_bar, &window_clone, &config);
             });
             window.add_action(&action);
         }
@@ -656,8 +940,6 @@ impl CtermWindow {
                         drop(cfg);
 
                         let tab_id = generate_tab_id(&next_tab_id);
-                        let page_num =
-                            notebook.append_page(terminal.widget(), None::<&gtk4::Widget>);
                         tab_bar.add_tab(tab_id, &title);
 
                         setup_tab_callbacks(
@@ -671,6 +953,7 @@ impl CtermWindow {
                             &notification_bar,
                             &terminal,
                             tab_id,
+                            PaneLayout::new().active(),
                             false,
                         );
 
@@ -679,12 +962,15 @@ impl CtermWindow {
                             &tabs,
                             &tab_bar,
                             tab_id,
-                            page_num,
                             title,
                             terminal,
                             title_locked,
+                            false,
                             Some(sid),
                             daemon_socket,
+                            None,
+                            None,
+                            None,
                             None,
                         );
 
@@ -1149,7 +1435,7 @@ impl CtermWindow {
                     log::info!("Executing seamless upgrade with binary: {}", binary_path);
 
                     // Collect upgrade state from current window
-                    let tabs_borrowed = tabs.borrow();
+                    let mut tabs_borrowed = tabs.borrow_mut();
 
                     // Build upgrade state
                     let mut upgrade_state = cterm_app::upgrade::UpgradeState::new();
@@ -1161,7 +1447,8 @@ impl CtermWindow {
                     window_state.maximized = window_clone.is_maximized();
                     window_state.fullscreen = window_clone.is_fullscreen();
 
-                    for tab in tabs_borrowed.iter() {
+                    for tab in tabs_borrowed.iter_mut() {
+                        tab.panes.flush_divider_ratios();
                         let mut tab_state = cterm_app::upgrade::TabUpgradeState::new(tab.id);
                         tab_state.title = tab.title.clone();
                         if tab.title_locked {
@@ -1178,6 +1465,34 @@ impl CtermWindow {
                                 .foreground_cwd()
                                 .map(|p| p.to_string_lossy().into_owned());
                         }
+
+                        tab_state.pane_layout = Some(tab.panes.layout().clone());
+                        tab_state.panes = tab
+                            .panes
+                            .pane_ids()
+                            .into_iter()
+                            .map(|pane_id| {
+                                let pane = tab
+                                    .panes
+                                    .get(pane_id)
+                                    .expect("pane resources mirror the pane layout");
+                                let mut pane_state = cterm_app::upgrade::PaneUpgradeState::new(
+                                    pane.session_id.clone(),
+                                );
+                                pane_state.title = pane.title.clone();
+                                pane_state.title_locked = pane.title_locked;
+                                pane_state.template_name = pane.template_name.clone();
+                                #[cfg(unix)]
+                                {
+                                    pane_state.cwd = pane.terminal.foreground_cwd();
+                                }
+                                pane_state.keep_open = pane.keep_open;
+                                pane_state.daemon_socket = pane.daemon_socket.clone();
+                                pane_state.remote_name = pane.remote_name.clone();
+                                pane_state.launch_context = pane.launch_context.clone();
+                                pane_state
+                            })
+                            .collect();
 
                         window_state.tabs.push(tab_state);
                     }
@@ -1450,6 +1765,169 @@ impl CtermWindow {
         });
     }
 
+    /// Run the deterministic Wayland pane action sequence used by Linux CI.
+    ///
+    /// This is deliberately unavailable unless the exact opt-in environment
+    /// variable is present. It activates the registered GTK window actions,
+    /// avoiding compositor-specific input injection while still exercising the
+    /// production action and asynchronous daemon-session paths.
+    pub(crate) fn start_wayland_pane_ci_driver(&self) {
+        if std::env::var("CTERM_WAYLAND_PANE_CI").as_deref() != Ok("1") {
+            return;
+        }
+
+        let Some(display) = gdk::Display::default() else {
+            pane_ci_fail(PaneCiStep::WaitInitial, "no GDK display");
+        };
+        if !display.backend().is_wayland() {
+            pane_ci_fail(PaneCiStep::WaitInitial, "GDK backend is not Wayland");
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            pane_ci_fail(PaneCiStep::WaitInitial, "DISPLAY is set");
+        }
+
+        let Some(application) = self.window.application() else {
+            pane_ci_fail(PaneCiStep::WaitInitial, "window has no GTK application");
+        };
+        let window = self.window.clone();
+        let notebook = self.notebook.clone();
+        let tabs = Rc::clone(&self.tabs);
+        let step = Rc::new(RefCell::new(PaneCiStep::WaitInitial));
+        let started = std::time::Instant::now();
+
+        pane_ci_marker("CTERM_PANE_CI START backend=wayland");
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let current_step = *step.borrow();
+            if started.elapsed() > std::time::Duration::from_secs(20) {
+                pane_ci_fail(current_step, "timed out after 20 seconds");
+            }
+
+            let Some(snapshot) = pane_ci_snapshot(&notebook, &tabs) else {
+                return glib::ControlFlow::Continue;
+            };
+
+            match current_step {
+                PaneCiStep::WaitInitial => {
+                    if snapshot.pane_count != 1 || !window.is_mapped() {
+                        return glib::ControlFlow::Continue;
+                    }
+                    pane_ci_marker("CTERM_PANE_CI READY panes=1");
+                    pane_ci_activate(&window, "split-pane-horizontal")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    *step.borrow_mut() = PaneCiStep::WaitHorizontalSplit;
+                }
+                PaneCiStep::WaitHorizontalSplit => {
+                    if snapshot.pane_count == 1 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let horizontal = matches!(
+                        snapshot.layout.tree(),
+                        PaneTree::Split {
+                            direction: SplitDirection::Horizontal,
+                            ..
+                        }
+                    );
+                    if snapshot.pane_count != 2 || !horizontal {
+                        pane_ci_fail(current_step, "horizontal split topology mismatch");
+                    }
+                    pane_ci_marker("CTERM_PANE_CI SPLIT_HORIZONTAL_OK panes=2");
+                    pane_ci_activate(&window, "split-pane-vertical")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    *step.borrow_mut() = PaneCiStep::WaitVerticalSplit;
+                }
+                PaneCiStep::WaitVerticalSplit => {
+                    if snapshot.pane_count == 2 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let nested_vertical = matches!(
+                        snapshot.layout.tree(),
+                        PaneTree::Split {
+                            direction: SplitDirection::Horizontal,
+                            second,
+                            ..
+                        } if matches!(
+                            *second,
+                            PaneTree::Split {
+                                direction: SplitDirection::Vertical,
+                                ..
+                            }
+                        )
+                    );
+                    if snapshot.pane_count != 3 || !nested_vertical {
+                        pane_ci_fail(current_step, "vertical split topology mismatch");
+                    }
+                    pane_ci_marker("CTERM_PANE_CI SPLIT_VERTICAL_OK panes=3");
+                    *step.borrow_mut() = PaneCiStep::Focus;
+                }
+                PaneCiStep::Focus => {
+                    pane_ci_activate(&window, "focus-pane-up")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    let after = pane_ci_snapshot(&notebook, &tabs)
+                        .unwrap_or_else(|| pane_ci_fail(current_step, "active tab disappeared"));
+                    if after.active == snapshot.active {
+                        pane_ci_fail(current_step, "focus action did not change the active pane");
+                    }
+                    pane_ci_marker("CTERM_PANE_CI FOCUS_OK direction=up");
+                    *step.borrow_mut() = PaneCiStep::Resize;
+                }
+                PaneCiStep::Resize => {
+                    pane_ci_activate(&window, "resize-pane-left")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    let after = pane_ci_snapshot(&notebook, &tabs)
+                        .unwrap_or_else(|| pane_ci_fail(current_step, "active tab disappeared"));
+                    if after.layout == snapshot.layout {
+                        pane_ci_fail(current_step, "resize action did not change pane ratios");
+                    }
+                    pane_ci_marker("CTERM_PANE_CI RESIZE_OK direction=left");
+                    *step.borrow_mut() = PaneCiStep::Zoom;
+                }
+                PaneCiStep::Zoom => {
+                    pane_ci_activate(&window, "toggle-pane-zoom")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    let after = pane_ci_snapshot(&notebook, &tabs)
+                        .unwrap_or_else(|| pane_ci_fail(current_step, "active tab disappeared"));
+                    if after.layout.zoomed() != Some(after.active) {
+                        pane_ci_fail(current_step, "zoom action did not zoom the active pane");
+                    }
+                    pane_ci_marker("CTERM_PANE_CI ZOOM_OK");
+                    *step.borrow_mut() = PaneCiStep::Unzoom;
+                }
+                PaneCiStep::Unzoom => {
+                    pane_ci_activate(&window, "toggle-pane-zoom")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    let after = pane_ci_snapshot(&notebook, &tabs)
+                        .unwrap_or_else(|| pane_ci_fail(current_step, "active tab disappeared"));
+                    if after.layout.zoomed().is_some() {
+                        pane_ci_fail(current_step, "second zoom action did not restore the tree");
+                    }
+                    pane_ci_marker("CTERM_PANE_CI UNZOOM_OK");
+                    pane_ci_activate(&window, "close-pane")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    *step.borrow_mut() = PaneCiStep::WaitClose;
+                }
+                PaneCiStep::WaitClose => {
+                    if snapshot.pane_count == 3 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if snapshot.pane_count != 2 {
+                        pane_ci_fail(
+                            current_step,
+                            "close action produced an unexpected pane count",
+                        );
+                    }
+                    pane_ci_marker("CTERM_PANE_CI CLOSE_OK panes=2");
+                    pane_ci_marker("CTERM_PANE_CI COMPLETE");
+                    destroy_all_pane_sessions(&tabs);
+                    window.destroy();
+                    application.quit();
+                    return glib::ControlFlow::Break;
+                }
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
+
     /// Set up keyboard event handler
     fn setup_key_handler(&self) {
         let key_controller = EventControllerKey::new();
@@ -1469,13 +1947,24 @@ impl CtermWindow {
         let has_bell = Rc::clone(&self.has_bell);
         let file_manager = Rc::clone(&self.file_manager);
         let notification_bar = self.notification_bar.clone();
+        let pane_context = PaneActionContext {
+            notebook: notebook.clone(),
+            tabs: Rc::clone(&tabs),
+            config: Rc::clone(&config),
+            theme: theme.clone(),
+            tab_bar: tab_bar.clone(),
+            window: window.clone(),
+            has_bell: Rc::clone(&has_bell),
+            file_manager: Rc::clone(&file_manager),
+            notification_bar: notification_bar.clone(),
+        };
 
         key_controller.connect_key_pressed(move |_, keyval, _keycode, state| {
             // Convert GTK modifiers to our modifiers
             let mut modifiers = gtk_modifiers_to_modifiers(state);
 
-            // GTK4 on X11 consumes Shift to produce uppercase keyvals,
-            // removing SHIFT_MASK from the state. Detect Shift from the keyval.
+            // Some keyboard layouts consume Shift to produce uppercase keyvals.
+            // Recover the logical modifier from the resulting key value.
             if !modifiers.contains(Modifiers::SHIFT) {
                 if let Some(c) = keyval.to_unicode() {
                     if c.is_uppercase() {
@@ -1489,6 +1978,14 @@ impl CtermWindow {
                 // Check for shortcut match
                 if let Some(action) = shortcuts.match_event(key, modifiers) {
                     match action {
+                        Action::SplitPane(_)
+                        | Action::ClosePane
+                        | Action::FocusPane(_)
+                        | Action::ResizePane(_)
+                        | Action::TogglePaneZoom => {
+                            perform_pane_action(&pane_context, action.clone());
+                            return glib::Propagation::Stop;
+                        }
                         Action::NewTab => {
                             if reject_managed_secondary_action("new-tab shortcut") {
                                 return glib::Propagation::Stop;
@@ -1534,7 +2031,7 @@ impl CtermWindow {
                                 let current = notebook.current_page().unwrap_or(0);
                                 notebook.set_current_page(Some((current + 1) % n));
                                 sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook);
+                                focus_current_terminal(&notebook, &tabs);
                             }
                             return glib::Propagation::Stop;
                         }
@@ -1545,7 +2042,7 @@ impl CtermWindow {
                                 let prev = if current == 0 { n - 1 } else { current - 1 };
                                 notebook.set_current_page(Some(prev));
                                 sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook);
+                                focus_current_terminal(&notebook, &tabs);
                             }
                             return glib::Propagation::Stop;
                         }
@@ -1561,7 +2058,7 @@ impl CtermWindow {
                                             drop(tabs_ref);
                                             notebook.set_current_page(Some(idx as u32));
                                             sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                            focus_current_terminal(&notebook);
+                                            focus_current_terminal(&notebook, &tabs);
                                             break;
                                         }
                                     }
@@ -1574,7 +2071,7 @@ impl CtermWindow {
                             if idx < notebook.n_pages() {
                                 notebook.set_current_page(Some(idx));
                                 sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook);
+                                focus_current_terminal(&notebook, &tabs);
                             }
                             return glib::Propagation::Stop;
                         }
@@ -2082,16 +2579,20 @@ impl CtermWindow {
                 // share it — needed for the dialog wording.
                 let (remote_name, tab_count) = {
                     let tabs_ref = tabs.borrow();
-                    let Some(name) = tabs_ref
-                        .iter()
-                        .find(|t| t.id == tab_id)
-                        .and_then(|t| t.remote_name.clone())
-                    else {
+                    let Some(name) = tabs_ref.iter().find(|t| t.id == tab_id).and_then(|tab| {
+                        tab.panes
+                            .iter()
+                            .find_map(|(_, pane)| pane.remote_name.clone())
+                    }) else {
                         return; // Not a remote tab — shouldn't happen, menu is hidden.
                     };
                     let count = tabs_ref
                         .iter()
-                        .filter(|t| t.remote_name.as_deref() == Some(name.as_str()))
+                        .filter(|tab| {
+                            tab.panes
+                                .iter()
+                                .any(|(_, pane)| pane.remote_name.as_deref() == Some(name.as_str()))
+                        })
                         .count();
                     (name, count)
                 };
@@ -2134,6 +2635,7 @@ impl CtermWindow {
         self.window.connect_close_request(move |win| {
             let confirm_close = config.borrow().general.confirm_close_with_running;
             if !confirm_close {
+                destroy_all_pane_sessions(&tabs);
                 return glib::Propagation::Proceed;
             }
 
@@ -2141,81 +2643,28 @@ impl CtermWindow {
             let tab_infos: Vec<(String, Option<std::path::PathBuf>, String)> = {
                 let tabs = tabs.borrow();
                 tabs.iter()
-                    .filter_map(|tab| {
-                        let sid = tab.session_id.clone()?;
-                        if sid.is_empty() {
-                            return None;
-                        }
-                        Some((sid, tab.daemon_socket.clone(), tab.title.clone()))
+                    .flat_map(|tab| {
+                        tab.panes.iter().filter_map(|(_, pane)| {
+                            let sid = pane.session_id.clone()?;
+                            if sid.is_empty() {
+                                return None;
+                            }
+                            Some((sid, pane.daemon_socket.clone(), pane.title.clone()))
+                        })
                     })
                     .collect()
             };
 
             if tab_infos.is_empty() {
+                destroy_all_pane_sessions(&tabs);
                 return glib::Propagation::Proceed;
             }
 
-            // Query the daemon asynchronously for each session's foreground process
-            let window_clone = window.clone();
-            let win_ref = win.clone();
-            let (result_tx, result_rx) = std::sync::mpsc::channel();
-
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                let results = rt.block_on(async {
-                    let mut running = Vec::new();
-                    for (session_id, daemon_socket, title) in &tab_infos {
-                        let conn = match if let Some(ref path) = daemon_socket {
-                            cterm_client::DaemonConnection::connect_unix(path, false).await
-                        } else {
-                            cterm_client::DaemonConnection::connect_local().await
-                        } {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-                        if let Ok(info) = conn.get_session(session_id).await {
-                            if info.has_foreground_process {
-                                let name = if info.foreground_process_name.is_empty() {
-                                    "a process".to_string()
-                                } else {
-                                    info.foreground_process_name
-                                };
-                                running.push((title.clone(), name));
-                            }
-                        }
-                    }
-                    running
-                });
-                let _ = result_tx.send(results);
-            });
-
-            glib::idle_add_local_once(move || {
-                let running_processes =
-                    match result_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                        Ok(r) => r,
-                        Err(_) => {
-                            window_clone.destroy();
-                            return;
-                        }
-                    };
-
-                if running_processes.is_empty() {
-                    window_clone.destroy();
-                } else {
-                    let wc = window_clone.clone();
-                    dialogs::show_close_confirmation_dialog(
-                        &win_ref,
-                        running_processes,
-                        move |confirmed| {
-                            if confirmed {
-                                wc.destroy();
-                            }
-                        },
-                    );
-                }
+            let window_to_destroy = window.clone();
+            let tabs_to_destroy = Rc::clone(&tabs);
+            confirm_running_sessions(win, tab_infos, move || {
+                destroy_all_pane_sessions(&tabs_to_destroy);
+                window_to_destroy.destroy();
             });
 
             glib::Propagation::Stop
@@ -2278,13 +2727,18 @@ impl CtermWindow {
         });
 
         let cfg = self.config.borrow();
+        let template_name = (!recon.template_name.is_empty()).then(|| recon.template_name.clone());
+        let native_ssh = template_name.as_deref().and_then(|name| {
+            cfg.sticky_tabs
+                .iter()
+                .find(|template| template.name == name)
+                .and_then(|template| template.ssh.as_ref())
+                .map(|ssh| ssh.to_ssh_params())
+        });
         let terminal = TerminalWidget::from_daemon_with_screen(recon, &cfg, &self.theme);
         drop(cfg);
 
         let tab_id = generate_tab_id(&self.next_tab_id);
-        let page_num = self
-            .notebook
-            .append_page(terminal.widget(), None::<&gtk4::Widget>);
         self.tab_bar.add_tab(tab_id, &title);
 
         setup_tab_callbacks(
@@ -2298,6 +2752,7 @@ impl CtermWindow {
             &self.notification_bar,
             &terminal,
             tab_id,
+            PaneLayout::new().active(),
             false,
         );
 
@@ -2306,12 +2761,15 @@ impl CtermWindow {
             &self.tabs,
             &self.tab_bar,
             tab_id,
-            page_num,
             title,
             terminal,
             title_locked,
+            false,
             Some(sid),
             daemon_socket,
+            None,
+            template_name,
+            native_ssh,
             None,
         );
 
@@ -2322,6 +2780,155 @@ impl CtermWindow {
                 tab.color = effective_color;
             }
         }
+    }
+
+    /// Restore every session and split in one upgraded tab.
+    pub fn add_reconnected_pane_tab(
+        &self,
+        tab_state: cterm_app::upgrade::TabUpgradeState,
+        layout: PaneLayout,
+        reconnected: Vec<cterm_app::daemon_reconnect::ReconnectedSession>,
+    ) -> bool {
+        let pane_ids = layout.pane_ids();
+        if pane_ids.len() != tab_state.panes.len() || pane_ids.len() != reconnected.len() {
+            log::error!(
+                "Cannot restore pane tab '{}': layout={}, records={}, sessions={}",
+                tab_state.title,
+                pane_ids.len(),
+                tab_state.panes.len(),
+                reconnected.len()
+            );
+            return false;
+        }
+
+        let tab_id = generate_tab_id(&self.next_tab_id);
+        let mut callback_terminals = Vec::with_capacity(pane_ids.len());
+        let entries = pane_ids
+            .iter()
+            .copied()
+            .zip(tab_state.panes.iter().cloned())
+            .zip(reconnected)
+            .map(|((pane_id, pane_state), recon)| {
+                let session_id = Some(recon.handle.session_id().to_string());
+                let daemon_socket = recon
+                    .handle
+                    .socket_path()
+                    .map(|path| path.to_owned())
+                    .or_else(|| pane_state.daemon_socket.clone());
+                let title = if !pane_state.title.is_empty() {
+                    pane_state.title.clone()
+                } else if !recon.custom_title.is_empty() {
+                    recon.custom_title.clone()
+                } else if !recon.title.is_empty() {
+                    recon.title.clone()
+                } else {
+                    "Terminal".to_string()
+                };
+                let config = self.config.borrow();
+                let native_ssh = pane_state.template_name.as_deref().and_then(|name| {
+                    config
+                        .sticky_tabs
+                        .iter()
+                        .find(|template| template.name == name)
+                        .and_then(|template| template.ssh.as_ref())
+                        .map(|ssh| ssh.to_ssh_params())
+                });
+                let terminal = Rc::new(TerminalWidget::from_daemon_with_screen(
+                    recon,
+                    &config,
+                    &self.theme,
+                ));
+                drop(config);
+                callback_terminals.push((pane_id, Rc::clone(&terminal), pane_state.keep_open));
+                (
+                    pane_id,
+                    PaneEntry {
+                        terminal,
+                        title,
+                        title_locked: pane_state.title_locked,
+                        template_name: pane_state.template_name,
+                        keep_open: pane_state.keep_open,
+                        session_id,
+                        daemon_socket,
+                        remote_name: pane_state.remote_name,
+                        native_ssh,
+                        launch_context: pane_state.launch_context,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let panes = match PaneSet::from_layout(layout, entries) {
+            Ok(panes) => panes,
+            Err(error) => {
+                log::error!(
+                    "Cannot restore pane layout for '{}': {error}",
+                    tab_state.title
+                );
+                return false;
+            }
+        };
+        let active = panes.active();
+        let title = if tab_state.custom_title.is_some() || active.title.is_empty() {
+            tab_state.title.clone()
+        } else {
+            active.title.clone()
+        };
+        let pane_container = GtkBox::new(Orientation::Vertical, 0);
+        pane_container.set_hexpand(true);
+        pane_container.set_vexpand(true);
+        panes.rebuild(&pane_container, |pane| {
+            pane.terminal.widget().clone().upcast()
+        });
+        let page_num = self
+            .notebook
+            .append_page(&pane_container, None::<&gtk4::Widget>);
+
+        self.tab_bar.add_tab(tab_id, &title);
+        if panes.iter().any(|(_, pane)| pane.remote_name.is_some()) {
+            self.tab_bar.mark_tab_remote(tab_id);
+        }
+        if let Some(color) = tab_state.color.as_deref() {
+            self.tab_bar.set_color(tab_id, Some(color));
+        }
+
+        self.tabs.borrow_mut().push(TabEntry {
+            id: tab_id,
+            title,
+            terminal: Rc::clone(&active.terminal),
+            title_locked: tab_state.custom_title.is_some(),
+            color: tab_state.color,
+            session_id: active.session_id.clone(),
+            daemon_socket: active.daemon_socket.clone(),
+            remote_name: active.remote_name.clone(),
+            pane_container,
+            panes,
+        });
+
+        for (pane_id, terminal, keep_open) in callback_terminals {
+            setup_tab_callbacks(
+                &self.notebook,
+                &self.tabs,
+                &self.config,
+                &self.tab_bar,
+                &self.window,
+                &self.has_bell,
+                &self.file_manager,
+                &self.notification_bar,
+                &terminal,
+                tab_id,
+                pane_id,
+                keep_open,
+            );
+        }
+
+        self.tab_bar.update_visibility();
+        self.notebook.set_current_page(Some(page_num));
+        self.tab_bar.set_active(tab_id);
+        if let Some(tab) = self.tabs.borrow().last() {
+            tab.terminal.widget().grab_focus();
+        }
+        true
     }
 
     /// Update window title when switching tabs
@@ -2366,6 +2973,11 @@ fn show_rename_tab_dialog(
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.title = new_title.clone();
             tab.title_locked = true;
+            let active = tab.active_pane_id();
+            if let Some(pane) = tab.panes.get_mut(active) {
+                pane.title = new_title.clone();
+                pane.title_locked = true;
+            }
             tab_bar_clone.set_title(tab_id, &new_title);
             window_clone.set_title(Some(&new_title));
             // Persist custom title to daemon
@@ -2395,6 +3007,7 @@ fn setup_tab_callbacks(
     notification_bar: &NotificationBar,
     terminal: &TerminalWidget,
     tab_id: u64,
+    pane_id: PaneId,
     keep_open: bool,
 ) {
     // Close callback (with confirmation for running processes)
@@ -2425,9 +3038,7 @@ fn setup_tab_callbacks(
             tab_bar_click.set_active(tab_id);
             tab_bar_click.clear_bell(tab_id);
             tabs[idx].terminal.clear_alert();
-            if let Some(widget) = notebook_click.nth_page(Some(idx as u32)) {
-                widget.grab_focus();
-            }
+            tabs[idx].terminal.widget().grab_focus();
         }
     });
 
@@ -2438,12 +3049,14 @@ fn setup_tab_callbacks(
     let window_exit = window.clone();
     terminal.set_on_exit(move || {
         if !keep_open {
-            close_tab_by_id(
+            close_pane_by_id(
                 &notebook_exit,
                 &tabs_exit,
                 &tab_bar_exit,
                 &window_exit,
                 tab_id,
+                pane_id,
+                false,
             );
         }
     });
@@ -2456,16 +3069,16 @@ fn setup_tab_callbacks(
     let has_bell_bell = Rc::clone(has_bell);
     terminal.set_on_bell(move || {
         let is_window_active = window_bell.is_active();
-        let is_current_tab = if let Some(current_page) = notebook_bell.current_page() {
+        let is_current_pane = if let Some(current_page) = notebook_bell.current_page() {
             let tabs = tabs_bell.borrow();
             tabs.get(current_page as usize)
-                .map(|t| t.id == tab_id)
+                .map(|t| t.id == tab_id && t.active_pane_id() == pane_id)
                 .unwrap_or(false)
         } else {
             false
         };
 
-        if !is_current_tab || !is_window_active {
+        if !is_current_pane || !is_window_active {
             tab_bar_bell.set_bell(tab_id, true);
         }
 
@@ -2482,26 +3095,30 @@ fn setup_tab_callbacks(
     let notebook_title = notebook.clone();
     let has_bell_title = Rc::clone(has_bell);
     terminal.set_on_title_change(move |title| {
-        // Check if title is locked (user-set or template)
-        {
-            let tabs = tabs_title.borrow();
-            if let Some(entry) = tabs.iter().find(|t| t.id == tab_id) {
-                if entry.title_locked {
-                    return;
-                }
-            }
-        }
-
-        // Update tab bar
-        tab_bar_title.set_title(tab_id, title);
-
-        // Update stored title in tabs
-        {
+        let active_title_changed = {
             let mut tabs = tabs_title.borrow_mut();
-            if let Some(entry) = tabs.iter_mut().find(|t| t.id == tab_id) {
-                entry.title = title.to_string();
+            let Some(entry) = tabs.iter_mut().find(|t| t.id == tab_id) else {
+                return;
+            };
+            let Some(pane) = entry.panes.get_mut(pane_id) else {
+                return;
+            };
+            if pane.title_locked || entry.title_locked {
+                return;
             }
+            pane.title = title.to_string();
+            if entry.active_pane_id() != pane_id {
+                false
+            } else {
+                entry.title = title.to_string();
+                true
+            }
+        };
+
+        if !active_title_changed {
+            return;
         }
+        tab_bar_title.set_title(tab_id, title);
 
         // Update window title if this is the active tab
         if let Some(current_page) = notebook_title.current_page() {
@@ -2515,6 +3132,30 @@ fn setup_tab_callbacks(
                 window_title.set_title(Some(title));
             }
         }
+    });
+
+    let tabs_focus = Rc::clone(tabs);
+    let tab_bar_focus = tab_bar.clone();
+    let window_focus = window.clone();
+    terminal.widget().connect_has_focus_notify(move |widget| {
+        if !widget.has_focus() {
+            return;
+        }
+        let title = {
+            let mut tabs = tabs_focus.borrow_mut();
+            let Some(tab) = tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                return;
+            };
+            let previous = Rc::clone(&tab.terminal);
+            if !tab.activate_pane(pane_id) {
+                return;
+            }
+            previous.send_focus_event(false);
+            tab.terminal.send_focus_event(true);
+            tab.title.clone()
+        };
+        tab_bar_focus.set_title(tab_id, &title);
+        window_focus.set_title(Some(&title));
     });
 
     // File transfer callback
@@ -2562,36 +3203,60 @@ fn finalize_new_tab(
     tabs: &Rc<RefCell<Vec<TabEntry>>>,
     tab_bar: &TabBar,
     tab_id: u64,
-    page_num: u32,
     title: String,
     terminal: TerminalWidget,
     title_locked: bool,
+    keep_open: bool,
     session_id: Option<String>,
     daemon_socket: Option<std::path::PathBuf>,
     remote_name: Option<String>,
+    template_name: Option<String>,
+    native_ssh: Option<cterm_client::SshParams>,
+    launch_context: Option<cterm_app::upgrade::PaneLaunchContext>,
 ) {
     if remote_name.is_some() {
         tab_bar.mark_tab_remote(tab_id);
     }
 
+    let pane_container = GtkBox::new(Orientation::Vertical, 0);
+    pane_container.set_hexpand(true);
+    pane_container.set_vexpand(true);
+    let terminal = Rc::new(terminal);
+    let panes = PaneSet::new(PaneEntry {
+        terminal: Rc::clone(&terminal),
+        title: title.clone(),
+        title_locked,
+        template_name,
+        keep_open,
+        session_id: session_id.clone(),
+        daemon_socket: daemon_socket.clone(),
+        remote_name: remote_name.clone(),
+        native_ssh,
+        launch_context,
+    });
+    panes.rebuild(&pane_container, |pane| {
+        pane.terminal.widget().clone().upcast()
+    });
+    let page_num = notebook.append_page(&pane_container, None::<&gtk4::Widget>);
+
     tabs.borrow_mut().push(TabEntry {
         id: tab_id,
         title,
-        terminal,
+        terminal: Rc::clone(&terminal),
         title_locked,
         color: None,
         session_id,
         daemon_socket,
         remote_name,
+        pane_container,
+        panes,
     });
 
     tab_bar.update_visibility();
     notebook.set_current_page(Some(page_num));
     tab_bar.set_active(tab_id);
 
-    if let Some(widget) = notebook.nth_page(Some(page_num)) {
-        widget.grab_focus();
-    }
+    terminal.widget().grab_focus();
 }
 
 /// Create a new terminal tab (daemon-backed via ctermd)
@@ -2661,6 +3326,7 @@ fn create_new_tab(
         initial_title,
         None,
         None,
+        None,
         false,
         false,
         None,
@@ -2706,6 +3372,7 @@ fn create_docker_tab(
         notification_bar,
         opts,
         title.to_string(),
+        None,
         Some("#0db7ed".to_string()),
         None,
         false,
@@ -2713,6 +3380,221 @@ fn create_docker_tab(
         None,
         None,
     );
+}
+
+/// Create a new daemon session beside the active pane in the same tab.
+fn inherited_pane_session_options(
+    config: &Config,
+    remote_backend: bool,
+    cwd: Option<String>,
+    native_ssh: Option<cterm_client::SshParams>,
+    launch_context: Option<&cterm_app::upgrade::PaneLaunchContext>,
+) -> cterm_client::CreateSessionOpts {
+    let mut options = if remote_backend {
+        cterm_client::CreateSessionOpts {
+            cols: 80,
+            rows: 24,
+            cwd,
+            ..Default::default()
+        }
+    } else {
+        cterm_client::CreateSessionOpts {
+            cols: 80,
+            rows: 24,
+            shell: config.general.default_shell.clone(),
+            args: config.general.shell_args.clone(),
+            cwd,
+            ssh: native_ssh,
+            ..Default::default()
+        }
+    };
+    if let Some(launch_context) = launch_context {
+        launch_context.apply_to(&mut options);
+    }
+    options
+}
+
+fn spawn_daemon_pane(context: &PaneActionContext, direction: SplitDirection) {
+    if reject_managed_secondary_action("pane split") {
+        return;
+    }
+
+    let Some(page) = context.notebook.current_page() else {
+        return;
+    };
+    let (
+        tab_id,
+        target,
+        cwd,
+        daemon_socket,
+        remote_name,
+        native_ssh,
+        launch_context,
+        template_name,
+        cell_dims,
+    ) = {
+        let tabs = context.tabs.borrow();
+        let Some(tab) = tabs.get(page as usize) else {
+            return;
+        };
+        let pane = tab.panes.active();
+        (
+            tab.id,
+            tab.active_pane_id(),
+            pane.terminal.foreground_cwd(),
+            pane.daemon_socket.clone(),
+            pane.remote_name.clone(),
+            pane.native_ssh.clone(),
+            pane.launch_context.clone(),
+            pane.template_name.clone(),
+            pane.terminal.cell_dimensions(),
+        )
+    };
+
+    if remote_name.is_some() && daemon_socket.is_none() {
+        log::error!("Cannot split remote pane without its owning daemon socket");
+        return;
+    }
+
+    let remote_backend = remote_name.is_some()
+        || daemon_socket
+            .as_ref()
+            .is_some_and(|path| path != &cterm_client::default_socket_path());
+    let config = context.config.borrow();
+    let shell = config
+        .general
+        .default_shell
+        .clone()
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
+    let title = if remote_backend {
+        "Terminal".to_string()
+    } else {
+        std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Terminal")
+            .to_string()
+    };
+    let mut opts = inherited_pane_session_options(
+        &config,
+        remote_backend,
+        cwd,
+        native_ssh,
+        launch_context.as_ref(),
+    );
+    opts.base_palette = Some(frontend_palette(&context.theme, None));
+    opts.frontend_state.appearance = context.theme.appearance();
+    opts.pixel_width = (cell_dims.width * 80.0).round().max(1.0) as u32;
+    opts.pixel_height = (cell_dims.height * 24.0).round().max(1.0) as u32;
+    let split_native_ssh = opts.ssh.clone();
+    let split_launch_context = cterm_app::upgrade::PaneLaunchContext::capture(&opts);
+    drop(config);
+
+    let context = context.clone();
+    let socket_for_connect = daemon_socket.clone();
+    let (sender, receiver) = std::sync::mpsc::channel::<DaemonAttachResult>();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let result = match runtime {
+            Ok(runtime) => runtime.block_on(async {
+                let connection = if let Some(path) = socket_for_connect.as_ref() {
+                    cterm_client::DaemonConnection::connect_unix(path, false).await?
+                } else {
+                    cterm_client::DaemonConnection::connect_local().await?
+                };
+                connection.create_session(opts).await
+            }),
+            Err(error) => Err(cterm_client::ClientError::Connection(error.to_string())),
+        };
+        let _ = sender.send(result);
+    });
+
+    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return glib::ControlFlow::Break;
+            }
+        };
+
+        match result {
+            Ok(session) => {
+                let session_id = Some(session.session_id().to_string());
+                let session_socket = session
+                    .socket_path()
+                    .map(|path| path.to_owned())
+                    .or_else(|| daemon_socket.clone());
+                let config = context.config.borrow();
+                let terminal = Rc::new(TerminalWidget::from_daemon(
+                    session,
+                    &config,
+                    &context.theme,
+                ));
+                drop(config);
+
+                let request = SplitRequest {
+                    direction,
+                    placement: SplitPlacement::Second,
+                    ratio: SplitRatio::HALF,
+                };
+                let pane_id = {
+                    let mut tabs = context.tabs.borrow_mut();
+                    let Some(tab) = tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                        terminal.destroy_session();
+                        return glib::ControlFlow::Break;
+                    };
+                    if tab.panes.get(target).is_none() {
+                        terminal.destroy_session();
+                        return glib::ControlFlow::Break;
+                    }
+                    let entry = PaneEntry {
+                        terminal: Rc::clone(&terminal),
+                        title: title.clone(),
+                        session_id: session_id.clone(),
+                        daemon_socket: session_socket.clone(),
+                        remote_name: remote_name.clone(),
+                        native_ssh: split_native_ssh.clone(),
+                        launch_context: Some(split_launch_context.clone()),
+                        title_locked: false,
+                        template_name: template_name.clone(),
+                        keep_open: false,
+                    };
+                    match tab.panes.split(target, request, entry) {
+                        Ok(pane_id) => {
+                            tab.sync_active_pane(true);
+                            pane_id
+                        }
+                        Err(error) => {
+                            log::error!("Failed to split terminal pane: {error}");
+                            terminal.destroy_session();
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                };
+
+                setup_tab_callbacks(
+                    &context.notebook,
+                    &context.tabs,
+                    &context.config,
+                    &context.tab_bar,
+                    &context.window,
+                    &context.has_bell,
+                    &context.file_manager,
+                    &context.notification_bar,
+                    &terminal,
+                    tab_id,
+                    pane_id,
+                    false,
+                );
+                terminal.widget().grab_focus();
+            }
+            Err(error) => log::error!("Failed to create pane session: {error}"),
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 /// Spawn a new daemon-backed tab: connects to ctermd, creates session, and wires up the tab
@@ -2735,6 +3617,7 @@ fn spawn_daemon_tab(
     notification_bar: &NotificationBar,
     mut opts: cterm_client::CreateSessionOpts,
     title: String,
+    template_name: Option<String>,
     color: Option<String>,
     background_color: Option<String>,
     keep_open: bool,
@@ -2742,6 +3625,8 @@ fn spawn_daemon_tab(
     remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
     daemon_socket: Option<std::path::PathBuf>,
 ) {
+    let native_ssh = opts.ssh.clone();
+    let launch_context = cterm_app::upgrade::PaneLaunchContext::capture(&opts);
     opts.base_palette = Some(frontend_palette(
         theme,
         background_color.as_deref().and_then(parse_rgb),
@@ -2813,8 +3698,6 @@ fn spawn_daemon_tab(
                         }
 
                         let tab_id = generate_tab_id(&next_tab_id);
-                        let page_num =
-                            notebook.append_page(terminal.widget(), None::<&gtk4::Widget>);
                         tab_bar.add_tab(tab_id, &title);
 
                         if let Some(ref c) = color {
@@ -2832,6 +3715,7 @@ fn spawn_daemon_tab(
                             &notification_bar,
                             &terminal,
                             tab_id,
+                            PaneLayout::new().active(),
                             keep_open,
                         );
 
@@ -2840,13 +3724,16 @@ fn spawn_daemon_tab(
                             &tabs,
                             &tab_bar,
                             tab_id,
-                            page_num,
                             title.clone(),
                             terminal,
                             title_locked,
+                            keep_open,
                             sid,
                             daemon_socket,
                             remote_name.clone(),
+                            template_name.clone(),
+                            native_ssh.clone(),
+                            Some(launch_context.clone()),
                         );
 
                         // Store color in tab entry and send metadata to daemon
@@ -2948,8 +3835,6 @@ fn create_daemon_tab(
                         let terminal = TerminalWidget::from_daemon(session, &cfg, &theme);
 
                         let tab_id = generate_tab_id(&next_tab_id);
-                        let page_num =
-                            notebook.append_page(terminal.widget(), None::<&gtk4::Widget>);
                         tab_bar.add_tab(tab_id, &title);
 
                         setup_tab_callbacks(
@@ -2963,6 +3848,7 @@ fn create_daemon_tab(
                             &notification_bar,
                             &terminal,
                             tab_id,
+                            PaneLayout::new().active(),
                             false,
                         );
 
@@ -2971,11 +3857,14 @@ fn create_daemon_tab(
                             &tabs,
                             &tab_bar,
                             tab_id,
-                            page_num,
                             title,
                             terminal,
                             false,
+                            false,
                             Some(sid),
+                            None,
+                            None,
+                            None,
                             None,
                             None,
                         );
@@ -3023,14 +3912,19 @@ fn create_tab_from_template(
     let cfg = config.borrow();
 
     // Build daemon session options from template
+    let remote_daemon = template.remote.is_some();
     let opts = cterm_client::CreateSessionOpts {
         cols: 80,
         rows: 24,
-        shell: template
-            .command
-            .clone()
-            .or_else(|| cfg.general.default_shell.clone()),
-        args: if template.args.is_empty() && template.command.is_none() {
+        shell: if remote_daemon {
+            template.command.clone()
+        } else {
+            template
+                .command
+                .clone()
+                .or_else(|| cfg.general.default_shell.clone())
+        },
+        args: if !remote_daemon && template.args.is_empty() && template.command.is_none() {
             cfg.general.shell_args.clone()
         } else {
             template.args.clone()
@@ -3050,10 +3944,20 @@ fn create_tab_from_template(
     };
 
     // Resolve remote from template
-    let remote_cfg = template
-        .remote
-        .as_ref()
-        .and_then(|name| cfg.remotes.iter().find(|r| r.name == *name).cloned());
+    let remote_cfg = match template.remote.as_ref() {
+        Some(name) => match cfg.remotes.iter().find(|remote| remote.name == *name) {
+            Some(remote) => Some(remote.clone()),
+            None => {
+                log::error!(
+                    "Template '{}' references unknown remote '{}'",
+                    template.name,
+                    name
+                );
+                return;
+            }
+        },
+        None => None,
+    };
 
     {
         let remote = remote_cfg.map(|r| {
@@ -3079,6 +3983,7 @@ fn create_tab_from_template(
             notification_bar,
             opts,
             template.name.clone(),
+            Some(template.name.clone()),
             template.color.clone(),
             template.background_color.clone(),
             template.keep_open,
@@ -3124,13 +4029,64 @@ fn close_tab_by_id(
 
     let Some(index) = index else { return };
 
-    // Destroy the daemon session (kill the PTY process)
+    // Destroy every daemon session owned by the tab.
     {
         let tabs = tabs.borrow();
-        tabs[index].terminal.destroy_session();
+        for (_, pane) in tabs[index].panes.iter() {
+            pane.terminal.destroy_session();
+        }
     }
 
     remove_tab_from_ui(notebook, tabs, tab_bar, window, id);
+}
+
+fn destroy_all_pane_sessions(tabs: &Rc<RefCell<Vec<TabEntry>>>) {
+    for tab in tabs.borrow().iter() {
+        for (_, pane) in tab.panes.iter() {
+            pane.terminal.destroy_session();
+        }
+    }
+}
+
+/// Close one pane, or close the tab when it contains only that pane.
+fn close_pane_by_id(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    tab_bar: &TabBar,
+    window: &ApplicationWindow,
+    tab_id: u64,
+    pane_id: PaneId,
+    destroy_session: bool,
+) {
+    let close_tab = tabs
+        .borrow()
+        .iter()
+        .find(|tab| tab.id == tab_id)
+        .is_some_and(|tab| tab.panes.len() == 1 && tab.active_pane_id() == pane_id);
+    if close_tab {
+        if destroy_session {
+            close_tab_by_id(notebook, tabs, tab_bar, window, tab_id);
+        } else {
+            remove_tab_from_ui(notebook, tabs, tab_bar, window, tab_id);
+        }
+        return;
+    }
+
+    let terminal_to_focus = {
+        let mut tabs = tabs.borrow_mut();
+        let Some(tab) = tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let Ok(pane) = tab.panes.close(pane_id) else {
+            return;
+        };
+        if destroy_session {
+            pane.terminal.destroy_session();
+        }
+        tab.sync_active_pane(true);
+        Rc::clone(&tab.terminal)
+    };
+    terminal_to_focus.widget().grab_focus();
 }
 
 /// Remove a tab from the UI (notebook, tabs vec, tab bar) WITHOUT issuing any
@@ -3164,11 +4120,7 @@ fn remove_tab_from_ui(
 
     sync_tab_bar_active(tab_bar, tabs, notebook);
 
-    if let Some(page) = notebook.current_page() {
-        if let Some(widget) = notebook.nth_page(Some(page)) {
-            widget.grab_focus();
-        }
-    }
+    focus_current_terminal(notebook, tabs);
 }
 
 /// Disconnect from a remote: send `detach` to each tab's daemon session
@@ -3190,10 +4142,15 @@ fn disconnect_remote(
         let tabs_ref = tabs.borrow();
         tabs_ref
             .iter()
-            .filter(|t| t.remote_name.as_deref() == Some(remote_name))
-            .map(|t| {
-                t.terminal.detach_session();
-                t.id
+            .filter_map(|tab| {
+                let mut matched = false;
+                for (_, pane) in tab.panes.iter() {
+                    if pane.remote_name.as_deref() == Some(remote_name) {
+                        pane.terminal.detach_session();
+                        matched = true;
+                    }
+                }
+                matched.then_some(tab.id)
             })
             .collect()
     };
@@ -3229,7 +4186,114 @@ fn disconnect_remote(
     }
 }
 
-/// Request to close tab by ID - queries daemon for running processes and confirms with user
+type SessionQueryInfo = (String, Option<std::path::PathBuf>, String);
+type PendingOperation = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
+
+/// Query session processes away from the GTK thread, then run an operation
+/// after confirmation when any pane still has a foreground process.
+#[cfg(unix)]
+fn confirm_running_sessions(
+    window: &ApplicationWindow,
+    sessions: Vec<SessionQueryInfo>,
+    operation: impl FnOnce() + 'static,
+) {
+    if sessions.is_empty() {
+        operation();
+        return;
+    }
+
+    let operation: PendingOperation = Rc::new(RefCell::new(Some(Box::new(operation))));
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let running = match runtime {
+            Ok(runtime) => runtime.block_on(async {
+                let mut running = Vec::new();
+                for (session_id, daemon_socket, title) in sessions {
+                    let connection = match if let Some(path) = daemon_socket.as_ref() {
+                        cterm_client::DaemonConnection::connect_unix(path, false).await
+                    } else {
+                        cterm_client::DaemonConnection::connect_local().await
+                    } {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            log::warn!("Could not query pane '{title}' before close: {error}");
+                            running
+                                .push((title, "process status could not be checked".to_string()));
+                            continue;
+                        }
+                    };
+                    let session = match connection.get_session(&session_id).await {
+                        Ok(session) => session,
+                        Err(error) => {
+                            log::warn!("Could not query pane '{title}' before close: {error}");
+                            running
+                                .push((title, "process status could not be checked".to_string()));
+                            continue;
+                        }
+                    };
+                    if session.has_foreground_process {
+                        let process = if session.foreground_process_name.is_empty() {
+                            "a process".to_string()
+                        } else {
+                            session.foreground_process_name
+                        };
+                        running.push((title, process));
+                    }
+                }
+                running
+            }),
+            Err(error) => {
+                log::warn!("Failed to create runtime for close confirmation: {error}");
+                vec![(
+                    "Terminal".to_string(),
+                    "process status could not be checked".to_string(),
+                )]
+            }
+        };
+        let _ = result_tx.send(running);
+    });
+
+    let window = window.clone();
+    let started = std::time::Instant::now();
+    glib::timeout_add_local(std::time::Duration::from_millis(25), move || {
+        let running = match result_rx.try_recv() {
+            Ok(running) => running,
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if started.elapsed() < std::time::Duration::from_secs(2) =>
+            {
+                return glib::ControlFlow::Continue;
+            }
+            Err(error) => {
+                log::warn!("Could not check pane processes before close: {error}");
+                vec![(
+                    "Terminal".to_string(),
+                    "process status check timed out".to_string(),
+                )]
+            }
+        };
+        if running.is_empty() {
+            if let Some(operation) = operation.borrow_mut().take() {
+                operation();
+            }
+            return glib::ControlFlow::Break;
+        }
+
+        let confirmed_operation = Rc::clone(&operation);
+        dialogs::show_close_confirmation_dialog(&window, running, move |confirmed| {
+            if confirmed {
+                if let Some(operation) = confirmed_operation.borrow_mut().take() {
+                    operation();
+                }
+            }
+        });
+        glib::ControlFlow::Break
+    });
+}
+
+/// Request to close a tab, aggregating foreground processes from every pane.
 #[cfg(unix)]
 fn request_close_tab_by_id(
     notebook: &Notebook,
@@ -3245,91 +4309,74 @@ fn request_close_tab_by_id(
         return;
     }
 
-    // Get session_id, daemon_socket, and title for the daemon query
-    let query_info: Option<(String, Option<std::path::PathBuf>, String)> = {
+    let sessions: Vec<SessionQueryInfo> = {
         let tabs = tabs.borrow();
-        tabs.iter().find(|t| t.id == id).map(|tab| {
-            (
-                tab.session_id.clone().unwrap_or_default(),
-                tab.daemon_socket.clone(),
-                tab.title.clone(),
-            )
-        })
+        let Some(tab) = tabs.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        tab.panes
+            .iter()
+            .filter_map(|(_, pane)| {
+                pane.session_id
+                    .clone()
+                    .map(|session_id| (session_id, pane.daemon_socket.clone(), pane.title.clone()))
+            })
+            .collect()
     };
 
-    let Some((session_id, daemon_socket, tab_title)) = query_info else {
-        return;
-    };
-
-    if session_id.is_empty() {
-        close_tab_by_id(notebook, tabs, tab_bar, window, id);
-        return;
-    }
-
-    // Query the daemon asynchronously for foreground process info
     let notebook = notebook.clone();
     let tabs = Rc::clone(tabs);
     let tab_bar = tab_bar.clone();
-    let window = window.clone();
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
-
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = rt.block_on(async {
-            let conn = match if let Some(ref path) = daemon_socket {
-                cterm_client::DaemonConnection::connect_unix(path, false).await
-            } else {
-                cterm_client::DaemonConnection::connect_local().await
-            } {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
-            let session = match conn.get_session(&session_id).await {
-                Ok(s) => s,
-                Err(_) => return None,
-            };
-            if session.has_foreground_process {
-                let name = if session.foreground_process_name.is_empty() {
-                    "a process".to_string()
-                } else {
-                    session.foreground_process_name
-                };
-                Some(name)
-            } else {
-                None
-            }
-        });
-        let _ = result_tx.send(result);
+    let close_window = window.clone();
+    confirm_running_sessions(window, sessions, move || {
+        close_tab_by_id(&notebook, &tabs, &tab_bar, &close_window, id);
     });
+}
 
-    // Check result on the main thread via idle callback
-    glib::idle_add_local_once(move || {
-        // The thread should complete very quickly (local socket query)
-        let process_name = match result_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-            Ok(Some(name)) => name,
-            _ => {
-                // No foreground process or query failed — close directly
-                close_tab_by_id(&notebook, &tabs, &tab_bar, &window, id);
-                return;
-            }
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn request_close_pane_by_id(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    tab_bar: &TabBar,
+    window: &ApplicationWindow,
+    config: &Rc<RefCell<Config>>,
+    tab_id: u64,
+    pane_id: PaneId,
+) {
+    if !config.borrow().general.confirm_close_with_running {
+        close_pane_by_id(notebook, tabs, tab_bar, window, tab_id, pane_id, true);
+        return;
+    }
+
+    let sessions = {
+        let tabs_ref = tabs.borrow();
+        let Some(pane) = tabs_ref
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.panes.get(pane_id))
+        else {
+            return;
         };
+        pane.session_id
+            .clone()
+            .map(|session_id| vec![(session_id, pane.daemon_socket.clone(), pane.title.clone())])
+            .unwrap_or_default()
+    };
 
-        let window_for_closure = window.clone();
-        let notebook_c = notebook.clone();
-        let tabs_c = Rc::clone(&tabs);
-        let tab_bar_c = tab_bar.clone();
-
-        dialogs::show_close_confirmation_dialog(
-            &window,
-            vec![(tab_title, process_name)],
-            move |confirmed| {
-                if confirmed {
-                    close_tab_by_id(&notebook_c, &tabs_c, &tab_bar_c, &window_for_closure, id);
-                }
-            },
+    let notebook = notebook.clone();
+    let tabs = Rc::clone(tabs);
+    let tab_bar = tab_bar.clone();
+    let close_window = window.clone();
+    confirm_running_sessions(window, sessions, move || {
+        close_pane_by_id(
+            &notebook,
+            &tabs,
+            &tab_bar,
+            &close_window,
+            tab_id,
+            pane_id,
+            true,
         );
     });
 }
@@ -3347,45 +4394,110 @@ fn request_close_tab_by_id(
     close_tab_by_id(notebook, tabs, tab_bar, window, id);
 }
 
-/// Close all tabs except the current one
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+fn request_close_pane_by_id(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    tab_bar: &TabBar,
+    window: &ApplicationWindow,
+    _config: &Rc<RefCell<Config>>,
+    tab_id: u64,
+    pane_id: PaneId,
+) {
+    close_pane_by_id(notebook, tabs, tab_bar, window, tab_id, pane_id, true);
+}
+
+/// Close all tabs except the current one after checking every pane process.
+#[cfg(unix)]
+fn close_other_tabs(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    tab_bar: &TabBar,
+    window: &ApplicationWindow,
+    config: &Rc<RefCell<Config>>,
+) {
+    let Some(current_id) = notebook.current_page().and_then(|page_idx| {
+        let tabs = tabs.borrow();
+        tabs.get(page_idx as usize).map(|tab| tab.id)
+    }) else {
+        return;
+    };
+
+    let (ids_to_close, sessions): (Vec<u64>, Vec<SessionQueryInfo>) = {
+        let tabs = tabs.borrow();
+        let other_tabs = tabs.iter().filter(|tab| tab.id != current_id);
+        let ids = other_tabs.clone().map(|tab| tab.id).collect();
+        let sessions = other_tabs
+            .flat_map(|tab| {
+                tab.panes.iter().filter_map(|(_, pane)| {
+                    pane.session_id.clone().map(|session_id| {
+                        (session_id, pane.daemon_socket.clone(), pane.title.clone())
+                    })
+                })
+            })
+            .collect();
+        (ids, sessions)
+    };
+
+    if !config.borrow().general.confirm_close_with_running {
+        close_other_tabs_now(notebook, tabs, tab_bar, &ids_to_close);
+        return;
+    }
+
+    let notebook = notebook.clone();
+    let tabs = Rc::clone(tabs);
+    let tab_bar = tab_bar.clone();
+    confirm_running_sessions(window, sessions, move || {
+        close_other_tabs_now(&notebook, &tabs, &tab_bar, &ids_to_close);
+    });
+}
+
+#[cfg(not(unix))]
 fn close_other_tabs(
     notebook: &Notebook,
     tabs: &Rc<RefCell<Vec<TabEntry>>>,
     tab_bar: &TabBar,
     _window: &ApplicationWindow,
+    _config: &Rc<RefCell<Config>>,
 ) {
-    let current_id = {
-        if let Some(page_idx) = notebook.current_page() {
-            let tabs = tabs.borrow();
-            tabs.get(page_idx as usize).map(|t| t.id)
-        } else {
-            None
-        }
-    };
-
-    let Some(current_id) = current_id else { return };
-
-    // Collect IDs of tabs to close (all except current)
-    let ids_to_close: Vec<u64> = {
+    let Some(current_id) = notebook.current_page().and_then(|page_idx| {
         let tabs = tabs.borrow();
-        tabs.iter()
-            .filter(|t| t.id != current_id)
-            .map(|t| t.id)
-            .collect()
+        tabs.get(page_idx as usize).map(|tab| tab.id)
+    }) else {
+        return;
     };
+    let ids_to_close = tabs
+        .borrow()
+        .iter()
+        .filter(|tab| tab.id != current_id)
+        .map(|tab| tab.id)
+        .collect::<Vec<_>>();
+    close_other_tabs_now(notebook, tabs, tab_bar, &ids_to_close);
+}
 
-    // Close each tab by removing from notebook, tabs list, and tab bar
+fn close_other_tabs_now(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    tab_bar: &TabBar,
+    ids_to_close: &[u64],
+) {
     for id in ids_to_close {
-        // Find index of this tab
         let index = {
             let tabs = tabs.borrow();
-            tabs.iter().position(|t| t.id == id)
+            tabs.iter().position(|tab| tab.id == *id)
         };
 
         if let Some(index) = index {
+            {
+                let tabs_ref = tabs.borrow();
+                for (_, pane) in tabs_ref[index].panes.iter() {
+                    pane.terminal.destroy_session();
+                }
+            }
             notebook.remove_page(Some(index as u32));
             tabs.borrow_mut().remove(index);
-            tab_bar.remove_tab(id);
+            tab_bar.remove_tab(*id);
         }
     }
 
@@ -3397,11 +4509,11 @@ fn close_other_tabs(
 }
 
 /// Sync tab bar active state with notebook
-/// Focus the terminal widget in the currently visible notebook page
-fn focus_current_terminal(notebook: &Notebook) {
+/// Focus the active terminal in the currently visible notebook page.
+fn focus_current_terminal(notebook: &Notebook, tabs: &Rc<RefCell<Vec<TabEntry>>>) {
     if let Some(page) = notebook.current_page() {
-        if let Some(widget) = notebook.nth_page(Some(page)) {
-            widget.grab_focus();
+        if let Some(tab) = tabs.borrow().get(page as usize) {
+            tab.terminal.widget().grab_focus();
         }
     }
 }
@@ -3506,12 +4618,12 @@ fn keyval_to_keycode(keyval: gdk::Key) -> Option<KeyCode> {
         Key::Tab | Key::ISO_Left_Tab => KeyCode::Tab,
         Key::Escape => KeyCode::Escape,
         Key::space => KeyCode::Space,
-        Key::minus => KeyCode::Minus,
-        Key::equal => KeyCode::Equals,
+        Key::minus | Key::underscore => KeyCode::Minus,
+        Key::equal | Key::plus => KeyCode::Equals,
         Key::comma => KeyCode::Comma,
         Key::period => KeyCode::Period,
         Key::slash => KeyCode::Slash,
-        Key::backslash => KeyCode::Backslash,
+        Key::backslash | Key::bar => KeyCode::Backslash,
         Key::semicolon => KeyCode::Semicolon,
         Key::apostrophe => KeyCode::Quote,
         Key::bracketleft => KeyCode::LeftBracket,
@@ -3574,4 +4686,95 @@ fn calculate_initial_cell_dimensions(config: &Config) -> CellDimensions {
         "Failed to load any font or measure text. \
          Please ensure fonts are installed (e.g., fonts-dejavu or similar)."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_split_inherits_shell_arguments_and_cwd() {
+        let mut config = Config::default();
+        config.general.default_shell = Some("/bin/fish".into());
+        config.general.shell_args = vec!["--login".into()];
+
+        let options =
+            inherited_pane_session_options(&config, false, Some("/work/tree".into()), None, None);
+        assert_eq!(options.shell.as_deref(), Some("/bin/fish"));
+        assert_eq!(options.args, ["--login"]);
+        assert_eq!(options.cwd.as_deref(), Some("/work/tree"));
+    }
+
+    #[test]
+    fn remote_split_inherits_cwd_without_injecting_a_local_shell() {
+        let mut config = Config::default();
+        config.general.default_shell = Some("/bin/local-only".into());
+        config.general.shell_args = vec!["--must-not-cross-ssh".into()];
+
+        let options =
+            inherited_pane_session_options(&config, true, Some("/srv/remote".into()), None, None);
+        assert!(options.shell.is_none());
+        assert!(options.args.is_empty());
+        assert_eq!(options.cwd.as_deref(), Some("/srv/remote"));
+    }
+
+    #[test]
+    fn daemon_side_ssh_split_keeps_its_native_ssh_target() {
+        let config = Config::default();
+        let ssh = cterm_client::SshParams {
+            host: "shell.example".into(),
+            ..Default::default()
+        };
+
+        let options = inherited_pane_session_options(
+            &config,
+            false,
+            Some("/srv/project".into()),
+            Some(ssh),
+            None,
+        );
+        assert_eq!(
+            options.ssh.as_ref().map(|params| params.host.as_str()),
+            Some("shell.example")
+        );
+        assert_eq!(options.cwd.as_deref(), Some("/srv/project"));
+    }
+
+    #[test]
+    fn restored_launch_context_overrides_changed_local_defaults() {
+        let mut config = Config::default();
+        config.general.default_shell = Some("/bin/new-default".into());
+        config.general.shell_args = vec!["--new-default".into()];
+        let original = cterm_client::CreateSessionOpts {
+            shell: Some("/bin/fish".into()),
+            args: vec!["--login".into()],
+            env: vec![("PANE_TEST".into(), "preserved".into())],
+            term: Some("xterm-256color".into()),
+            ..Default::default()
+        };
+        let launch_context = cterm_app::upgrade::PaneLaunchContext::capture(&original);
+
+        let options = inherited_pane_session_options(
+            &config,
+            false,
+            Some("/work/current".into()),
+            None,
+            Some(&launch_context),
+        );
+
+        assert_eq!(options.shell.as_deref(), Some("/bin/fish"));
+        assert_eq!(options.args, ["--login"]);
+        assert_eq!(options.env, [("PANE_TEST".into(), "preserved".into())]);
+        assert_eq!(options.term.as_deref(), Some("xterm-256color"));
+        assert_eq!(options.cwd.as_deref(), Some("/work/current"));
+    }
+
+    #[test]
+    fn shifted_split_keyvals_map_to_their_configured_physical_keys() {
+        assert_eq!(keyval_to_keycode(gdk::Key::bar), Some(KeyCode::Backslash));
+        assert_eq!(
+            keyval_to_keycode(gdk::Key::underscore),
+            Some(KeyCode::Minus)
+        );
+    }
 }

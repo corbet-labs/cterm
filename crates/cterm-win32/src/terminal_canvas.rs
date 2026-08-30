@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use cterm_core::color::{Color, Rgb};
 use cterm_core::{Cell, CellAttrs, CursorStyle, Screen};
+use cterm_ui::pane::PaneRect;
 use cterm_ui::theme::Theme;
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -69,6 +70,9 @@ pub struct TerminalRenderer {
     hwnd: HWND,
     /// Optional background color override (from template)
     background_override: Option<Rgb>,
+    /// Origin of the pane currently being rendered.
+    origin_x: f32,
+    origin_y: f32,
 }
 
 impl TerminalRenderer {
@@ -107,6 +111,8 @@ impl TerminalRenderer {
             brush_cache: HashMap::new(),
             hwnd,
             background_override: None,
+            origin_x: 0.0,
+            origin_y: 0.0,
         };
 
         renderer.create_device_resources()?;
@@ -285,6 +291,17 @@ impl TerminalRenderer {
         self.cell_dims
     }
 
+    /// Clone the Direct2D/DirectWrite resources used by native window chrome.
+    pub fn chrome_resources(
+        &self,
+    ) -> Option<(ID2D1HwndRenderTarget, IDWriteFactory, IDWriteTextFormat)> {
+        Some((
+            self.render_target.clone()?,
+            self.dwrite_factory.clone(),
+            self.text_format.clone()?,
+        ))
+    }
+
     /// Set an optional background color override (hex string like "#1a1b26")
     pub fn set_background_override(&mut self, color: Option<&str>) {
         self.background_override = color.and_then(|hex| {
@@ -307,46 +324,116 @@ impl TerminalRenderer {
         (cols.max(1), rows.max(1))
     }
 
-    /// Render the terminal screen
+    /// Begin a window frame using the active terminal's background color.
+    pub fn begin_frame(&self, screen: &Screen) {
+        let Some(rt) = self.render_target.as_ref() else {
+            return;
+        };
+        let palette = self.resolved_palette(screen);
+        let background = if screen.modes.reverse_video {
+            palette.foreground
+        } else {
+            palette.background
+        };
+        unsafe {
+            rt.BeginDraw();
+            rt.Clear(Some(&rgb_to_d2d_color(background)));
+        }
+    }
+
+    /// Render one terminal into a clipped pane rectangle in client pixels.
+    pub fn render_pane(
+        &mut self,
+        screen: &Screen,
+        rect: PaneRect,
+        active: bool,
+        alerted: bool,
+    ) -> windows::core::Result<()> {
+        let Some(rt) = self.render_target.clone() else {
+            return Ok(());
+        };
+        if rect.width == 0 || rect.height == 0 {
+            return Ok(());
+        }
+
+        self.origin_x = rect.x as f32;
+        self.origin_y = rect.y as f32;
+        let clip = D2D_RECT_F {
+            left: self.origin_x,
+            top: self.origin_y,
+            right: self.origin_x + rect.width as f32,
+            bottom: self.origin_y + rect.height as f32,
+        };
+        let base: ID2D1RenderTarget = rt.cast()?;
+        let palette = self.resolved_palette(screen);
+        let background = if screen.modes.reverse_video {
+            palette.foreground
+        } else {
+            palette.background
+        };
+        let background_brush = self.get_brush(background)?;
+
+        unsafe {
+            base.FillRectangle(&clip, &background_brush);
+            base.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        }
+        let draw_result = (|| {
+            self.draw_grid(screen)?;
+            self.draw_images(screen)?;
+            if active {
+                self.draw_cursor(screen)?;
+            }
+            Ok::<(), windows::core::Error>(())
+        })();
+        unsafe { base.PopAxisAlignedClip() };
+        draw_result?;
+
+        let border_color = if alerted {
+            palette.ansi[3]
+        } else if active {
+            palette.cursor
+        } else {
+            palette.ansi[8]
+        };
+        let border_brush = self.get_brush(border_color)?;
+        let border = D2D_RECT_F {
+            left: clip.left + 0.5,
+            top: clip.top + 0.5,
+            right: (clip.right - 0.5).max(clip.left + 0.5),
+            bottom: (clip.bottom - 0.5).max(clip.top + 0.5),
+        };
+        unsafe { base.DrawRectangle(&border, &border_brush, 1.0, None) };
+        Ok(())
+    }
+
+    /// End and present the current window frame.
+    pub fn end_frame(&self) -> windows::core::Result<()> {
+        if let Some(rt) = self.render_target.as_ref() {
+            unsafe { rt.EndDraw(None, None)? };
+        }
+        Ok(())
+    }
+
+    /// Render the terminal screen as a single full-window pane.
     pub fn render(&mut self, screen: &Screen) -> windows::core::Result<()> {
         if self.render_target.is_none() {
             return Ok(());
         }
-
-        let palette = self.resolved_palette(screen);
-
-        // Begin drawing
-        unsafe {
-            let rt = self.render_target.as_ref().unwrap();
-            rt.BeginDraw();
-
-            // Clear with background color (use override if set)
-            let bg = if screen.modes.reverse_video {
-                palette.foreground
-            } else {
-                palette.background
-            };
-            let bg_color = rgb_to_d2d_color(bg);
-            rt.Clear(Some(&bg_color));
-        }
-
-        // Draw grid cells
-        self.draw_grid(screen)?;
-
-        // Inline images replace their underlying cells and are composited
-        // before the cursor, matching the Cocoa and GTK renderers.
-        self.draw_images(screen)?;
-
-        // Draw cursor
-        self.draw_cursor(screen)?;
-
-        // End drawing
-        unsafe {
-            let rt = self.render_target.as_ref().unwrap();
-            rt.EndDraw(None, None)?;
-        }
-
-        Ok(())
+        let mut client = RECT::default();
+        unsafe { GetClientRect(self.hwnd, &mut client)? };
+        self.begin_frame(screen);
+        self.render_pane(
+            screen,
+            PaneRect::new(
+                0,
+                0,
+                (client.right - client.left).max(1) as u32,
+                (client.bottom - client.top).max(1) as u32,
+            ),
+            true,
+            false,
+        )?;
+        self.end_frame()
     }
 
     /// Draw decoded SIXEL and other inline images through Direct2D.
@@ -395,8 +482,8 @@ impl TerminalRenderer {
                     &bitmap_properties,
                 )?
             };
-            let x = image.col as f32 * self.cell_dims.width;
-            let y = visible_row as f32 * self.cell_dims.height;
+            let x = self.origin_x + image.col as f32 * self.cell_dims.width;
+            let y = self.origin_y + visible_row as f32 * self.cell_dims.height;
             let destination = D2D_RECT_F {
                 left: x,
                 top: y,
@@ -449,8 +536,8 @@ impl TerminalRenderer {
         cell: &Cell,
         screen: &Screen,
     ) -> windows::core::Result<()> {
-        let x = col as f32 * self.cell_dims.width;
-        let y = row as f32 * self.cell_dims.height;
+        let x = self.origin_x + col as f32 * self.cell_dims.width;
+        let y = self.origin_y + row as f32 * self.cell_dims.height;
 
         let attrs = cell.attrs;
         let is_selected = screen.is_selected(absolute_line, col);
@@ -695,8 +782,8 @@ impl TerminalRenderer {
 
         let cursor = &screen.cursor;
 
-        let x = cursor.col as f32 * self.cell_dims.width;
-        let y = cursor.row as f32 * self.cell_dims.height;
+        let x = self.origin_x + cursor.col as f32 * self.cell_dims.width;
+        let y = self.origin_y + cursor.row as f32 * self.cell_dims.height;
 
         let cursor_color = self.resolved_palette(screen).cursor;
         let brush = self.get_brush(cursor_color)?;

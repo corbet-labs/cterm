@@ -447,7 +447,13 @@ impl SessionState {
 
     /// Decrement the attached client count
     pub fn detach(&self) {
-        self.attached_clients.fetch_sub(1, Ordering::Relaxed);
+        // Stale UI cleanup can race after a failed reconnect. Keep detach
+        // idempotent instead of wrapping the public count to `u32::MAX`.
+        let _ = self
+            .attached_clients
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            });
     }
 
     /// Get the number of currently attached clients
@@ -681,5 +687,24 @@ impl SessionState {
     {
         let mut term = self.terminal.write();
         f(&mut term)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detach_count_saturates_at_zero() {
+        let session =
+            SessionState::new_ssh_connecting("attachment-count".to_string(), PtySize::default(), 0);
+
+        session.detach();
+        assert_eq!(session.attached_clients(), 0);
+
+        session.attach();
+        session.detach();
+        session.detach();
+        assert_eq!(session.attached_clients(), 0);
     }
 }

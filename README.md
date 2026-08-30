@@ -13,6 +13,7 @@ A high-performance, customizable terminal emulator built in Rust. cterm uses nat
 
 ### User Interface
 - **Tabs**: Multiple terminal tabs with keyboard shortcuts
+- **Split Panes**: Native nested panes with draggable dividers, directional focus and resize, and temporary zoom
 - **Tab Customization**: Custom colors and names for tabs
 - **Tab Templates**: Persistent tab configurations for frequently-used commands (great for Claude sessions)
 - **Quick Launch**: VS Code-style fuzzy search overlay to instantly open or switch to tabs (Cmd+G / Ctrl+Shift+G)
@@ -537,10 +538,10 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 - [x] Tab templates with Quick Launch
 - [x] Docker and SSH templates
 - [x] Auto-update with release notes
+- [x] Native split panes (macOS/Linux/Windows)
 
 ### Future
 
-- Bind the completed pane-layout core to the three native frontends
 - Plugin system
 - Additional foot-compatible behavior and performance work
 - Android and iOS local-terminal frontends (distant targets)

@@ -10,6 +10,7 @@ mod file_transfer;
 mod log_viewer;
 mod menu;
 mod notification_bar;
+mod pane;
 mod quick_open;
 mod remotes_dialog;
 mod session_dialog;

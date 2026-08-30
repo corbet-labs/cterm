@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
+use cterm_ui::{Action, KeyCode, Modifiers, PaneDirection, Shortcut, SplitDirection};
 
 use crate::config::ShortcutsConfig;
 
@@ -36,6 +36,45 @@ impl ShortcutManager {
         // Override with config values
         manager.bind_str(&config.new_tab, Action::NewTab);
         manager.bind_str(&config.close_tab, Action::CloseTab);
+        manager.bind_str(
+            &config.split_pane_horizontal,
+            Action::SplitPane(SplitDirection::Horizontal),
+        );
+        manager.bind_str(
+            &config.split_pane_vertical,
+            Action::SplitPane(SplitDirection::Vertical),
+        );
+        manager.bind_str(&config.close_pane, Action::ClosePane);
+        manager.bind_str(
+            &config.focus_pane_left,
+            Action::FocusPane(PaneDirection::Left),
+        );
+        manager.bind_str(
+            &config.focus_pane_right,
+            Action::FocusPane(PaneDirection::Right),
+        );
+        manager.bind_str(&config.focus_pane_up, Action::FocusPane(PaneDirection::Up));
+        manager.bind_str(
+            &config.focus_pane_down,
+            Action::FocusPane(PaneDirection::Down),
+        );
+        manager.bind_str(
+            &config.resize_pane_left,
+            Action::ResizePane(PaneDirection::Left),
+        );
+        manager.bind_str(
+            &config.resize_pane_right,
+            Action::ResizePane(PaneDirection::Right),
+        );
+        manager.bind_str(
+            &config.resize_pane_up,
+            Action::ResizePane(PaneDirection::Up),
+        );
+        manager.bind_str(
+            &config.resize_pane_down,
+            Action::ResizePane(PaneDirection::Down),
+        );
+        manager.bind_str(&config.toggle_pane_zoom, Action::TogglePaneZoom);
         manager.bind_str(&config.next_tab, Action::NextTab);
         manager.bind_str(&config.prev_tab, Action::PrevTab);
         manager.bind_str(&config.new_window, Action::NewWindow);
@@ -64,6 +103,49 @@ impl ShortcutManager {
         // Tab shortcuts
         self.bind(Shortcut::ctrl_shift(KeyCode::T), Action::NewTab);
         self.bind(Shortcut::ctrl_shift(KeyCode::W), Action::CloseTab);
+        self.bind(
+            Shortcut::ctrl_shift(KeyCode::Backslash),
+            Action::SplitPane(SplitDirection::Horizontal),
+        );
+        self.bind(
+            Shortcut::ctrl_shift(KeyCode::Minus),
+            Action::SplitPane(SplitDirection::Vertical),
+        );
+        self.bind(Shortcut::ctrl_shift(KeyCode::Delete), Action::ClosePane);
+        self.bind(
+            Shortcut::new(KeyCode::Left, Modifiers::CTRL | Modifiers::ALT),
+            Action::FocusPane(PaneDirection::Left),
+        );
+        self.bind(
+            Shortcut::new(KeyCode::Right, Modifiers::CTRL | Modifiers::ALT),
+            Action::FocusPane(PaneDirection::Right),
+        );
+        self.bind(
+            Shortcut::new(KeyCode::Up, Modifiers::CTRL | Modifiers::ALT),
+            Action::FocusPane(PaneDirection::Up),
+        );
+        self.bind(
+            Shortcut::new(KeyCode::Down, Modifiers::CTRL | Modifiers::ALT),
+            Action::FocusPane(PaneDirection::Down),
+        );
+        let resize_modifiers = Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT;
+        self.bind(
+            Shortcut::new(KeyCode::Left, resize_modifiers),
+            Action::ResizePane(PaneDirection::Left),
+        );
+        self.bind(
+            Shortcut::new(KeyCode::Right, resize_modifiers),
+            Action::ResizePane(PaneDirection::Right),
+        );
+        self.bind(
+            Shortcut::new(KeyCode::Up, resize_modifiers),
+            Action::ResizePane(PaneDirection::Up),
+        );
+        self.bind(
+            Shortcut::new(KeyCode::Down, resize_modifiers),
+            Action::ResizePane(PaneDirection::Down),
+        );
+        self.bind(Shortcut::ctrl_shift(KeyCode::Enter), Action::TogglePaneZoom);
         self.bind(
             Shortcut::new(KeyCode::Tab, Modifiers::CTRL),
             Action::NextTab,
@@ -442,6 +524,25 @@ mod tests {
         assert_eq!(
             manager.match_event(KeyCode::X, Modifiers::CTRL | Modifiers::SHIFT),
             Some(&Action::PromptNext)
+        );
+        assert_eq!(
+            manager.match_event(KeyCode::Backslash, Modifiers::CTRL | Modifiers::SHIFT),
+            Some(&Action::SplitPane(SplitDirection::Horizontal))
+        );
+        assert_eq!(
+            manager.match_event(KeyCode::Left, Modifiers::CTRL | Modifiers::ALT),
+            Some(&Action::FocusPane(PaneDirection::Left))
+        );
+        assert_eq!(
+            manager.match_event(
+                KeyCode::Down,
+                Modifiers::CTRL | Modifiers::ALT | Modifiers::SHIFT
+            ),
+            Some(&Action::ResizePane(PaneDirection::Down))
+        );
+        assert_eq!(
+            manager.match_event(KeyCode::Enter, Modifiers::CTRL | Modifiers::SHIFT),
+            Some(&Action::TogglePaneZoom)
         );
     }
 }

@@ -36,13 +36,28 @@ fn receive_and_start(state_path: &str) -> Result<(), Box<dyn std::error::Error>>
     // Log the sessions that need reconnection
     for (i, window) in state.windows.iter().enumerate() {
         for tab in &window.tabs {
-            if let Some(ref session_id) = tab.session_id {
-                log::info!(
-                    "Window {} tab '{}': session_id={}",
-                    i,
-                    tab.title,
-                    session_id
-                );
+            if tab.panes.is_empty() {
+                if let Some(ref session_id) = tab.session_id {
+                    log::info!(
+                        "Window {} tab '{}': session_id={}",
+                        i,
+                        tab.title,
+                        session_id
+                    );
+                }
+            } else {
+                for (pane_index, pane) in tab.panes.iter().enumerate() {
+                    let Some(session_id) = pane.session_id.as_ref() else {
+                        continue;
+                    };
+                    log::info!(
+                        "Window {} tab '{}' pane {}: session_id={}",
+                        i,
+                        tab.title,
+                        pane_index,
+                        session_id
+                    );
+                }
             }
         }
     }

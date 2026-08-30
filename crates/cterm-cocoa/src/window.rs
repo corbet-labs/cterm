@@ -2,14 +2,15 @@
 //!
 //! Handles NSWindow creation and management using native macOS window tabbing.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSMenu, NSMenuItem, NSWindow,
-    NSWindowDelegate, NSWindowOcclusionState, NSWindowStyleMask, NSWindowTabbingMode,
+    NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSMenu,
+    NSMenuItem, NSView, NSWindow, NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode,
+    NSWindowStyleMask, NSWindowTabbingMode,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -17,11 +18,33 @@ use objc2_foundation::{
 
 use cterm_app::config::Config;
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_ui::theme::Theme;
+use cterm_app::upgrade::{PaneLaunchContext, PaneUpgradeState, TabUpgradeState};
+use cterm_ui::{
+    PaneDirection, PaneId, PaneLayout, PaneLayoutError, PaneRect, SplitDirection, SplitPlacement,
+    SplitRatio, SplitRequest, Theme,
+};
 
 use crate::cg_renderer::CGRenderer;
+use crate::panes::{PaneDivider, PaneFrameView, PaneHostView, PaneRegistry};
 use crate::quick_open::{OpenTabEntry, QuickOpenOverlay, QUICK_OPEN_HEIGHT};
 use crate::terminal_view::TerminalView;
+
+struct NativePane {
+    terminal: Retained<TerminalView>,
+    frame: Retained<PaneFrameView>,
+}
+
+#[derive(Clone, Copy)]
+enum CloseTarget {
+    Window,
+    Pane(PaneId),
+}
+
+struct DaemonProcessQuery {
+    session_id: String,
+    daemon_socket: Option<std::path::PathBuf>,
+    title: String,
+}
 
 /// Window state stored in ivars
 pub struct CtermWindowIvars {
@@ -29,6 +52,14 @@ pub struct CtermWindowIvars {
     theme: Theme,
     shortcuts: ShortcutManager,
     active_terminal: RefCell<Option<Retained<TerminalView>>>,
+    panes: RefCell<PaneRegistry<NativePane>>,
+    pane_host: RefCell<Option<Retained<PaneHostView>>>,
+    pane_drag: RefCell<Option<PaneDivider>>,
+    /// Set before native close cleanup so late async session results can be
+    /// destroyed instead of being attached to an already-closed tab.
+    closed: Cell<bool>,
+    close_query_in_progress: Cell<bool>,
+    close_approved: Cell<bool>,
     pending_tab_color: RefCell<Option<String>>,
     quick_open: RefCell<Option<Retained<QuickOpenOverlay>>>,
     /// Whether this window has an active bell notification
@@ -49,21 +80,15 @@ define_class!(
         fn window_did_become_key(&self, _notification: &NSNotification) {
             log::debug!("Window became key");
             // Make the terminal view first responder so it can receive keyboard input
-            if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
-                self.makeFirstResponder(Some(terminal));
+            let active_terminal = self.ivars().active_terminal.borrow().clone();
+            if let Some(terminal) = active_terminal {
+                self.makeFirstResponder(Some(&terminal));
                 // Send focus in event if DECSET 1004 is enabled
                 terminal.send_focus_event(true);
+                self.clear_bell_for_terminal(&terminal);
+            } else {
+                self.refresh_bell_indicator();
             }
-
-            // Clear bell indicator from window title if present
-            let current_title: Retained<NSString> = unsafe { msg_send![self, title] };
-            let title_str = current_title.to_string();
-            if let Some(stripped) = title_str.strip_prefix("🔔 ") {
-                self.setTitle(&NSString::from_str(stripped));
-            }
-
-            // Clear bell state and update dock badge
-            self.set_bell(false);
 
             // Apply pending tab color if any (tab property becomes available after joining tab group)
             // Try immediately, and schedule a retry in case the tab isn't ready yet
@@ -91,43 +116,30 @@ define_class!(
             } else {
                 cterm_core::WindowVisibility::Hidden
             };
-            if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
+            for terminal in self.terminal_views() {
                 terminal.set_window_visibility(visibility);
             }
         }
 
         #[unsafe(method(windowShouldClose:))]
         fn window_should_close(&self, _sender: &NSWindow) -> objc2::runtime::Bool {
-            // Check if config says to confirm close with running processes
-            if !self.ivars().config.general.confirm_close_with_running {
+            if crate::app::is_relaunching()
+                || self.ivars().close_approved.replace(false)
+                || !self.ivars().config.general.confirm_close_with_running
+            {
                 return objc2::runtime::Bool::YES;
             }
 
-            if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
-                // For local PTY sessions: check directly
-                #[cfg(unix)]
-                if terminal.has_foreground_process() {
-                    let process_name = terminal
-                        .foreground_process_name()
-                        .unwrap_or_else(|| "a process".to_string());
-                    return objc2::runtime::Bool::new(self.show_close_confirmation(&process_name));
-                }
-
-                // For daemon-backed sessions: query the daemon
-                if terminal.session_id().is_some() {
-                    if let Some(process_name) = terminal.daemon_foreground_process_name() {
-                        return objc2::runtime::Bool::new(
-                            self.show_close_confirmation(&process_name),
-                        );
-                    }
-                }
-            }
-            objc2::runtime::Bool::YES
+            self.begin_close_check(CloseTarget::Window, self.terminal_views());
+            objc2::runtime::Bool::NO
         }
 
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
             log::debug!("Window will close");
+            self.ivars().closed.set(true);
+            self.set_bell(false);
+            self.cleanup_all_panes();
 
             // Notify AppDelegate to remove this window from tracking
             let mtm = MainThreadMarker::from(self);
@@ -141,10 +153,7 @@ define_class!(
         #[unsafe(method(windowDidResize:))]
         fn window_did_resize(&self, _notification: &NSNotification) {
             log::debug!("Window did resize");
-            // Update terminal dimensions
-            if let Some(terminal) = self.ivars().active_terminal.borrow().as_ref() {
-                terminal.handle_resize();
-            }
+            self.layout_panes();
 
             // Update Quick Open overlay width
             if let Some(ref overlay) = *self.ivars().quick_open.borrow() {
@@ -168,6 +177,114 @@ define_class!(
         #[unsafe(method(closeTab:))]
         fn action_close_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             self.close_current_tab();
+        }
+
+        #[unsafe(method(splitPaneHorizontal:))]
+        fn action_split_pane_horizontal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.create_pane(SplitDirection::Horizontal);
+        }
+
+        #[unsafe(method(splitPaneVertical:))]
+        fn action_split_pane_vertical(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.create_pane(SplitDirection::Vertical);
+        }
+
+        #[unsafe(method(closePane:))]
+        fn action_close_pane(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.close_active_pane();
+        }
+
+        #[unsafe(method(focusPaneLeft:))]
+        fn action_focus_pane_left(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.focus_pane_direction(PaneDirection::Left);
+        }
+
+        #[unsafe(method(focusPaneRight:))]
+        fn action_focus_pane_right(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.focus_pane_direction(PaneDirection::Right);
+        }
+
+        #[unsafe(method(focusPaneUp:))]
+        fn action_focus_pane_up(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.focus_pane_direction(PaneDirection::Up);
+        }
+
+        #[unsafe(method(focusPaneDown:))]
+        fn action_focus_pane_down(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.focus_pane_direction(PaneDirection::Down);
+        }
+
+        #[unsafe(method(resizePaneLeft:))]
+        fn action_resize_pane_left(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.resize_active_pane(PaneDirection::Left);
+        }
+
+        #[unsafe(method(resizePaneRight:))]
+        fn action_resize_pane_right(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.resize_active_pane(PaneDirection::Right);
+        }
+
+        #[unsafe(method(resizePaneUp:))]
+        fn action_resize_pane_up(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.resize_active_pane(PaneDirection::Up);
+        }
+
+        #[unsafe(method(resizePaneDown:))]
+        fn action_resize_pane_down(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.resize_active_pane(PaneDirection::Down);
+        }
+
+        #[unsafe(method(togglePaneZoom:))]
+        fn action_toggle_pane_zoom(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.toggle_active_pane_zoom();
+        }
+
+        #[unsafe(method(focusPaneForView:))]
+        fn focus_pane_for_view(&self, terminal: &TerminalView) {
+            if let Some(id) = self.pane_id_for_terminal(terminal) {
+                self.focus_pane(id);
+            }
+        }
+
+        #[unsafe(method(isActivePaneView:))]
+        fn is_active_pane_view(&self, terminal: &TerminalView) -> bool {
+            self.is_active_terminal(terminal)
+        }
+
+        #[unsafe(method(paneTitleDidChange:))]
+        fn pane_title_did_change(&self, terminal: &TerminalView) {
+            if self.is_active_terminal(terminal) {
+                self.refresh_active_title();
+            }
+        }
+
+        #[unsafe(method(paneBellDidRing:))]
+        fn pane_bell_did_ring(&self, terminal: &TerminalView) {
+            let focused = self.isKeyWindow() && self.is_active_terminal(terminal);
+            if !focused {
+                terminal.set_active_bell(true);
+                self.refresh_bell_indicator();
+            }
+        }
+
+        #[unsafe(method(paneDidExit:))]
+        fn pane_did_exit(&self, terminal: &TerminalView) {
+            self.close_exited_pane(terminal);
+        }
+
+        #[unsafe(method(beginPaneDividerDragAt:))]
+        fn begin_pane_divider_drag_at(&self, point: NSPoint) -> bool {
+            self.begin_pane_divider_drag(point)
+        }
+
+        #[unsafe(method(dragPaneDividerTo:))]
+        fn drag_pane_divider_to(&self, point: NSPoint) -> bool {
+            self.drag_pane_divider(point)
+        }
+
+        #[unsafe(method(endPaneDividerDrag))]
+        fn end_pane_divider_drag_action(&self) -> bool {
+            self.end_pane_divider_drag()
         }
 
         /// Called by macOS native tabbing when Command-T or tab bar + is pressed.
@@ -311,6 +428,51 @@ fn ensure_session_pixel_size(config: &Config, opts: &mut cterm_client::CreateSes
     }
 }
 
+fn configured_template_launch_context(config: &Config, name: &str) -> Option<PaneLaunchContext> {
+    let template = config
+        .sticky_tabs
+        .iter()
+        .find(|template| template.name == name)?;
+    let (configured_shell, configured_args) = template.get_command_args();
+    let options = cterm_client::CreateSessionOpts {
+        shell: configured_shell.or_else(|| config.general.default_shell.clone()),
+        args: if template.docker.is_none() && template.command.is_none() {
+            config.general.shell_args.clone()
+        } else {
+            configured_args
+        },
+        env: template
+            .env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .chain(
+                config
+                    .general
+                    .env
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            )
+            .collect(),
+        term: config.general.term.clone(),
+        ssh: template.ssh.as_ref().map(|ssh| ssh.to_ssh_params()),
+        ..Default::default()
+    };
+    Some(PaneLaunchContext::capture(&options))
+}
+
+fn destroy_unattached_session(session: cterm_client::SessionHandle) {
+    std::thread::spawn(move || {
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            if let Err(error) = runtime.block_on(session.destroy()) {
+                log::warn!("Failed to destroy an unattached pane session: {error}");
+            }
+        }
+    });
+}
+
 impl CtermWindow {
     /// Common window initialization: calculate size, allocate, init NSWindow,
     /// set min size, tabbing mode, and delegate.
@@ -340,6 +502,12 @@ impl CtermWindow {
             theme: theme.clone(),
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
             active_terminal: RefCell::new(None),
+            panes: RefCell::new(PaneRegistry::default()),
+            pane_host: RefCell::new(None),
+            pane_drag: RefCell::new(None),
+            closed: Cell::new(false),
+            close_query_in_progress: Cell::new(false),
+            close_approved: Cell::new(false),
             pending_tab_color: RefCell::new(pending_tab_color),
             quick_open: RefCell::new(None),
             has_active_bell: std::cell::Cell::new(false),
@@ -361,10 +529,22 @@ impl CtermWindow {
         this.setTabbingMode(NSWindowTabbingMode::Preferred);
         this.setDelegate(Some(ProtocolObject::from_ref(&*this)));
 
+        let host_frame = this
+            .contentView()
+            .map(|view| view.bounds())
+            .unwrap_or_else(|| NSRect::new(NSPoint::ZERO, content_rect.size));
+        let pane_host = PaneHostView::new(mtm, host_frame);
+        pane_host.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        this.setContentView(Some(&pane_host));
+        *this.ivars().pane_host.borrow_mut() = Some(pane_host);
+
         this
     }
 
-    /// Attach a terminal view to this window as content and store it
+    /// Attach the first terminal view to this tab's pane host.
     fn attach_terminal_view(&self, terminal: Retained<TerminalView>) {
         let visibility = if self
             .occlusionState()
@@ -375,10 +555,489 @@ impl CtermWindow {
             cterm_core::WindowVisibility::Hidden
         };
         terminal.set_window_visibility(visibility);
-        self.setContentView(Some(&terminal));
+        let mtm = MainThreadMarker::from(self);
+        let frame = PaneFrameView::new(mtm, terminal.clone(), &self.ivars().theme);
+        let entry = NativePane {
+            terminal,
+            frame: frame.clone(),
+        };
+        if self
+            .ivars()
+            .panes
+            .borrow_mut()
+            .insert_initial(entry)
+            .is_err()
+        {
+            log::error!("Attempted to attach a second initial terminal to a pane host");
+            return;
+        }
+        self.add_pane_frame(&frame);
+        self.layout_panes();
+        self.sync_active_terminal(true);
+    }
+
+    fn add_pane_frame(&self, frame: &PaneFrameView) {
+        let host = self
+            .ivars()
+            .pane_host
+            .borrow()
+            .clone()
+            .expect("pane host is initialized with the window");
+        if let Some(overlay) = self.ivars().quick_open.borrow().as_ref() {
+            host.addSubview_positioned_relativeTo(
+                frame,
+                NSWindowOrderingMode::Below,
+                Some(overlay),
+            );
+        } else {
+            host.addSubview(frame);
+        }
+    }
+
+    fn pane_bounds(&self) -> PaneRect {
+        let size = self
+            .ivars()
+            .pane_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.bounds().size)
+            .unwrap_or(NSSize::new(0.0, 0.0));
+        PaneRect::new(
+            0,
+            0,
+            size.width.floor().clamp(0.0, u32::MAX as f64) as u32,
+            size.height.floor().clamp(0.0, u32::MAX as f64) as u32,
+        )
+    }
+
+    fn point_in_pane_host(&self, point_in_window: NSPoint) -> NSPoint {
+        self.ivars()
+            .pane_host
+            .borrow()
+            .as_ref()
+            .map(|host| unsafe { host.convertPoint_fromView(point_in_window, None) })
+            .unwrap_or(point_in_window)
+    }
+
+    fn begin_pane_divider_drag(&self, point_in_window: NSPoint) -> bool {
+        let point = self.point_in_pane_host(point_in_window);
+        let divider = self
+            .ivars()
+            .panes
+            .borrow()
+            .divider_at(self.pane_bounds(), point.x, point.y);
+        let began = divider.is_some();
+        *self.ivars().pane_drag.borrow_mut() = divider;
+        began
+    }
+
+    fn drag_pane_divider(&self, point_in_window: NSPoint) -> bool {
+        let Some(divider) = self.ivars().pane_drag.borrow().clone() else {
+            return false;
+        };
+        let point = self.point_in_pane_host(point_in_window);
+        match self
+            .ivars()
+            .panes
+            .borrow_mut()
+            .drag_divider(&divider, point.x, point.y)
+        {
+            Ok(true) => {
+                self.layout_panes();
+                self.sync_active_terminal(false);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                log::debug!("Ignoring stale pane divider drag: {error}");
+                *self.ivars().pane_drag.borrow_mut() = None;
+            }
+        }
+        true
+    }
+
+    fn end_pane_divider_drag(&self) -> bool {
+        let ended = self.ivars().pane_drag.borrow_mut().take().is_some();
+        if ended {
+            log::info!("Resized pane divider");
+        }
+        ended
+    }
+
+    fn layout_panes(&self) {
+        let bounds = self.pane_bounds();
+        let panes = self.ivars().panes.borrow();
+        for entry in panes.values() {
+            entry.frame.setHidden(true);
+        }
+        for positioned in panes.positions(bounds) {
+            if let Some(entry) = panes.get(positioned.id) {
+                let rect = positioned.rect;
+                let frame = NSRect::new(
+                    NSPoint::new(f64::from(rect.x), f64::from(rect.y)),
+                    NSSize::new(f64::from(rect.width), f64::from(rect.height)),
+                );
+                let _: () = unsafe { msg_send![&*entry.frame, setFrame: frame] };
+                entry.frame.setHidden(false);
+            }
+        }
+        drop(panes);
+        self.update_pane_focus_rings();
+    }
+
+    fn update_pane_focus_rings(&self) {
+        let panes = self.ivars().panes.borrow();
+        let active = panes.active_id();
+        for id in panes.layout().pane_ids() {
+            if let Some(entry) = panes.get(id) {
+                entry.frame.set_active(id == active);
+            }
+        }
+    }
+
+    fn sync_active_terminal(&self, make_responder: bool) {
+        let next = self
+            .ivars()
+            .panes
+            .borrow()
+            .active()
+            .map(|entry| entry.terminal.clone());
+        let previous = self.ivars().active_terminal.borrow().clone();
+        let changed = previous
+            .as_ref()
+            .zip(next.as_ref())
+            .is_none_or(|(previous, next)| Retained::as_ptr(previous) != Retained::as_ptr(next));
+
+        if changed && self.isKeyWindow() {
+            if let Some(previous) = previous.as_ref() {
+                previous.send_focus_event(false);
+            }
+        }
+        *self.ivars().active_terminal.borrow_mut() = next.clone();
+        self.update_pane_focus_rings();
+
+        if let Some(terminal) = next {
+            let (cell_width, cell_height) = terminal.cell_size();
+            self.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
+            if make_responder {
+                self.makeFirstResponder(Some(&terminal));
+                self.clear_bell_for_terminal(&terminal);
+            }
+            if changed && self.isKeyWindow() {
+                terminal.send_focus_event(true);
+            }
+            self.refresh_active_title();
+        }
+    }
+
+    fn refresh_active_title(&self) {
+        let Some(terminal) = self.ivars().active_terminal.borrow().clone() else {
+            return;
+        };
+        let title = match terminal.current_title() {
+            title if !title.is_empty() => title,
+            _ => "Terminal".to_string(),
+        };
+        let title = if self.ivars().has_active_bell.get() {
+            format!("🔔 {title}")
+        } else {
+            title
+        };
+        self.setTitle(&NSString::from_str(&title));
+    }
+
+    fn refresh_bell_indicator(&self) {
+        let active = self
+            .terminal_views()
+            .iter()
+            .any(|terminal| terminal.has_active_bell());
+        self.set_bell(active);
+        self.refresh_active_title();
+    }
+
+    fn clear_bell_for_terminal(&self, terminal: &TerminalView) {
+        terminal.set_active_bell(false);
+        self.refresh_bell_indicator();
+    }
+
+    fn pane_id_for_terminal(&self, terminal: &TerminalView) -> Option<PaneId> {
+        let pointer = terminal as *const TerminalView;
+        self.ivars()
+            .panes
+            .borrow()
+            .id_matching(|entry| Retained::as_ptr(&entry.terminal) == pointer)
+    }
+
+    fn is_active_terminal(&self, terminal: &TerminalView) -> bool {
+        self.ivars()
+            .active_terminal
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| Retained::as_ptr(active) == terminal as *const TerminalView)
+    }
+
+    fn focus_pane(&self, id: PaneId) {
+        if self.ivars().panes.borrow_mut().set_active(id).is_ok() {
+            log::info!("Focused pane {}", id);
+            self.layout_panes();
+            self.sync_active_terminal(true);
+        }
+    }
+
+    fn focus_pane_direction(&self, direction: PaneDirection) {
+        let bounds = self.pane_bounds();
+        match self
+            .ivars()
+            .panes
+            .borrow_mut()
+            .focus_direction(direction, bounds)
+        {
+            Some(active) => {
+                log::info!("Focused pane {} {:?}", active, direction);
+                self.layout_panes();
+                self.sync_active_terminal(true);
+            }
+            None => {}
+        }
+    }
+
+    fn resize_active_pane(&self, direction: PaneDirection) {
+        let bounds = self.pane_bounds();
+        let amount = self
+            .active_terminal()
+            .map(|terminal| {
+                let (cell_width, cell_height) = terminal.cell_size();
+                match direction {
+                    PaneDirection::Left | PaneDirection::Right => cell_width,
+                    PaneDirection::Up | PaneDirection::Down => cell_height,
+                }
+                .round()
+                .max(1.0) as u32
+            })
+            .unwrap_or(1);
+        if self
+            .ivars()
+            .panes
+            .borrow_mut()
+            .layout_mut()
+            .adjust_active_size(direction, amount, bounds)
+        {
+            let active = self.ivars().panes.borrow().active_id();
+            log::info!("Resized pane {} {:?}", active, direction);
+            self.layout_panes();
+            self.sync_active_terminal(true);
+        }
+    }
+
+    fn toggle_active_pane_zoom(&self) {
+        if self.ivars().panes.borrow().is_empty() {
+            return;
+        }
+        let zoomed = self.ivars().panes.borrow_mut().layout_mut().toggle_zoom();
+        log::info!("Pane zoom {}", zoomed);
+        self.layout_panes();
+        self.sync_active_terminal(true);
+    }
+
+    fn create_pane(&self, direction: SplitDirection) {
+        if crate::app::get_args().managed {
+            log::warn!("Ignoring split-pane request in managed mode");
+            return;
+        }
+
+        let (target, terminal) = {
+            let panes = self.ivars().panes.borrow();
+            let Some(active) = panes.active() else {
+                return;
+            };
+            (panes.active_id(), active.terminal.clone())
+        };
+        #[cfg(unix)]
+        let cwd = terminal.foreground_cwd();
+        #[cfg(not(unix))]
+        let cwd: Option<String> = None;
+        let daemon_socket = terminal.daemon_socket();
+        let remote_name = terminal.remote_name();
+        let mut launch_context = match terminal.pane_launch_context() {
+            Ok(context) => context,
+            Err(()) => {
+                log::warn!(
+                    "Cannot split an attached session whose process/SSH launch context is unknown"
+                );
+                self.show_split_context_error();
+                return;
+            }
+        };
+        if terminal.is_remote_daemon_pane() {
+            // Paths and default argv belong to the remote host. Preserve the
+            // portable environment/TERM/native-SSH fields, but let ctermd
+            // choose its own default shell for an ordinary remote split.
+            launch_context.shell = None;
+            launch_context.args.clear();
+        }
+        let terminal_frame: NSRect = unsafe { msg_send![&*terminal, frame] };
         let (cell_width, cell_height) = terminal.cell_size();
-        self.setContentResizeIncrements(NSSize::new(cell_width, cell_height));
-        *self.ivars().active_terminal.borrow_mut() = Some(terminal);
+        let config = self.ivars().config.clone();
+        let theme = self.ivars().theme.clone();
+        let mut opts = cterm_client::CreateSessionOpts {
+            cols: (terminal_frame.size.width / cell_width).floor().max(1.0) as u32,
+            rows: (terminal_frame.size.height / cell_height).floor().max(1.0) as u32,
+            pixel_width: terminal_frame.size.width.round().max(1.0) as u32,
+            pixel_height: terminal_frame.size.height.round().max(1.0) as u32,
+            cwd,
+            ..Default::default()
+        };
+        launch_context.apply_to(&mut opts);
+        opts.base_palette = Some(terminal_palette(&theme, None));
+        opts.frontend_state.appearance = theme.appearance();
+        let window = unsafe {
+            Retained::retain(self as *const _ as *mut CtermWindow)
+                .expect("a live pane window can be retained")
+        };
+        let window = dispatch2::MainThreadBound::new(window, MainThreadMarker::from(self));
+
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| cterm_client::ClientError::Connection(error.to_string()))
+                .and_then(|runtime| {
+                    runtime.block_on(async {
+                        let connection = if let Some(ref path) = daemon_socket {
+                            cterm_client::DaemonConnection::connect_unix(path, false).await?
+                        } else {
+                            cterm_client::DaemonConnection::connect_local().await?
+                        };
+                        connection.create_session(opts).await
+                    })
+                });
+
+            dispatch2::Queue::main().exec_async(move || {
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                let window = window.into_inner(mtm);
+                match result {
+                    Ok(session) => {
+                        if window.ivars().closed.get()
+                            || window.ivars().panes.borrow().get(target).is_none()
+                        {
+                            destroy_unattached_session(session);
+                            return;
+                        }
+                        let terminal = TerminalView::from_daemon(mtm, &config, &theme, session);
+                        terminal.set_pane_launch_context(launch_context);
+                        terminal.set_remote_name(remote_name);
+                        window.attach_split_terminal(target, direction, terminal);
+                    }
+                    Err(error) => log::error!("Failed to create pane session: {error}"),
+                }
+            });
+        });
+    }
+
+    fn attach_split_terminal(
+        &self,
+        target: PaneId,
+        direction: SplitDirection,
+        terminal: Retained<TerminalView>,
+    ) {
+        let visibility = if self
+            .occlusionState()
+            .contains(NSWindowOcclusionState::Visible)
+        {
+            cterm_core::WindowVisibility::Visible
+        } else {
+            cterm_core::WindowVisibility::Hidden
+        };
+        terminal.set_window_visibility(visibility);
+        let frame = PaneFrameView::new(
+            MainThreadMarker::from(self),
+            terminal.clone(),
+            &self.ivars().theme,
+        );
+        let entry = NativePane {
+            terminal,
+            frame: frame.clone(),
+        };
+        let request = SplitRequest {
+            direction,
+            placement: SplitPlacement::Second,
+            ratio: SplitRatio::HALF,
+        };
+        match self
+            .ivars()
+            .panes
+            .borrow_mut()
+            .split(target, request, entry)
+        {
+            Ok(pane_id) => {
+                log::info!("Split pane {:?}: pane {}", direction, pane_id);
+                self.add_pane_frame(&frame);
+                self.layout_panes();
+                self.sync_active_terminal(true);
+            }
+            Err((error, entry)) => {
+                log::warn!("Discarding pane whose split target disappeared: {error}");
+                entry.terminal.destroy_session();
+            }
+        }
+    }
+
+    fn close_active_pane(&self) {
+        let (count, active) = {
+            let panes = self.ivars().panes.borrow();
+            (
+                panes.len(),
+                panes.active().map(|entry| entry.terminal.clone()),
+            )
+        };
+        if count <= 1 {
+            self.performClose(None);
+            return;
+        }
+        let Some(active) = active else {
+            return;
+        };
+        if self.ivars().config.general.confirm_close_with_running {
+            let target = self.ivars().panes.borrow().active_id();
+            self.begin_close_check(CloseTarget::Pane(target), vec![active]);
+            return;
+        }
+        let target = self.ivars().panes.borrow().active_id();
+        self.remove_pane(target);
+    }
+
+    fn close_exited_pane(&self, terminal: &TerminalView) {
+        let Some(target) = self.pane_id_for_terminal(terminal) else {
+            return;
+        };
+        if self.ivars().panes.borrow().len() <= 1 {
+            self.performClose(None);
+        } else {
+            self.remove_pane(target);
+        }
+    }
+
+    fn remove_pane(&self, target: PaneId) {
+        match self.ivars().panes.borrow_mut().close(target) {
+            Ok(entry) => {
+                log::info!("Closed pane {}", target);
+                entry.terminal.removeFromSuperview();
+                entry.frame.removeFromSuperview();
+                self.layout_panes();
+                self.sync_active_terminal(true);
+            }
+            Err(PaneLayoutError::LastPane) => self.performClose(None),
+            Err(error) => log::warn!("Could not close pane: {error}"),
+        }
+    }
+
+    fn cleanup_all_panes(&self) {
+        self.ivars().pane_drag.borrow_mut().take();
+        *self.ivars().active_terminal.borrow_mut() = None;
+        let entries = self.ivars().panes.borrow_mut().drain().collect::<Vec<_>>();
+        for entry in entries {
+            entry.terminal.removeFromSuperview();
+            entry.frame.removeFromSuperview();
+        }
     }
 
     pub fn new(mtm: MainThreadMarker, config: &Config, theme: &Theme) -> Retained<Self> {
@@ -447,7 +1106,12 @@ impl CtermWindow {
         let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         opts.frontend_state.appearance = theme.appearance();
-        let window_ptr = self as *const Self as usize;
+        let launch_context = PaneLaunchContext::capture(&opts);
+        let window = unsafe {
+            Retained::retain(self as *const _ as *mut CtermWindow)
+                .expect("a live terminal window can be retained")
+        };
+        let window = dispatch2::MainThreadBound::new(window, MainThreadMarker::from(self));
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -471,11 +1135,19 @@ impl CtermWindow {
                 Ok(session) => {
                     dispatch2::Queue::main().exec_async(move || {
                         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-                        let window: &CtermWindow = unsafe { &*(window_ptr as *const CtermWindow) };
+                        let window = window.into_inner(mtm);
+                        if window.ivars().closed.get() {
+                            destroy_unattached_session(session);
+                            return;
+                        }
                         let terminal_view =
                             TerminalView::from_daemon(mtm, &config, &theme, session);
+                        terminal_view.set_pane_launch_context(launch_context);
                         if let Some(ref bg) = background_color {
                             terminal_view.set_background_override(Some(bg));
+                        }
+                        if title_locked {
+                            terminal_view.set_current_title(window.title().to_string());
                         }
                         terminal_view.set_title_locked(title_locked);
                         window.attach_terminal_view(terminal_view);
@@ -560,6 +1232,104 @@ impl CtermWindow {
         this
     }
 
+    /// Restore every live daemon session and split owned by one native tab.
+    pub fn from_daemon_panes(
+        mtm: MainThreadMarker,
+        config: &Config,
+        theme: &Theme,
+        tab_state: &TabUpgradeState,
+        layout: PaneLayout,
+        reconnected: Vec<cterm_app::daemon_reconnect::ReconnectedSession>,
+    ) -> Option<Retained<Self>> {
+        let pane_ids = layout.pane_ids();
+        if pane_ids.is_empty()
+            || pane_ids.len() != tab_state.panes.len()
+            || pane_ids.len() != reconnected.len()
+        {
+            log::error!(
+                "Cannot restore pane tab '{}': layout={}, records={}, sessions={}",
+                tab_state.title,
+                pane_ids.len(),
+                tab_state.panes.len(),
+                reconnected.len()
+            );
+            return None;
+        }
+
+        let active_index = pane_ids
+            .iter()
+            .position(|id| *id == layout.active())
+            .unwrap_or(0);
+        let active_title = tab_state.panes[active_index].title.as_str();
+        let title = if active_title.is_empty() {
+            tab_state.title.as_str()
+        } else {
+            active_title
+        };
+        let this = Self::init_window(mtm, config, theme, title, tab_state.color.clone());
+        *this.ivars().panes.borrow_mut() = PaneRegistry::from_layout(layout);
+
+        let mut frames = Vec::with_capacity(pane_ids.len());
+        for ((pane_id, pane_state), recon) in pane_ids
+            .into_iter()
+            .zip(tab_state.panes.iter())
+            .zip(reconnected)
+        {
+            let fallback_title = if !recon.custom_title.is_empty() {
+                recon.custom_title.clone()
+            } else if !recon.title.is_empty() {
+                recon.title.clone()
+            } else {
+                "Terminal".to_string()
+            };
+            let pane_title = if pane_state.title.is_empty() {
+                fallback_title
+            } else {
+                pane_state.title.clone()
+            };
+            let terminal = TerminalView::from_daemon_with_screen(mtm, config, theme, recon);
+            terminal.set_current_title(pane_title);
+            terminal.set_title_locked(pane_state.title_locked);
+            terminal.set_template_name(pane_state.template_name.clone());
+            terminal.set_keep_open(pane_state.keep_open);
+            terminal.set_remote_name(pane_state.remote_name.clone());
+            let launch_context = pane_state.launch_context.clone().or_else(|| {
+                pane_state
+                    .template_name
+                    .as_deref()
+                    .and_then(|name| configured_template_launch_context(config, name))
+            });
+            if let Some(launch_context) = launch_context {
+                terminal.set_pane_launch_context(launch_context);
+            }
+
+            let frame = PaneFrameView::new(mtm, terminal.clone(), theme);
+            let entry = NativePane {
+                terminal,
+                frame: frame.clone(),
+            };
+            if this
+                .ivars()
+                .panes
+                .borrow_mut()
+                .insert_restored(pane_id, entry)
+                .is_err()
+            {
+                log::error!("Serialized pane layout contains inconsistent pane IDs");
+                this.cleanup_all_panes();
+                return None;
+            }
+            frames.push(frame);
+        }
+
+        for frame in frames {
+            this.add_pane_frame(&frame);
+        }
+        this.layout_panes();
+        this.sync_active_terminal(true);
+        Some(this)
+    }
+
     /// Create a new tab connected to a daemon session (using native macOS window tabbing)
     pub fn create_daemon_tab(&self, session: cterm_client::SessionHandle) {
         let mtm = MainThreadMarker::from(self);
@@ -631,9 +1401,13 @@ impl CtermWindow {
         let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         opts.frontend_state.appearance = theme.appearance();
-        // SAFETY: self is MainThreadOnly, we use the raw pointer only inside
-        // dispatch2::Queue::main().exec_async() which runs on the main thread
-        let window_ptr = self as *const Self as usize;
+        let launch_context = PaneLaunchContext::capture(&opts);
+        let remote_name = remote.as_ref().map(|(_, name, _, _)| name.clone());
+        let window = unsafe {
+            Retained::retain(self as *const _ as *mut CtermWindow)
+                .expect("a live tab owner can be retained")
+        };
+        let window = dispatch2::MainThreadBound::new(window, MainThreadMarker::from(self));
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -659,7 +1433,11 @@ impl CtermWindow {
                 Ok(session) => {
                     dispatch2::Queue::main().exec_async(move || {
                         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-                        let window: &CtermWindow = unsafe { &*(window_ptr as *const CtermWindow) };
+                        let window = window.into_inner(mtm);
+                        if window.ivars().closed.get() {
+                            destroy_unattached_session(session);
+                            return;
+                        }
 
                         let title = template_name
                             .clone()
@@ -670,7 +1448,11 @@ impl CtermWindow {
 
                         // Store template name and apply background color on the terminal view
                         if let Some(tv) = new_window.active_terminal() {
+                            tv.set_pane_launch_context(launch_context);
+                            tv.set_remote_name(remote_name);
                             if let Some(ref name) = template_name {
+                                tv.set_current_title(title.clone());
+                                tv.set_title_locked(true);
                                 tv.set_template_name(Some(name.clone()));
                                 tv.set_template_name_on_daemon(name);
                             }
@@ -726,6 +1508,184 @@ impl CtermWindow {
     /// Get a reference to the active terminal view
     pub fn active_terminal(&self) -> Option<Retained<TerminalView>> {
         self.ivars().active_terminal.borrow().clone()
+    }
+
+    /// Return all terminal views in deterministic pane order.
+    pub fn terminal_views(&self) -> Vec<Retained<TerminalView>> {
+        let panes = self.ivars().panes.borrow();
+        panes
+            .layout()
+            .pane_ids()
+            .into_iter()
+            .filter_map(|id| panes.get(id).map(|entry| entry.terminal.clone()))
+            .collect()
+    }
+
+    /// Keep daemon sessions alive when this frontend hands them to a new process.
+    pub fn preserve_panes_for_upgrade(&self) {
+        let completions = self
+            .terminal_views()
+            .iter()
+            .filter_map(|terminal| terminal.prepare_session_for_handoff())
+            .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for completion in completions {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match completion.recv_timeout(remaining) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::warn!("Daemon detach before upgrade failed: {error}"),
+                Err(error) => log::warn!("Timed out detaching daemon pane before upgrade: {error}"),
+            }
+        }
+    }
+
+    /// Collect the complete split topology and its sessions in layout preorder.
+    pub fn pane_upgrade_state(&self) -> Option<(PaneLayout, Vec<PaneUpgradeState>)> {
+        let panes = self.ivars().panes.borrow();
+        if panes.is_empty() {
+            return None;
+        }
+        let layout = panes.layout().clone();
+        let records = layout
+            .pane_ids()
+            .into_iter()
+            .map(|pane_id| {
+                let terminal = &panes
+                    .get(pane_id)
+                    .expect("pane resources mirror the pane layout")
+                    .terminal;
+                let mut state = PaneUpgradeState::new(terminal.session_id());
+                state.title = terminal.current_title();
+                state.title_locked = terminal.is_title_locked();
+                state.template_name = terminal.template_name();
+                state.cwd = terminal.foreground_cwd();
+                state.keep_open = terminal.keep_open();
+                state.daemon_socket = terminal.daemon_socket();
+                state.remote_name = terminal.remote_name();
+                state.launch_context = terminal.pane_launch_context().ok();
+                state
+            })
+            .collect();
+        Some((layout, records))
+    }
+
+    fn begin_close_check(&self, target: CloseTarget, terminals: Vec<Retained<TerminalView>>) {
+        if self.ivars().close_query_in_progress.replace(true) {
+            return;
+        }
+
+        let mut running = Vec::new();
+        let mut daemon_queries = Vec::new();
+        for terminal in terminals {
+            if let Some(session_id) = terminal.session_id() {
+                daemon_queries.push(DaemonProcessQuery {
+                    session_id,
+                    daemon_socket: terminal.daemon_socket(),
+                    title: terminal.current_title(),
+                });
+                continue;
+            }
+            #[cfg(unix)]
+            if terminal.has_foreground_process() {
+                running.push(
+                    terminal
+                        .foreground_process_name()
+                        .unwrap_or_else(|| "a process".to_string()),
+                );
+            }
+        }
+
+        let window = unsafe {
+            Retained::retain(self as *const _ as *mut CtermWindow)
+                .expect("a live close-check window can be retained")
+        };
+        let window = dispatch2::MainThreadBound::new(window, MainThreadMarker::from(self));
+        std::thread::spawn(move || {
+            if !daemon_queries.is_empty() {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(async {
+                        for query in daemon_queries {
+                            let connection = if let Some(path) = query.daemon_socket.as_ref() {
+                                cterm_client::DaemonConnection::connect_unix(path, false).await
+                            } else {
+                                cterm_client::DaemonConnection::connect_local().await
+                            };
+                            let info = match connection {
+                                Ok(connection) => connection.get_session(&query.session_id).await,
+                                Err(error) => {
+                                    log::warn!(
+                                        "Could not query pane '{}' before close: {error}",
+                                        query.title
+                                    );
+                                    running.push(format!(
+                                        "{} (process status unavailable)",
+                                        query.title
+                                    ));
+                                    continue;
+                                }
+                            };
+                            match info {
+                                Ok(info) if info.has_foreground_process => {
+                                    running.push(if info.foreground_process_name.is_empty() {
+                                        "a process".to_string()
+                                    } else {
+                                        info.foreground_process_name
+                                    })
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    log::warn!(
+                                        "Could not query pane '{}' before close: {error}",
+                                        query.title
+                                    );
+                                    running.push(format!(
+                                        "{} (process status unavailable)",
+                                        query.title
+                                    ));
+                                }
+                            }
+                        }
+                    }),
+                    Err(error) => {
+                        log::warn!("Could not create close-query runtime: {error}");
+                        running.extend(
+                            daemon_queries.into_iter().map(|query| {
+                                format!("{} (process status unavailable)", query.title)
+                            }),
+                        );
+                    }
+                }
+            }
+
+            dispatch2::Queue::main().exec_async(move || {
+                let mtm = unsafe { MainThreadMarker::new_unchecked() };
+                let window = window.into_inner(mtm);
+                window.finish_close_check(target, running);
+            });
+        });
+    }
+
+    fn finish_close_check(&self, target: CloseTarget, running: Vec<String>) {
+        self.ivars().close_query_in_progress.set(false);
+        if self.ivars().closed.get()
+            || (!running.is_empty() && !self.show_close_confirmation(&running))
+        {
+            return;
+        }
+        match target {
+            CloseTarget::Window => {
+                self.ivars().close_approved.set(true);
+                self.performClose(None);
+            }
+            CloseTarget::Pane(pane_id) => {
+                if self.ivars().panes.borrow().get(pane_id).is_some() {
+                    self.remove_pane(pane_id);
+                }
+            }
+        }
     }
 
     /// Set the bell state for this window and update dock badge
@@ -1045,16 +2005,18 @@ impl CtermWindow {
     }
 
     /// Show a confirmation dialog when closing with a running process
-    fn show_close_confirmation(&self, process_name: &str) -> bool {
+    fn show_close_confirmation(&self, process_names: &[String]) -> bool {
         use objc2_app_kit::NSAlert;
 
         let mtm = MainThreadMarker::from(self);
         let alert = NSAlert::new(mtm);
 
-        alert.setMessageText(&NSString::from_str(&format!(
-            "\"{}\" is still running",
-            process_name
-        )));
+        let message = if process_names.len() == 1 {
+            format!("\"{}\" is still running", process_names[0])
+        } else {
+            format!("{} processes are still running", process_names.len())
+        };
+        alert.setMessageText(&NSString::from_str(&message));
         alert.setInformativeText(&NSString::from_str(
             "Closing this terminal will terminate the running process. Are you sure you want to close?",
         ));
@@ -1065,6 +2027,18 @@ impl CtermWindow {
 
         let response = alert.runModal();
         response == NSAlertFirstButtonReturn
+    }
+
+    fn show_split_context_error(&self) {
+        use objc2_app_kit::NSAlert;
+
+        let alert = NSAlert::new(MainThreadMarker::from(self));
+        alert.setMessageText(&NSString::from_str("Cannot Split This Session"));
+        alert.setInformativeText(&NSString::from_str(
+            "cterm cannot safely reconstruct the local or SSH launch context of this attached session. Open a new tab instead; the existing session was left unchanged.",
+        ));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        alert.runModal();
     }
 
     // Window positioning methods

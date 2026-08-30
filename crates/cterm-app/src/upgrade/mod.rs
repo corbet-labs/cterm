@@ -13,5 +13,8 @@ mod state;
 mod updater;
 
 pub use protocol::{execute_upgrade, receive_upgrade, UpgradeError};
-pub use state::{TabUpgradeState, UpgradeState, WindowUpgradeState};
+pub use state::{
+    PaneLaunchContext, PaneUpgradeState, PortForwardLaunchState, SshLaunchState, TabUpgradeState,
+    UpgradeState, WindowUpgradeState,
+};
 pub use updater::{UpdateError, UpdateInfo, Updater};

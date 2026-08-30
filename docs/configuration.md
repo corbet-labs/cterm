@@ -78,6 +78,24 @@ close_tab = "Ctrl+Shift+W"
 next_tab = "Ctrl+Tab"
 prev_tab = "Ctrl+Shift+Tab"
 
+# Pane management
+# "horizontal" divides the width into left/right panes; "vertical" divides
+# the height into top/bottom panes.
+split_pane_horizontal = "Ctrl+Shift+Backslash"
+split_pane_vertical = "Ctrl+Shift+Minus"
+close_pane = "Ctrl+Shift+Delete"
+toggle_pane_zoom = "Ctrl+Shift+Enter"
+
+# Pane focus and divider movement
+focus_pane_left = "Ctrl+Alt+Left"
+focus_pane_right = "Ctrl+Alt+Right"
+focus_pane_up = "Ctrl+Alt+Up"
+focus_pane_down = "Ctrl+Alt+Down"
+resize_pane_left = "Ctrl+Alt+Shift+Left"
+resize_pane_right = "Ctrl+Alt+Shift+Right"
+resize_pane_up = "Ctrl+Alt+Shift+Up"
+resize_pane_down = "Ctrl+Alt+Shift+Down"
+
 # Clipboard
 copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
@@ -199,12 +217,13 @@ Shortcuts are specified as a combination of modifiers and a key:
 - Letters: `A` through `Z`
 - Numbers: `0` through `9`
 - Function keys: `F1` through `F12`
-- Special keys: `Tab`, `Return`, `Escape`, `Space`, `BackSpace`, `Delete`, `Insert`, `Home`, `End`, `Page_Up`, `Page_Down`
-- Symbols: `plus`, `minus`, `equal`, `bracketleft`, `bracketright`, etc.
+- Special keys: `Tab`, `Enter`, `Escape`, `Space`, `Backspace`, `Delete`, `Insert`, `Home`, `End`, `PageUp`, `PageDown`, and the arrow names
+- Symbols: `Plus`, `Minus`, `Equals`, `Backslash`, `BracketLeft`, `BracketRight`, and their literal characters
 
 **Examples:**
 ```toml
 new_tab = "Ctrl+Shift+T"
 zoom_in = "Ctrl+plus"
 find = "Ctrl+Shift+F"
+focus_pane_left = "Ctrl+Alt+Left"
 ```

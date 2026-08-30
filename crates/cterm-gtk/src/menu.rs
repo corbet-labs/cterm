@@ -101,6 +101,45 @@ pub fn create_menu_model_with_options(
 
     terminal_menu.append(Some("Reset"), Some("win.reset"));
     terminal_menu.append(Some("Clear Scrollback && Reset"), Some("win.clear-reset"));
+
+    if !managed {
+        let pane_menu = gio::Menu::new();
+        pane_menu.append_item(&menu_item(
+            "Split Horizontally",
+            "win.split-pane-horizontal",
+            Some("<Ctrl><Shift>backslash"),
+        ));
+        pane_menu.append_item(&menu_item(
+            "Split Vertically",
+            "win.split-pane-vertical",
+            Some("<Ctrl><Shift>minus"),
+        ));
+        pane_menu.append_item(&menu_item(
+            "Close Pane",
+            "win.close-pane",
+            Some("<Ctrl><Shift>Delete"),
+        ));
+        pane_menu.append_item(&menu_item(
+            "Toggle Zoom",
+            "win.toggle-pane-zoom",
+            Some("<Ctrl><Shift>Return"),
+        ));
+
+        let focus_menu = gio::Menu::new();
+        focus_menu.append(Some("Left"), Some("win.focus-pane-left"));
+        focus_menu.append(Some("Right"), Some("win.focus-pane-right"));
+        focus_menu.append(Some("Up"), Some("win.focus-pane-up"));
+        focus_menu.append(Some("Down"), Some("win.focus-pane-down"));
+        pane_menu.append_submenu(Some("Focus"), &focus_menu);
+
+        let resize_menu = gio::Menu::new();
+        resize_menu.append(Some("Left"), Some("win.resize-pane-left"));
+        resize_menu.append(Some("Right"), Some("win.resize-pane-right"));
+        resize_menu.append(Some("Up"), Some("win.resize-pane-up"));
+        resize_menu.append(Some("Down"), Some("win.resize-pane-down"));
+        pane_menu.append_submenu(Some("Resize"), &resize_menu);
+        terminal_menu.append_submenu(Some("Panes"), &pane_menu);
+    }
     menu.append_submenu(Some("Terminal"), &terminal_menu);
 
     // Tools menu

@@ -84,6 +84,46 @@ send_key() {
     esac
 }
 
+send_pane_shortcut() {
+    local key_code="$1"
+    local modifiers="$2"
+
+    case "$modifiers" in
+        "ctrl+shift")
+            osascript -e "tell application \"System Events\" to key code $key_code using {control down, shift down}"
+            ;;
+        "ctrl+option")
+            osascript -e "tell application \"System Events\" to key code $key_code using {control down, option down}"
+            ;;
+        "ctrl+option+shift")
+            osascript -e "tell application \"System Events\" to key code $key_code using {control down, option down, shift down}"
+            ;;
+        *)
+            log "ERROR: Unsupported pane shortcut modifiers: $modifiers"
+            exit 1
+            ;;
+    esac
+}
+
+wait_for_cterm_log() {
+    local pattern="$1"
+    local description="$2"
+
+    for _attempt in $(seq 1 40); do
+        if [ -f "$CTERM_LOG_FILE" ] && grep -Eq "$pattern" "$CTERM_LOG_FILE"; then
+            log "$description"
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    log "ERROR: Timed out waiting for cterm log pattern: $pattern"
+    if [ -f "$CTERM_LOG_FILE" ]; then
+        tail -100 "$CTERM_LOG_FILE" | while IFS= read -r line; do log "  $line"; done
+    fi
+    exit 1
+}
+
 log "=== cterm UI Automation Test (macOS) ==="
 log "Executable: $CTERM_PATH"
 log "Output: $OUTPUT_DIR"
@@ -217,6 +257,37 @@ sleep 1
 
 # Take screenshot showing tabs
 take_screenshot "05_new_tab"
+
+# Exercise the native AppKit pane host. Key codes avoid keyboard-layout
+# ambiguity on the hosted runner (42=backslash, 27=minus, 126=up,
+# 125=down, 36=return, 117=forward delete).
+log "Testing native horizontal pane split..."
+send_pane_shortcut 42 "ctrl+shift"
+wait_for_cterm_log 'Split pane Horizontal' "Horizontal pane split succeeded"
+
+log "Testing native vertical pane split..."
+send_pane_shortcut 27 "ctrl+shift"
+wait_for_cterm_log 'Split pane Vertical' "Vertical pane split succeeded"
+take_screenshot "06_split_panes"
+
+log "Testing directional pane focus..."
+send_pane_shortcut 126 "ctrl+option"
+wait_for_cterm_log 'Focused pane .*Up' "Directional pane focus succeeded"
+
+log "Testing pane divider resize..."
+send_pane_shortcut 125 "ctrl+option+shift"
+wait_for_cterm_log 'Resized pane .*Down' "Pane divider resize succeeded"
+
+log "Testing pane zoom and unzoom..."
+send_pane_shortcut 36 "ctrl+shift"
+wait_for_cterm_log 'Pane zoom true' "Pane zoom succeeded"
+send_pane_shortcut 36 "ctrl+shift"
+wait_for_cterm_log 'Pane zoom false' "Pane unzoom succeeded"
+
+log "Testing pane close..."
+send_pane_shortcut 117 "ctrl+shift"
+wait_for_cterm_log 'Closed pane' "Pane close succeeded"
+take_screenshot "07_closed_pane"
 
 # Close the window
 log "Closing window..."

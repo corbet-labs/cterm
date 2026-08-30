@@ -44,6 +44,18 @@ pub enum MenuAction {
     SendSignalKill = 3007,
     SendSignalHup = 3008,
     SendSignalTerm = 3009,
+    SplitPaneHorizontal = 3101,
+    SplitPaneVertical = 3102,
+    ClosePane = 3103,
+    FocusPaneLeft = 3111,
+    FocusPaneRight = 3112,
+    FocusPaneUp = 3113,
+    FocusPaneDown = 3114,
+    ResizePaneLeft = 3121,
+    ResizePaneRight = 3122,
+    ResizePaneUp = 3123,
+    ResizePaneDown = 3124,
+    TogglePaneZoom = 3131,
 
     // Tabs menu
     PrevTab = 4001,
@@ -106,6 +118,18 @@ impl MenuAction {
             3007 => Some(Self::SendSignalKill),
             3008 => Some(Self::SendSignalHup),
             3009 => Some(Self::SendSignalTerm),
+            3101 => Some(Self::SplitPaneHorizontal),
+            3102 => Some(Self::SplitPaneVertical),
+            3103 => Some(Self::ClosePane),
+            3111 => Some(Self::FocusPaneLeft),
+            3112 => Some(Self::FocusPaneRight),
+            3113 => Some(Self::FocusPaneUp),
+            3114 => Some(Self::FocusPaneDown),
+            3121 => Some(Self::ResizePaneLeft),
+            3122 => Some(Self::ResizePaneRight),
+            3123 => Some(Self::ResizePaneUp),
+            3124 => Some(Self::ResizePaneDown),
+            3131 => Some(Self::TogglePaneZoom),
             4001 => Some(Self::PrevTab),
             4002 => Some(Self::NextTab),
             4003 => Some(Self::NextAlertedTab),
@@ -211,6 +235,42 @@ pub fn create_menu_bar(show_debug: bool, updates_enabled: bool, managed: bool) -
         append_menu_item(terminal_menu, MenuAction::SetTitle, "Set &Title...");
         append_menu_item(terminal_menu, MenuAction::SetColor, "Set &Color...");
         append_separator(terminal_menu);
+        if !managed {
+            let pane_menu = CreatePopupMenu();
+            append_menu_item(
+                pane_menu,
+                MenuAction::SplitPaneHorizontal,
+                "Split &Left/Right\tCtrl+Shift+\\",
+            );
+            append_menu_item(
+                pane_menu,
+                MenuAction::SplitPaneVertical,
+                "Split &Top/Bottom\tCtrl+Shift+-",
+            );
+            append_menu_item(
+                pane_menu,
+                MenuAction::ClosePane,
+                "&Close Pane\tCtrl+Shift+Delete",
+            );
+            append_separator(pane_menu);
+            append_menu_item(pane_menu, MenuAction::FocusPaneLeft, "Focus &Left");
+            append_menu_item(pane_menu, MenuAction::FocusPaneRight, "Focus &Right");
+            append_menu_item(pane_menu, MenuAction::FocusPaneUp, "Focus &Up");
+            append_menu_item(pane_menu, MenuAction::FocusPaneDown, "Focus &Down");
+            append_separator(pane_menu);
+            append_menu_item(pane_menu, MenuAction::ResizePaneLeft, "Resize Left");
+            append_menu_item(pane_menu, MenuAction::ResizePaneRight, "Resize Right");
+            append_menu_item(pane_menu, MenuAction::ResizePaneUp, "Resize Up");
+            append_menu_item(pane_menu, MenuAction::ResizePaneDown, "Resize Down");
+            append_separator(pane_menu);
+            append_menu_item(
+                pane_menu,
+                MenuAction::TogglePaneZoom,
+                "Toggle Pane &Zoom\tCtrl+Shift+Enter",
+            );
+            append_popup_menu(terminal_menu, pane_menu, "&Panes");
+            append_separator(terminal_menu);
+        }
         append_menu_item(terminal_menu, MenuAction::Find, "&Find...\tCtrl+Shift+F");
         append_separator(terminal_menu);
 
@@ -464,6 +524,26 @@ mod tests {
     fn test_menu_action_roundtrip() {
         let action = MenuAction::NewTab;
         assert_eq!(MenuAction::from_id(action.id()), Some(action));
+    }
+
+    #[test]
+    fn pane_menu_actions_roundtrip() {
+        for action in [
+            MenuAction::SplitPaneHorizontal,
+            MenuAction::SplitPaneVertical,
+            MenuAction::ClosePane,
+            MenuAction::FocusPaneLeft,
+            MenuAction::FocusPaneRight,
+            MenuAction::FocusPaneUp,
+            MenuAction::FocusPaneDown,
+            MenuAction::ResizePaneLeft,
+            MenuAction::ResizePaneRight,
+            MenuAction::ResizePaneUp,
+            MenuAction::ResizePaneDown,
+            MenuAction::TogglePaneZoom,
+        ] {
+            assert_eq!(MenuAction::from_id(action.id()), Some(action));
+        }
     }
 
     #[test]

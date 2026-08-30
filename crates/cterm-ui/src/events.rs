@@ -4,6 +4,8 @@
 
 use bitflags::bitflags;
 
+use crate::pane::{PaneDirection, SplitDirection};
+
 bitflags! {
     /// Keyboard modifiers
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
@@ -335,6 +337,13 @@ pub enum Action {
     PrevTab,
     NextAlertedTab,
     Tab(u8), // Tab 1-9
+
+    // Pane actions
+    SplitPane(SplitDirection),
+    ClosePane,
+    FocusPane(PaneDirection),
+    ResizePane(PaneDirection),
+    TogglePaneZoom,
 
     // Window actions
     NewWindow,

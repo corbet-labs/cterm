@@ -9,16 +9,29 @@ is omitted for readability.
 
 ## [Unreleased]
 
+### Added
+- Native split panes on AppKit, GTK4/Wayland, and Win32/Direct2D, including
+  draggable dividers, directional focus and resize, pane zoom, and configurable
+  shortcuts. New panes inherit the active pane's exact process or SSH launch
+  context and its working directory where the target daemon can honor one;
+  native SSH keeps the same target while the remote login shell selects its
+  initial directory.
+
 ### Changed
 - Establish FSL-1.1-ALv2 as cterm's product license, with Apache-2.0 becoming
   available automatically after two years per version. Source inherited from
   KarpelesLab/cterm and Rio/Sugarloaf retains its MIT grants and notices.
+- Seamless-upgrade state now preserves each tab's complete split topology and
+  every pane session instead of only the active terminal.
 
 ### Fixed
 - OSC 10/11/12 color queries now receive theme-accurate replies from the
   attached frontend. Dynamic foreground, background, and cursor colors support
   foot-compatible XParseColor forms, reset through OSC 110/111/112, render on
   every desktop backend, and survive daemon reconnection.
+- Restoring pane snapshots no longer leaks daemon attachment counts, and
+  independent windows connected to the same SSH host no longer overwrite or
+  tear down each other's tunnel registry entries.
 
 ## [0.0.19] - 2026-07-09
 

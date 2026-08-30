@@ -62,6 +62,11 @@ pub fn create_menu_bar(
     // View menu
     menu_bar.addItem(&create_view_menu(mtm));
 
+    // Pane menu
+    if !managed {
+        menu_bar.addItem(&create_pane_menu(mtm));
+    }
+
     // Terminal menu
     menu_bar.addItem(&create_terminal_menu(mtm));
 
@@ -425,6 +430,61 @@ fn create_view_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
         Some(sel!(toggleFullScreen:)),
         "f",
         NSEventModifierFlags::Command.union(NSEventModifierFlags::Control),
+    ));
+
+    let menu_item = NSMenuItem::new(mtm);
+    menu_item.setSubmenu(Some(&menu));
+    menu_item
+}
+
+fn create_pane_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+    let menu = NSMenu::new(mtm);
+    menu.setTitle(&NSString::from_str("Pane"));
+
+    menu.addItem(&create_menu_item(
+        mtm,
+        "Split Right",
+        Some(sel!(splitPaneHorizontal:)),
+        "",
+    ));
+    menu.addItem(&create_menu_item(
+        mtm,
+        "Split Down",
+        Some(sel!(splitPaneVertical:)),
+        "",
+    ));
+    menu.addItem(&create_menu_item(
+        mtm,
+        "Close Pane",
+        Some(sel!(closePane:)),
+        "",
+    ));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    for (title, action) in [
+        ("Focus Left", sel!(focusPaneLeft:)),
+        ("Focus Right", sel!(focusPaneRight:)),
+        ("Focus Up", sel!(focusPaneUp:)),
+        ("Focus Down", sel!(focusPaneDown:)),
+    ] {
+        menu.addItem(&create_menu_item(mtm, title, Some(action), ""));
+    }
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    for (title, action) in [
+        ("Resize Left", sel!(resizePaneLeft:)),
+        ("Resize Right", sel!(resizePaneRight:)),
+        ("Resize Up", sel!(resizePaneUp:)),
+        ("Resize Down", sel!(resizePaneDown:)),
+    ] {
+        menu.addItem(&create_menu_item(mtm, title, Some(action), ""));
+    }
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&create_menu_item(
+        mtm,
+        "Toggle Pane Zoom",
+        Some(sel!(togglePaneZoom:)),
+        "",
     ));
 
     let menu_item = NSMenuItem::new(mtm);

@@ -20,6 +20,23 @@ function Log {
     "$timestamp - $Message" | Tee-Object -FilePath $LogFile -Append
 }
 
+function Wait-ForCtermLog {
+    param(
+        [string]$Pattern,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ((Test-Path $env:CTERM_LOG_FILE) -and
+            (Select-String -Path $env:CTERM_LOG_FILE -Pattern $Pattern -Quiet)) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Timed out waiting for cterm log pattern: $Pattern"
+}
+
 function Take-Screenshot {
     param(
         [string]$Name,
@@ -185,6 +202,7 @@ Log "Window found: $hwnd"
 # Bring window to foreground
 [User32]::SetForegroundWindow($hwnd) | Out-Null
 Start-Sleep -Seconds 1
+Wait-ForCtermLog -Pattern "Pane source .* attached to daemon session"
 
 # Take initial screenshot
 Take-Screenshot -Name "01_startup" -Hwnd $hwnd
@@ -235,6 +253,38 @@ Start-Sleep -Seconds 1
 
 # Take screenshot showing tabs
 Take-Screenshot -Name "05_new_tab" -Hwnd $hwnd
+
+# Pane commands are verified through semantic log markers; the screenshot is
+# retained as a visual artifact but is not the pass/fail oracle.
+Log "Testing Ctrl+Shift+Backslash (horizontal split)..."
+[System.Windows.Forms.SendKeys]::SendWait("^+\")
+Wait-ForCtermLog -Pattern "Split tab .*Horizontal"
+Take-Screenshot -Name "06_split_pane" -Hwnd $hwnd
+
+Log "Testing Ctrl+Shift+Minus (vertical split)..."
+[System.Windows.Forms.SendKeys]::SendWait("^+-")
+Wait-ForCtermLog -Pattern "Split tab .*Vertical"
+
+Log "Testing Ctrl+Alt+Up (directional pane focus)..."
+[System.Windows.Forms.SendKeys]::SendWait("^%{UP}")
+Wait-ForCtermLog -Pattern "Focused pane .*Up"
+
+Log "Testing Ctrl+Alt+Shift+Left (pane resize)..."
+[System.Windows.Forms.SendKeys]::SendWait("^%+{LEFT}")
+Wait-ForCtermLog -Pattern "Resized pane .*Left"
+
+Log "Testing Ctrl+Shift+Enter (pane zoom)..."
+[System.Windows.Forms.SendKeys]::SendWait("^+{ENTER}")
+Wait-ForCtermLog -Pattern "Pane zoom true"
+
+Log "Testing Ctrl+Shift+Enter (unzoom)..."
+[System.Windows.Forms.SendKeys]::SendWait("^+{ENTER}")
+Wait-ForCtermLog -Pattern "Pane zoom false"
+
+Log "Testing Ctrl+Shift+Delete (close pane)..."
+[System.Windows.Forms.SendKeys]::SendWait("^+{DELETE}")
+Wait-ForCtermLog -Pattern "Closed pane"
+Take-Screenshot -Name "07_closed_pane" -Hwnd $hwnd
 
 # Close the window
 Log "Closing window..."

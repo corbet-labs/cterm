@@ -1423,8 +1423,10 @@ impl TerminalWidget {
         drawing_area.set_vexpand(true);
         drawing_area.set_hexpand(true);
 
-        let min_width = (cell_dims.width * 80.0).ceil() as i32;
-        let min_height = (cell_dims.height * 24.0).ceil() as i32;
+        // Keep enough space for a usable split without forcing every pane to
+        // retain the initial 80x24 window size.
+        let min_width = (cell_dims.width * 8.0).ceil() as i32;
+        let min_height = (cell_dims.height * 3.0).ceil() as i32;
         drawing_area.set_size_request(min_width, min_height);
 
         // Capture session ID before session is consumed
@@ -1483,6 +1485,7 @@ impl TerminalWidget {
                 appearance: theme.appearance(),
                 ..Default::default()
             },
+            false,
         );
         widget.setup_daemon_resize(cmd_tx);
 
@@ -1509,8 +1512,8 @@ impl TerminalWidget {
         drawing_area.set_vexpand(true);
         drawing_area.set_hexpand(true);
 
-        let min_width = (cell_dims.width * 80.0).ceil() as i32;
-        let min_height = (cell_dims.height * 24.0).ceil() as i32;
+        let min_width = (cell_dims.width * 8.0).ceil() as i32;
+        let min_height = (cell_dims.height * 3.0).ceil() as i32;
         drawing_area.set_size_request(min_width, min_height);
 
         // Create a Terminal with no PTY
@@ -1574,6 +1577,7 @@ impl TerminalWidget {
                 appearance: theme.appearance(),
                 ..Default::default()
             },
+            true,
         );
         widget.setup_daemon_resize(cmd_tx);
 
@@ -1595,6 +1599,7 @@ impl TerminalWidget {
         daemon_socket: Option<std::path::PathBuf>,
         base_palette: ColorPalette,
         frontend_state: cterm_core::FrontendState,
+        release_snapshot_attachment: bool,
     ) {
         let drawing_area = self.drawing_area.clone();
 
@@ -1636,6 +1641,18 @@ impl TerminalWidget {
                         return;
                     }
                 };
+
+                // `from_daemon_with_screen` arrived with one attachment used
+                // only to fetch the initial snapshot. The reader attachment is
+                // now live, so balance that temporary count without dropping
+                // the stream we are about to use.
+                if release_snapshot_attachment {
+                    if let Err(error) = session.detach().await {
+                        log::warn!(
+                            "Failed to release snapshot attachment for {session_id}: {error}"
+                        );
+                    }
+                }
 
                 if let Err(error) = session.set_base_palette(&base_palette).await {
                     log::warn!("Failed to synchronize frontend palette with daemon: {error}");

@@ -23,6 +23,90 @@ use cterm_app::config::{
 };
 use cterm_app::{git_sync, PullResult};
 
+#[derive(Clone, Copy)]
+enum PaneShortcutField {
+    SplitHorizontal,
+    SplitVertical,
+    Close,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    ToggleZoom,
+}
+
+impl PaneShortcutField {
+    const ALL: [Self; 12] = [
+        Self::SplitHorizontal,
+        Self::SplitVertical,
+        Self::Close,
+        Self::FocusLeft,
+        Self::FocusRight,
+        Self::FocusUp,
+        Self::FocusDown,
+        Self::ResizeLeft,
+        Self::ResizeRight,
+        Self::ResizeUp,
+        Self::ResizeDown,
+        Self::ToggleZoom,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SplitHorizontal => "Split right:",
+            Self::SplitVertical => "Split down:",
+            Self::Close => "Close pane:",
+            Self::FocusLeft => "Focus left:",
+            Self::FocusRight => "Focus right:",
+            Self::FocusUp => "Focus up:",
+            Self::FocusDown => "Focus down:",
+            Self::ResizeLeft => "Resize left:",
+            Self::ResizeRight => "Resize right:",
+            Self::ResizeUp => "Resize up:",
+            Self::ResizeDown => "Resize down:",
+            Self::ToggleZoom => "Toggle zoom:",
+        }
+    }
+
+    fn value(self, shortcuts: &cterm_app::config::ShortcutsConfig) -> &str {
+        match self {
+            Self::SplitHorizontal => &shortcuts.split_pane_horizontal,
+            Self::SplitVertical => &shortcuts.split_pane_vertical,
+            Self::Close => &shortcuts.close_pane,
+            Self::FocusLeft => &shortcuts.focus_pane_left,
+            Self::FocusRight => &shortcuts.focus_pane_right,
+            Self::FocusUp => &shortcuts.focus_pane_up,
+            Self::FocusDown => &shortcuts.focus_pane_down,
+            Self::ResizeLeft => &shortcuts.resize_pane_left,
+            Self::ResizeRight => &shortcuts.resize_pane_right,
+            Self::ResizeUp => &shortcuts.resize_pane_up,
+            Self::ResizeDown => &shortcuts.resize_pane_down,
+            Self::ToggleZoom => &shortcuts.toggle_pane_zoom,
+        }
+    }
+
+    fn set(self, shortcuts: &mut cterm_app::config::ShortcutsConfig, value: String) {
+        match self {
+            Self::SplitHorizontal => shortcuts.split_pane_horizontal = value,
+            Self::SplitVertical => shortcuts.split_pane_vertical = value,
+            Self::Close => shortcuts.close_pane = value,
+            Self::FocusLeft => shortcuts.focus_pane_left = value,
+            Self::FocusRight => shortcuts.focus_pane_right = value,
+            Self::FocusUp => shortcuts.focus_pane_up = value,
+            Self::FocusDown => shortcuts.focus_pane_down = value,
+            Self::ResizeLeft => shortcuts.resize_pane_left = value,
+            Self::ResizeRight => shortcuts.resize_pane_right = value,
+            Self::ResizeUp => shortcuts.resize_pane_up = value,
+            Self::ResizeDown => shortcuts.resize_pane_down = value,
+            Self::ToggleZoom => shortcuts.toggle_pane_zoom = value,
+        }
+    }
+}
+
 /// Format a Unix timestamp as a human-readable relative time
 fn format_timestamp(ts: i64) -> String {
     let now = SystemTime::now()
@@ -70,6 +154,7 @@ pub struct PreferencesWindowIvars {
     tab_position_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     new_tab_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     show_close_checkbox: RefCell<Option<Retained<NSButton>>>,
+    pane_shortcut_fields: RefCell<Vec<(PaneShortcutField, Retained<NSTextField>)>>,
     // Tools tab controls
     tool_entries_stack: RefCell<Option<Retained<NSStackView>>>,
     tool_entries: RefCell<
@@ -161,7 +246,7 @@ impl PreferencesWindow {
         config: &Config,
         on_save: impl Fn(Config) + 'static,
     ) -> Retained<Self> {
-        let content_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(500.0, 400.0));
+        let content_rect = NSRect::new(NSPoint::new(200.0, 120.0), NSSize::new(560.0, 620.0));
 
         let style_mask = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
@@ -186,6 +271,7 @@ impl PreferencesWindow {
             tab_position_popup: RefCell::new(None),
             new_tab_popup: RefCell::new(None),
             show_close_checkbox: RefCell::new(None),
+            pane_shortcut_fields: RefCell::new(Vec::new()),
             tool_entries_stack: RefCell::new(None),
             tool_entries: RefCell::new(Vec::new()),
             git_remote_field: RefCell::new(None),
@@ -239,6 +325,9 @@ impl PreferencesWindow {
 
         let tabs_tab = self.create_tabs_tab(mtm, config);
         tab_view.addTabViewItem(&tabs_tab);
+
+        let pane_shortcuts_tab = self.create_pane_shortcuts_tab(mtm, config);
+        tab_view.addTabViewItem(&pane_shortcuts_tab);
 
         let tools_tab = self.create_tools_tab(mtm);
         tab_view.addTabViewItem(&tools_tab);
@@ -588,6 +677,41 @@ impl PreferencesWindow {
         unsafe {
             stack.addArrangedSubview(&close_checkbox);
         }
+
+        tab.setView(Some(&stack));
+        tab
+    }
+
+    fn create_pane_shortcuts_tab(
+        &self,
+        mtm: MainThreadMarker,
+        config: &Config,
+    ) -> Retained<NSTabViewItem> {
+        let tab = NSTabViewItem::new();
+        tab.setLabel(&NSString::from_str("Pane Shortcuts"));
+
+        let stack = NSStackView::new(mtm);
+        stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Vertical);
+        stack.setAlignment(objc2_app_kit::NSLayoutAttribute::Leading);
+        stack.setSpacing(8.0);
+        stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
+            top: 16.0,
+            left: 16.0,
+            bottom: 16.0,
+            right: 16.0,
+        });
+
+        let mut fields = self.ivars().pane_shortcut_fields.borrow_mut();
+        for shortcut in PaneShortcutField::ALL {
+            let row = self.create_label_field_row(
+                mtm,
+                shortcut.label(),
+                shortcut.value(&config.shortcuts),
+            );
+            fields.push((shortcut, row.1.clone()));
+            stack.addArrangedSubview(&row.0);
+        }
+        drop(fields);
 
         tab.setView(Some(&stack));
         tab
@@ -1250,6 +1374,10 @@ impl PreferencesWindow {
         }
         if let Some(ref checkbox) = *self.ivars().show_close_checkbox.borrow() {
             config.tabs.show_close_button = checkbox.state() == 1;
+        }
+
+        for (shortcut, field) in self.ivars().pane_shortcut_fields.borrow().iter() {
+            shortcut.set(&mut config.shortcuts, field.stringValue().to_string());
         }
 
         // Save config to file
