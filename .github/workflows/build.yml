@@ -184,6 +184,74 @@ jobs:
           run: |
             cargo test -p cterm-core -p cterm-ui --lib
 
+  compatibility-linux:
+    name: Compatibility (foot + real TUIs)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: [format, lint-linux]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies and reference applications
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            foot \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libpango1.0-dev \
+            libcairo2-dev \
+            libglib2.0-dev \
+            neovim \
+            protobuf-compiler \
+            tmux \
+            weston
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run real TUI sessions through cterm
+        run: cargo test -p cterm-core --test tui_e2e -- --ignored --test-threads=1
+
+      - name: Build cterm, ctermd, and differential probe
+        run: |
+          cargo build -p cterm -p cterm-headless
+          cargo build -p cterm-core --example foot_compat_probe
+
+      - name: Compare cterm behavior with foot
+        run: |
+          OUTPUT_DIR="${{ runner.temp }}/cterm_compat_test"
+          mkdir -p "$OUTPUT_DIR"
+          chmod +x scripts/foot_compat_test.sh
+          export XDG_RUNTIME_DIR="${{ runner.temp }}/cterm-compat-xdg-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          unset DISPLAY
+          weston \
+            --backend=headless-backend.so \
+            --socket=cterm-compat-ci \
+            --idle-time=0 \
+            --log="$OUTPUT_DIR/weston.log" &
+          WESTON_PID=$!
+          trap 'kill "$WESTON_PID" 2>/dev/null || true' EXIT
+          export WAYLAND_DISPLAY=cterm-compat-ci
+          ./scripts/foot_compat_test.sh \
+            target/debug/cterm \
+            target/debug/ctermd \
+            target/debug/examples/foot_compat_probe \
+            "$OUTPUT_DIR"
+
+      - name: Upload compatibility artifacts
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: linux-compatibility-results
+          path: ${{ runner.temp }}/cterm_compat_test/
+          if-no-files-found: ignore
+
   test-macos:
     name: Test (macOS)
     runs-on: macos-latest
@@ -230,7 +298,7 @@ jobs:
   build-linux:
     name: Build Linux (Ubuntu 22.04)
     runs-on: ubuntu-22.04
-    needs: test-linux
+    needs: [test-linux, compatibility-linux]
     steps:
       - uses: actions/checkout@v7
 
@@ -310,7 +378,7 @@ jobs:
   build-linux-arm64:
     name: Build Linux (ARM64)
     runs-on: ubuntu-22.04-arm
-    needs: test-linux
+    needs: [test-linux, compatibility-linux]
     steps:
       - uses: actions/checkout@v7
 
