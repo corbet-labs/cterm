@@ -511,31 +511,12 @@ mod unix {
             // Close the master FD in child
             libc::close(master_fd);
 
-            // Create a new session
-            if libc::setsid() < 0 {
+            // Create a session, install the controlling terminal, duplicate it
+            // onto all three standard streams, and close the original slave FD.
+            // The platform implementation handles the BSD-specific session setup
+            // details that a hand-rolled setsid/TIOCSCTTY sequence misses.
+            if libc::login_tty(slave_fd) < 0 {
                 libc::_exit(1);
-            }
-
-            // Set the slave as the controlling terminal
-            // Cast needed: TIOCSCTTY type differs between Linux and macOS
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
-                libc::_exit(1);
-            }
-
-            // Duplicate slave to stdin/stdout/stderr
-            if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
-                libc::_exit(1);
-            }
-            if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
-                libc::_exit(1);
-            }
-            if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
-                libc::_exit(1);
-            }
-
-            // Close the original slave FD if it's not one of the standard FDs
-            if slave_fd > libc::STDERR_FILENO {
-                libc::close(slave_fd);
             }
 
             // Close all other inherited file descriptors (PTY masters from other
@@ -1402,7 +1383,10 @@ mod tests {
                 ..Default::default()
             },
             shell: Some("/bin/sh".to_string()),
-            args: vec!["-c".to_string(), "echo hello".to_string()],
+            args: vec![
+                "-c".to_string(),
+                "test -t 0 && test -t 1 && test -t 2 && echo hello".to_string(),
+            ],
             ..Default::default()
         };
 
