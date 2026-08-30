@@ -316,7 +316,16 @@ where
     std::thread::spawn(move || {
         let result = (|| {
             let updater = Updater::new(CTERM_GITHUB_REPOSITORY, CURRENT_VERSION)?;
-            updater.download(&info, on_progress)
+            let archive_path = updater.download(&info, on_progress)?;
+            updater.verify(&archive_path, &info)?;
+            let binary_path = Updater::prepare_linux_update(&archive_path)?;
+            if let Err(error) = std::fs::remove_file(&archive_path) {
+                log::warn!(
+                    "Failed to remove downloaded update archive {}: {error}",
+                    archive_path.display()
+                );
+            }
+            Ok(binary_path)
         })();
         let _ = tx.send(result);
     });
