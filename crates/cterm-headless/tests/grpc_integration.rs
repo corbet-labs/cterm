@@ -580,6 +580,73 @@ async fn test_write_input_and_get_screen() {
         .await;
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn test_stream_input_reaches_conpty() {
+    let server = CtermdServer::spawn();
+    let mut client = connect(&server.address()).await;
+
+    let create_response = client
+        .create_session(CreateSessionRequest {
+            cols: 80,
+            rows: 24,
+            shell: Some("cmd.exe".to_string()),
+            args: vec!["/Q".to_string()],
+            cwd: None,
+            env: Default::default(),
+            term: Some("xterm".to_string()),
+            ssh: None,
+            pixel_width: 640,
+            pixel_height: 384,
+            base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
+        })
+        .await
+        .expect("create_session failed");
+
+    let session_id = create_response.get_ref().session_id.clone();
+    let marker = "cterm_windows_stream_input";
+    let input = tokio_stream::iter([WriteInputRequest {
+        session_id: session_id.clone(),
+        data: format!("echo {marker}\r").into_bytes(),
+    }]);
+    let response = client
+        .stream_input(input)
+        .await
+        .expect("stream_input failed");
+    assert!(response.get_ref().total_bytes_written > 0);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let screen_text = loop {
+        let response = client
+            .get_screen_text(GetScreenTextRequest {
+                session_id: session_id.clone(),
+                include_scrollback: false,
+                start_row: None,
+                end_row: None,
+            })
+            .await
+            .expect("get_screen_text failed");
+        let text = response.get_ref().lines.join("\n");
+        if text.contains(marker) || tokio::time::Instant::now() >= deadline {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        screen_text.contains(marker),
+        "streamed input did not reach ConPTY; screen was: {screen_text:?}"
+    );
+
+    let _ = client
+        .destroy_session(DestroySessionRequest {
+            session_id,
+            signal: None,
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn test_resize() {
     let server = CtermdServer::spawn();

@@ -441,6 +441,11 @@ mod unix {
             }
         }
 
+        /// Try to clone the bidirectional PTY master for dedicated writes.
+        pub fn try_clone_writer(&self) -> io::Result<File> {
+            self.try_clone_reader()
+        }
+
         /// Internal: Create PTY and spawn child process
         unsafe fn create_pty_and_spawn(config: &PtyConfig) -> Result<Self, PtyError> {
             // Open a new PTY pair
@@ -847,6 +852,11 @@ mod windows {
         /// Try to clone the reader for concurrent access
         pub fn try_clone_reader(&self) -> io::Result<File> {
             self.read_pipe.try_clone()
+        }
+
+        /// Try to clone the ConPTY input pipe for dedicated writes.
+        pub fn try_clone_writer(&self) -> io::Result<File> {
+            self.write_pipe.try_clone()
         }
 
         unsafe fn create_conpty(config: &PtyConfig) -> Result<Self, PtyError> {
@@ -1275,13 +1285,12 @@ impl Pty {
 
     /// Clone an independent blocking writer over the PTY input, for local PTYs.
     ///
-    /// A duplicated local PTY master fd is bidirectional, so the returned `File` can
-    /// be written to from a dedicated thread without holding any terminal lock. SSH
-    /// backends have no local fd, so this returns `None` and their writes go through
-    /// the regular (under-lock) path.
+    /// Unix duplicates the bidirectional PTY master; Windows duplicates ConPTY's
+    /// dedicated input pipe. SSH backends have no local writer handle, so this
+    /// returns `None` and their writes go through the regular (under-lock) path.
     pub fn try_clone_writer(&self) -> Option<File> {
         match &self.backend {
-            Backend::Local(p) => p.try_clone_reader().ok(),
+            Backend::Local(p) => p.try_clone_writer().ok(),
             Backend::Ssh(_) => None,
         }
     }
