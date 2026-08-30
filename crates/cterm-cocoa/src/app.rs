@@ -1171,7 +1171,7 @@ impl AppDelegate {
                 };
                 let (handle, screen) = connection.attach_session(session_id, 80, 24).await?;
                 handle.detach().await?;
-                Ok((handle, screen))
+                Ok::<_, cterm_client::ClientError>((handle, screen))
             })
             .map_err(|error| format!("failed to reconnect session {session_id}: {error}"))?;
 
