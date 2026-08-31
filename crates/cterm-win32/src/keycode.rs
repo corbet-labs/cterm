@@ -143,6 +143,12 @@ pub fn get_modifiers() -> Modifiers {
         {
             mods.insert(Modifiers::SUPER);
         }
+        if winapi::um::winuser::GetKeyState(winuser::VK_CAPITAL) & 1 != 0 {
+            mods.insert(Modifiers::CAPS_LOCK);
+        }
+        if winapi::um::winuser::GetKeyState(winuser::VK_NUMLOCK) & 1 != 0 {
+            mods.insert(Modifiers::NUM_LOCK);
+        }
     }
 
     mods

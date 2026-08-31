@@ -358,7 +358,8 @@ message Key {
   oneof key_type {
     string char = 1;        // Single character
     SpecialKey special = 2;  // Special key
-    uint32 function = 3;     // F1-F12 (1-12)
+    uint32 function = 3;     // F1-F35 (1-35)
+    uint32 kitty_named = 4;  // Kitty private-use functional-key code
   }
 }
 
@@ -401,6 +402,10 @@ message Modifiers {
   bool ctrl = 2;
   bool alt = 3;
   bool super = 4;
+  bool hyper = 5;
+  bool meta = 6;
+  bool caps_lock = 7;
+  bool num_lock = 8;
 }
 
 // ============================================================================

@@ -1,7 +1,7 @@
 //! Key conversion between proto and cterm-core
 
 use crate::proto;
-use cterm_core::term::{Key, Modifiers};
+use cterm_core::term::{Key, Modifiers, NamedKey};
 
 /// Convert proto Key to cterm_core Key
 pub fn proto_to_key(key: &proto::Key) -> Option<Key> {
@@ -47,12 +47,13 @@ pub fn proto_to_key(key: &proto::Key) -> Option<Key> {
             }
         }
         Some(KeyType::Function(n)) => {
-            if *n >= 1 && *n <= 12 {
+            if *n >= 1 && *n <= 35 {
                 Some(Key::F(*n as u8))
             } else {
                 None
             }
         }
+        Some(KeyType::KittyNamed(code)) => NamedKey::from_kitty_code(*code).map(Key::Named),
         None => None,
     }
 }
@@ -71,6 +72,18 @@ pub fn proto_to_modifiers(modifiers: &proto::Modifiers) -> Modifiers {
     }
     if modifiers.super_ {
         result |= Modifiers::SUPER;
+    }
+    if modifiers.hyper {
+        result |= Modifiers::HYPER;
+    }
+    if modifiers.meta {
+        result |= Modifiers::META;
+    }
+    if modifiers.caps_lock {
+        result |= Modifiers::CAPS_LOCK;
+    }
+    if modifiers.num_lock {
+        result |= Modifiers::NUM_LOCK;
     }
     result
 }
@@ -119,6 +132,7 @@ pub fn key_to_proto(key: Key) -> proto::Key {
         Key::NumpadSubtract => Some(KeyType::Special(SpecialKey::NumpadSubtract as i32)),
         Key::NumpadAdd => Some(KeyType::Special(SpecialKey::NumpadAdd as i32)),
         Key::NumpadEnter => Some(KeyType::Special(SpecialKey::NumpadEnter as i32)),
+        Key::Named(named) => Some(KeyType::KittyNamed(named.kitty_code())),
     };
 
     proto::Key { key_type }
@@ -131,6 +145,10 @@ pub fn modifiers_to_proto(modifiers: Modifiers) -> proto::Modifiers {
         ctrl: modifiers.contains(Modifiers::CTRL),
         alt: modifiers.contains(Modifiers::ALT),
         super_: modifiers.contains(Modifiers::SUPER),
+        hyper: modifiers.contains(Modifiers::HYPER),
+        meta: modifiers.contains(Modifiers::META),
+        caps_lock: modifiers.contains(Modifiers::CAPS_LOCK),
+        num_lock: modifiers.contains(Modifiers::NUM_LOCK),
     }
 }
 
@@ -173,9 +191,22 @@ mod tests {
 
     #[test]
     fn test_modifiers_roundtrip() {
-        let mods = Modifiers::SHIFT | Modifiers::CTRL;
+        let mods = Modifiers::SHIFT
+            | Modifiers::CTRL
+            | Modifiers::HYPER
+            | Modifiers::META
+            | Modifiers::CAPS_LOCK
+            | Modifiers::NUM_LOCK;
         let proto = modifiers_to_proto(mods);
         let back = proto_to_modifiers(&proto);
         assert_eq!(back, mods);
+    }
+
+    #[test]
+    fn test_kitty_named_and_extended_function_roundtrip() {
+        for key in [Key::Named(NamedKey::MediaPlay), Key::F(35)] {
+            let proto = key_to_proto(key);
+            assert_eq!(proto_to_key(&proto), Some(key));
+        }
     }
 }

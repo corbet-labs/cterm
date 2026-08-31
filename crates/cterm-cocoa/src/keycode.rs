@@ -22,6 +22,9 @@ pub fn modifiers_from_event(event: &NSEvent) -> Modifiers {
     if flags.contains(NSEventModifierFlags::Command) {
         modifiers.insert(Modifiers::SUPER);
     }
+    if flags.contains(NSEventModifierFlags::CapsLock) {
+        modifiers.insert(Modifiers::CAPS_LOCK);
+    }
 
     modifiers
 }

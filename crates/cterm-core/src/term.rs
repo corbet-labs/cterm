@@ -9,7 +9,7 @@ use crate::screen::{
     ClipboardOperation, ColorQuery, DesktopNotificationAction, FrontendState, Screen, ScreenConfig,
     SearchResult,
 };
-use crate::{KeyEventKind, KeyboardEnhancementFlags};
+use crate::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
 use std::time::{Duration, Instant};
 
 const APPLICATION_SYNC_UPDATE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -526,6 +526,17 @@ impl Terminal {
         modifiers: Modifiers,
         kind: KeyEventKind,
     ) -> Option<Vec<u8>> {
+        self.handle_key_event_with_metadata(key, modifiers, kind, KeyEventMetadata::default())
+    }
+
+    /// Handle a physical key event together with native layout and text data.
+    pub fn handle_key_event_with_metadata(
+        &self,
+        key: Key,
+        modifiers: Modifiers,
+        kind: KeyEventKind,
+        metadata: KeyEventMetadata<'_>,
+    ) -> Option<Vec<u8>> {
         let flags = self.screen.keyboard_enhancement_flags();
         let report_events = flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
         let report_all = flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
@@ -539,9 +550,15 @@ impl Terminal {
         match key {
             Key::Char(c) => {
                 let needs_escape = report_all
-                    || modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER);
+                    || modifiers.intersects(
+                        Modifiers::CTRL
+                            | Modifiers::ALT
+                            | Modifiers::SUPER
+                            | Modifiers::HYPER
+                            | Modifiers::META,
+                    );
                 if disambiguate && needs_escape {
-                    Some(csi_u_key(c as u32, modifiers, kind, report_events))
+                    Some(csi_u_key(c as u32, modifiers, kind, flags, metadata))
                 } else if kind == KeyEventKind::Release {
                     None
                 } else if let Some(sequence) =
@@ -560,7 +577,7 @@ impl Terminal {
                         Key::Backspace => 127,
                         _ => unreachable!(),
                     };
-                    Some(csi_u_key(codepoint, modifiers, kind, report_events))
+                    Some(csi_u_key(codepoint, modifiers, kind, flags, metadata))
                 } else if kind == KeyEventKind::Release {
                     None
                 } else {
@@ -569,7 +586,7 @@ impl Terminal {
             }
             Key::Escape => {
                 if disambiguate || report_events {
-                    Some(csi_u_key(27, modifiers, kind, report_events))
+                    Some(csi_u_key(27, modifiers, kind, flags, metadata))
                 } else if kind == KeyEventKind::Release {
                     None
                 } else {
@@ -632,6 +649,13 @@ impl Terminal {
                 .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
             Key::Delete => enhanced_tilde_key(3, modifiers, kind, report_events)
                 .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
+            Key::F(n @ 13..=35) => Some(csi_u_key(
+                57363 + u32::from(n),
+                modifiers,
+                kind,
+                flags,
+                metadata,
+            )),
             Key::F(n) => enhanced_function_key(n, modifiers, kind, report_events)
                 .or_else(|| self.handle_non_release_legacy(key, modifiers, kind)),
             Key::NumpadDigit(_)
@@ -643,18 +667,59 @@ impl Terminal {
             | Key::NumpadEnter => {
                 if disambiguate || report_events {
                     kitty_numpad_code(key)
-                        .map(|code| csi_u_key(code, modifiers, kind, report_events))
+                        .map(|code| csi_u_key(code, modifiers, kind, flags, metadata))
                 } else {
                     self.handle_non_release_legacy(key, modifiers, kind)
                 }
             }
+            Key::Named(named) => {
+                if named.is_modifier() && !report_all {
+                    None
+                } else {
+                    Some(csi_u_key(
+                        named.kitty_code(),
+                        modifiers,
+                        kind,
+                        flags,
+                        metadata,
+                    ))
+                }
+            }
         }
+    }
+
+    /// Encode text delivered without a reliable physical-key identity.
+    ///
+    /// IME and dead-key APIs can produce such commits. In all-key mode the
+    /// physical event has already been reported, so raw text is suppressed;
+    /// associated-text mode uses Kitty key number zero for the commit.
+    pub fn handle_text_input(&self, text: &str) -> Vec<u8> {
+        let flags = self.screen.keyboard_enhancement_flags();
+        if !flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES) {
+            return text.as_bytes().to_vec();
+        }
+        if !flags.contains(KeyboardEnhancementFlags::REPORT_ASSOCIATED_TEXT) {
+            return Vec::new();
+        }
+
+        encode_pure_text_event(text).unwrap_or_default()
     }
 
     /// Encode the release paired with a key press that the UI already sent as
     /// an enhanced event. Release-time modifiers are authoritative, but a
     /// character remains a CSI-u event even if Ctrl/Alt was released first.
     pub fn handle_reported_key_release(&self, key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
+        self.handle_reported_key_release_with_metadata(key, modifiers, KeyEventMetadata::default())
+    }
+
+    /// Encode a release paired with a directly reported key press, retaining
+    /// any stable alternate layout identity captured on key-down.
+    pub fn handle_reported_key_release_with_metadata(
+        &self,
+        key: Key,
+        modifiers: Modifiers,
+        metadata: KeyEventMetadata<'_>,
+    ) -> Option<Vec<u8>> {
         let flags = self.screen.keyboard_enhancement_flags();
         if !flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES) {
             return None;
@@ -666,11 +731,17 @@ impl Terminal {
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
             );
             if disambiguate {
-                return Some(csi_u_key(c as u32, modifiers, KeyEventKind::Release, true));
+                return Some(csi_u_key(
+                    c as u32,
+                    modifiers,
+                    KeyEventKind::Release,
+                    flags,
+                    metadata,
+                ));
             }
         }
 
-        self.handle_key_event(key, modifiers, KeyEventKind::Release)
+        self.handle_key_event_with_metadata(key, modifiers, KeyEventKind::Release, metadata)
     }
 
     fn handle_non_release_legacy(
@@ -745,7 +816,10 @@ impl Terminal {
             Key::PageDown => Some(tilde_key(6, modifiers)),
             Key::Insert => Some(tilde_key(2, modifiers)),
             Key::Delete => Some(tilde_key(3, modifiers)),
-            Key::F(n) => Some(function_key(n, modifiers)),
+            Key::F(n) => {
+                let sequence = function_key(n, modifiers);
+                (!sequence.is_empty()).then_some(sequence)
+            }
             Key::NumpadDigit(digit) if digit <= 9 => {
                 let application_suffix = b'p' + digit;
                 let normal = b'0' + digit;
@@ -763,6 +837,13 @@ impl Terminal {
             Key::NumpadAdd => Some(keypad_key(b'k', b'+', modifiers, app_keypad)),
             Key::NumpadEnter => Some(keypad_key(b'M', b'\r', modifiers, app_keypad)),
             Key::NumpadDigit(_) => None,
+            Key::Named(named) => Some(csi_u_key(
+                named.kitty_code(),
+                modifiers,
+                KeyEventKind::Press,
+                KeyboardEnhancementFlags::empty(),
+                KeyEventMetadata::default(),
+            )),
         }
     }
 }
@@ -807,14 +888,63 @@ fn csi_u_key(
     codepoint: u32,
     modifiers: Modifiers,
     kind: KeyEventKind,
-    report_events: bool,
+    flags: KeyboardEnhancementFlags,
+    metadata: KeyEventMetadata<'_>,
 ) -> Vec<u8> {
-    let modifier = modifier_param(modifiers);
-    if report_events {
-        format!("\x1b[{codepoint};{modifier}:{}u", kind.protocol_value()).into_bytes()
-    } else {
-        format!("\x1b[{codepoint};{modifier}u").into_bytes()
+    let mut key_field = codepoint.to_string();
+    if flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS) {
+        let shifted_key = modifiers
+            .contains(Modifiers::SHIFT)
+            .then_some(metadata.shifted_key)
+            .flatten();
+        match (shifted_key, metadata.base_layout_key) {
+            (Some(shifted), Some(base)) => {
+                key_field.push_str(&format!(":{}:{}", shifted as u32, base as u32));
+            }
+            (Some(shifted), None) => {
+                key_field.push_str(&format!(":{}", shifted as u32));
+            }
+            (None, Some(base)) => {
+                key_field.push_str(&format!("::{}", base as u32));
+            }
+            (None, None) => {}
+        }
     }
+
+    let mut encoded = format!("\x1b[{key_field};{}", kitty_modifier_param(modifiers));
+    if flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES) {
+        encoded.push_str(&format!(":{}", kind.protocol_value()));
+    }
+
+    if kind != KeyEventKind::Release
+        && flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+        && flags.contains(KeyboardEnhancementFlags::REPORT_ASSOCIATED_TEXT)
+    {
+        if let Some(codepoints) = metadata.associated_text.and_then(encoded_text_codepoints) {
+            encoded.push(';');
+            encoded.push_str(&codepoints);
+        }
+    }
+    encoded.push('u');
+    encoded.into_bytes()
+}
+
+fn encode_pure_text_event(text: &str) -> Option<Vec<u8>> {
+    let codepoints = encoded_text_codepoints(text)?;
+    Some(format!("\x1b[0;;{codepoints}u").into_bytes())
+}
+
+fn encoded_text_codepoints(text: &str) -> Option<String> {
+    let codepoints = text
+        .chars()
+        .filter(|character| !is_c0_or_c1_control(*character))
+        .map(|character| u32::from(character).to_string())
+        .collect::<Vec<_>>();
+    (!codepoints.is_empty()).then(|| codepoints.join(":"))
+}
+
+fn is_c0_or_c1_control(character: char) -> bool {
+    matches!(u32::from(character), 0x00..=0x1f | 0x7f..=0x9f)
 }
 
 /// Encode xterm's unambiguous modified-character form. Level 1 preserves
@@ -858,7 +988,7 @@ fn enhanced_cursor_key(
     report_events: bool,
 ) -> Option<Vec<u8>> {
     enabled.then(|| {
-        let modifier = modifier_param(modifiers);
+        let modifier = kitty_modifier_param(modifiers);
         if !report_events {
             return if modifier == 1 {
                 vec![b'\x1b', b'[', key]
@@ -885,7 +1015,7 @@ fn enhanced_tilde_key(
     report_events.then(|| {
         format!(
             "\x1b[{code};{}:{}~",
-            modifier_param(modifiers),
+            kitty_modifier_param(modifiers),
             kind.protocol_value()
         )
         .into_bytes()
@@ -969,8 +1099,8 @@ fn function_key(n: u8, modifiers: Modifiers) -> Vec<u8> {
     }
 }
 
-fn modifier_param(modifiers: Modifiers) -> u8 {
-    let mut param = 1u8;
+fn modifier_param(modifiers: Modifiers) -> u16 {
+    let mut param = 1u16;
     if modifiers.contains(Modifiers::SHIFT) {
         param += 1;
     }
@@ -982,6 +1112,23 @@ fn modifier_param(modifiers: Modifiers) -> u8 {
     }
     if modifiers.contains(Modifiers::SUPER) {
         param += 8;
+    }
+    if modifiers.contains(Modifiers::HYPER) {
+        param += 16;
+    }
+    if modifiers.contains(Modifiers::META) {
+        param += 32;
+    }
+    param
+}
+
+fn kitty_modifier_param(modifiers: Modifiers) -> u16 {
+    let mut param = modifier_param(modifiers);
+    if modifiers.contains(Modifiers::CAPS_LOCK) {
+        param += 64;
+    }
+    if modifiers.contains(Modifiers::NUM_LOCK) {
+        param += 128;
     }
     param
 }
@@ -1012,6 +1159,184 @@ pub enum Key {
     NumpadSubtract,
     NumpadAdd,
     NumpadEnter,
+    /// Kitty functional keys without an older terminal encoding.
+    Named(NamedKey),
+}
+
+/// Named keys encoded with Kitty's Unicode private-use key numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedKey {
+    CapsLock,
+    ScrollLock,
+    NumLock,
+    PrintScreen,
+    Pause,
+    Menu,
+    NumpadEqual,
+    NumpadSeparator,
+    NumpadLeft,
+    NumpadRight,
+    NumpadUp,
+    NumpadDown,
+    NumpadPageUp,
+    NumpadPageDown,
+    NumpadHome,
+    NumpadEnd,
+    NumpadInsert,
+    NumpadDelete,
+    NumpadBegin,
+    MediaPlay,
+    MediaPause,
+    MediaPlayPause,
+    MediaReverse,
+    MediaStop,
+    MediaFastForward,
+    MediaRewind,
+    MediaTrackNext,
+    MediaTrackPrevious,
+    MediaRecord,
+    LowerVolume,
+    RaiseVolume,
+    MuteVolume,
+    LeftShift,
+    LeftControl,
+    LeftAlt,
+    LeftSuper,
+    LeftHyper,
+    LeftMeta,
+    RightShift,
+    RightControl,
+    RightAlt,
+    RightSuper,
+    RightHyper,
+    RightMeta,
+    IsoLevel3Shift,
+    IsoLevel5Shift,
+}
+
+impl NamedKey {
+    pub const fn is_modifier(self) -> bool {
+        matches!(
+            self,
+            Self::LeftShift
+                | Self::LeftControl
+                | Self::LeftAlt
+                | Self::LeftSuper
+                | Self::LeftHyper
+                | Self::LeftMeta
+                | Self::RightShift
+                | Self::RightControl
+                | Self::RightAlt
+                | Self::RightSuper
+                | Self::RightHyper
+                | Self::RightMeta
+                | Self::IsoLevel3Shift
+                | Self::IsoLevel5Shift
+        )
+    }
+
+    pub const fn kitty_code(self) -> u32 {
+        match self {
+            Self::CapsLock => 57358,
+            Self::ScrollLock => 57359,
+            Self::NumLock => 57360,
+            Self::PrintScreen => 57361,
+            Self::Pause => 57362,
+            Self::Menu => 57363,
+            Self::NumpadEqual => 57415,
+            Self::NumpadSeparator => 57416,
+            Self::NumpadLeft => 57417,
+            Self::NumpadRight => 57418,
+            Self::NumpadUp => 57419,
+            Self::NumpadDown => 57420,
+            Self::NumpadPageUp => 57421,
+            Self::NumpadPageDown => 57422,
+            Self::NumpadHome => 57423,
+            Self::NumpadEnd => 57424,
+            Self::NumpadInsert => 57425,
+            Self::NumpadDelete => 57426,
+            Self::NumpadBegin => 57427,
+            Self::MediaPlay => 57428,
+            Self::MediaPause => 57429,
+            Self::MediaPlayPause => 57430,
+            Self::MediaReverse => 57431,
+            Self::MediaStop => 57432,
+            Self::MediaFastForward => 57433,
+            Self::MediaRewind => 57434,
+            Self::MediaTrackNext => 57435,
+            Self::MediaTrackPrevious => 57436,
+            Self::MediaRecord => 57437,
+            Self::LowerVolume => 57438,
+            Self::RaiseVolume => 57439,
+            Self::MuteVolume => 57440,
+            Self::LeftShift => 57441,
+            Self::LeftControl => 57442,
+            Self::LeftAlt => 57443,
+            Self::LeftSuper => 57444,
+            Self::LeftHyper => 57445,
+            Self::LeftMeta => 57446,
+            Self::RightShift => 57447,
+            Self::RightControl => 57448,
+            Self::RightAlt => 57449,
+            Self::RightSuper => 57450,
+            Self::RightHyper => 57451,
+            Self::RightMeta => 57452,
+            Self::IsoLevel3Shift => 57453,
+            Self::IsoLevel5Shift => 57454,
+        }
+    }
+
+    pub const fn from_kitty_code(code: u32) -> Option<Self> {
+        Some(match code {
+            57358 => Self::CapsLock,
+            57359 => Self::ScrollLock,
+            57360 => Self::NumLock,
+            57361 => Self::PrintScreen,
+            57362 => Self::Pause,
+            57363 => Self::Menu,
+            57415 => Self::NumpadEqual,
+            57416 => Self::NumpadSeparator,
+            57417 => Self::NumpadLeft,
+            57418 => Self::NumpadRight,
+            57419 => Self::NumpadUp,
+            57420 => Self::NumpadDown,
+            57421 => Self::NumpadPageUp,
+            57422 => Self::NumpadPageDown,
+            57423 => Self::NumpadHome,
+            57424 => Self::NumpadEnd,
+            57425 => Self::NumpadInsert,
+            57426 => Self::NumpadDelete,
+            57427 => Self::NumpadBegin,
+            57428 => Self::MediaPlay,
+            57429 => Self::MediaPause,
+            57430 => Self::MediaPlayPause,
+            57431 => Self::MediaReverse,
+            57432 => Self::MediaStop,
+            57433 => Self::MediaFastForward,
+            57434 => Self::MediaRewind,
+            57435 => Self::MediaTrackNext,
+            57436 => Self::MediaTrackPrevious,
+            57437 => Self::MediaRecord,
+            57438 => Self::LowerVolume,
+            57439 => Self::RaiseVolume,
+            57440 => Self::MuteVolume,
+            57441 => Self::LeftShift,
+            57442 => Self::LeftControl,
+            57443 => Self::LeftAlt,
+            57444 => Self::LeftSuper,
+            57445 => Self::LeftHyper,
+            57446 => Self::LeftMeta,
+            57447 => Self::RightShift,
+            57448 => Self::RightControl,
+            57449 => Self::RightAlt,
+            57450 => Self::RightSuper,
+            57451 => Self::RightHyper,
+            57452 => Self::RightMeta,
+            57453 => Self::IsoLevel3Shift,
+            57454 => Self::IsoLevel5Shift,
+            _ => return None,
+        })
+    }
 }
 
 bitflags::bitflags! {
@@ -1022,6 +1347,10 @@ bitflags::bitflags! {
         const CTRL = 1 << 1;
         const ALT = 1 << 2;
         const SUPER = 1 << 3;
+        const HYPER = 1 << 4;
+        const META = 1 << 5;
+        const CAPS_LOCK = 1 << 6;
+        const NUM_LOCK = 1 << 7;
     }
 }
 
@@ -1415,17 +1744,97 @@ mod tests {
     }
 
     #[test]
-    fn kitty_keyboard_masks_unsupported_all_key_mode_and_separates_screens() {
+    fn kitty_keyboard_supports_all_key_mode_and_separates_screens() {
         let mut term = Terminal::new(80, 24, ScreenConfig::default());
 
         let (_, responses) = term.process_collecting(b"\x1b[>11u\x1b[?u");
-        assert_eq!(responses, [b"\x1b[?3u".to_vec()]);
+        assert_eq!(responses, [b"\x1b[?11u".to_vec()]);
 
         let (_, responses) = term.process_collecting(b"\x1b[?1049h\x1b[?u");
         assert_eq!(responses, [b"\x1b[?0u".to_vec()]);
 
         let (_, responses) = term.process_collecting(b"\x1b[>1u\x1b[?1049l\x1b[?u");
-        assert_eq!(responses, [b"\x1b[?3u".to_vec()]);
+        assert_eq!(responses, [b"\x1b[?11u".to_vec()]);
+    }
+
+    #[test]
+    fn kitty_keyboard_reports_alternate_keys_and_associated_text() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.process(b"\x1b[>31u");
+        let metadata = KeyEventMetadata::new()
+            .with_shifted_key(Some('+'))
+            .with_base_layout_key(Some('='))
+            .with_associated_text(Some("+"));
+
+        assert_eq!(
+            term.handle_key_event_with_metadata(
+                Key::Char('='),
+                Modifiers::SHIFT | Modifiers::CTRL,
+                KeyEventKind::Press,
+                metadata,
+            ),
+            Some(b"\x1b[61:43:61;6:1;43u".to_vec())
+        );
+        assert_eq!(
+            term.handle_reported_key_release_with_metadata(
+                Key::Char('='),
+                Modifiers::CTRL,
+                metadata,
+            ),
+            Some(b"\x1b[61::61;5:3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_encodes_identified_and_pure_text_without_controls() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.process(b"\x1b[>24u");
+
+        assert_eq!(
+            term.handle_key_event_with_metadata(
+                Key::Char('a'),
+                Modifiers::SHIFT,
+                KeyEventKind::Press,
+                KeyEventMetadata::new().with_associated_text(Some("A")),
+            ),
+            Some(b"\x1b[97;2;65u".to_vec())
+        );
+        assert_eq!(
+            term.handle_text_input("\u{e5}\u{65e5}\u{7}"),
+            b"\x1b[0;;229:26085u".to_vec()
+        );
+
+        term.process(b"\x1b[=8u");
+        assert!(term.handle_text_input("not duplicated").is_empty());
+    }
+
+    #[test]
+    fn kitty_keyboard_covers_extended_function_and_modifier_keys() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+        term.process(b"\x1b[>10u");
+
+        assert_eq!(
+            term.handle_key_event(
+                Key::Named(NamedKey::LeftControl),
+                Modifiers::CTRL,
+                KeyEventKind::Press,
+            ),
+            Some(b"\x1b[57442;5:1u".to_vec())
+        );
+        assert_eq!(
+            term.handle_key_event(
+                Key::F(35),
+                Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
+                KeyEventKind::Repeat,
+            ),
+            Some(b"\x1b[57398;193:2u".to_vec())
+        );
+
+        term.process(b"\x1b[=0u");
+        assert_eq!(
+            term.handle_key(Key::Named(NamedKey::LeftControl), Modifiers::CTRL),
+            None
+        );
     }
 
     #[test]

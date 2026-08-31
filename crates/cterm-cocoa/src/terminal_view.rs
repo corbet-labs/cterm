@@ -25,8 +25,8 @@ use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::upgrade::PaneLaunchContext;
 use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
-use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
-use cterm_core::{KeyEventKind, KeyboardEnhancementFlags, Terminal};
+use cterm_core::term::{Key, Modifiers as CoreModifiers, NamedKey, TerminalEvent};
+use cterm_core::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags, Terminal};
 use cterm_ui::theme::Theme;
 use cterm_ui::{Action, BlinkClock, BlinkNeeds, BlinkPhase, KeyCode, Modifiers};
 
@@ -72,6 +72,21 @@ fn key_event_kind(is_repeat: bool) -> KeyEventKind {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReportedKey {
+    key: Key,
+    shifted_key: Option<char>,
+    base_layout_key: Option<char>,
+}
+
+impl ReportedKey {
+    fn metadata(self) -> KeyEventMetadata<'static> {
+        KeyEventMetadata::new()
+            .with_shifted_key(self.shifted_key)
+            .with_base_layout_key(self.base_layout_key)
+    }
+}
+
 fn terminal_key_for_keycode(keycode: u16) -> Option<Key> {
     Some(match keycode {
         // Arrow keys
@@ -108,6 +123,7 @@ fn terminal_key_for_keycode(keycode: u16) -> Option<Key> {
         0x4E => Key::NumpadSubtract,
         0x45 => Key::NumpadAdd,
         0x4C => Key::NumpadEnter,
+        0x51 => Key::Named(NamedKey::NumpadEqual),
         // Function keys
         0x7A => Key::F(1),
         0x78 => Key::F(2),
@@ -121,6 +137,29 @@ fn terminal_key_for_keycode(keycode: u16) -> Option<Key> {
         0x6D => Key::F(10),
         0x67 => Key::F(11),
         0x6F => Key::F(12),
+        0x69 => Key::F(13),
+        0x6B => Key::F(14),
+        0x71 => Key::F(15),
+        0x6A => Key::F(16),
+        0x40 => Key::F(17),
+        0x4F => Key::F(18),
+        0x50 => Key::F(19),
+        0x5A => Key::F(20),
+        _ => return None,
+    })
+}
+
+fn modifier_key_for_keycode(keycode: u16) -> Option<(NamedKey, Modifiers)> {
+    Some(match keycode {
+        0x38 => (NamedKey::LeftShift, Modifiers::SHIFT),
+        0x3C => (NamedKey::RightShift, Modifiers::SHIFT),
+        0x3B => (NamedKey::LeftControl, Modifiers::CTRL),
+        0x3E => (NamedKey::RightControl, Modifiers::CTRL),
+        0x3A => (NamedKey::LeftAlt, Modifiers::ALT),
+        0x3D => (NamedKey::RightAlt, Modifiers::ALT),
+        0x37 => (NamedKey::LeftSuper, Modifiers::SUPER),
+        0x36 => (NamedKey::RightSuper, Modifiers::SUPER),
+        0x39 => (NamedKey::CapsLock, Modifiers::CAPS_LOCK),
         _ => return None,
     })
 }
@@ -254,7 +293,7 @@ pub struct TerminalViewIvars {
     /// Marked text for IME input (Japanese, Chinese, etc.)
     marked_text: RefCell<String>,
     /// Keys whose presses were sent directly to the terminal instead of Cocoa text input
-    reported_keys: RefCell<HashMap<u16, Key>>,
+    reported_keys: RefCell<HashMap<u16, ReportedKey>>,
     /// Notification bar for file transfers
     notification_bar: RefCell<Option<Retained<NotificationBar>>>,
     /// Pending file manager for file transfers
@@ -396,16 +435,27 @@ define_class!(
                 return;
             }
 
+            let keyboard_flags = self
+                .ivars()
+                .terminal
+                .lock()
+                .screen()
+                .keyboard_enhancement_flags();
+
             // Clear any stale press for a newly pressed physical key. Repeats retain the
             // original identity so keyUp can report the same key even if the layout changes.
             if kind == KeyEventKind::Press {
                 self.ivars().reported_keys.borrow_mut().remove(&raw_keycode);
             }
 
-            // Let Command+key combinations pass through to the menu system
-            // Command is never part of terminal sequences
-            if modifiers.contains(cterm_ui::events::Modifiers::SUPER) {
-                // Don't handle - let the responder chain process it for menu shortcuts
+            // AppKit menu equivalents and configured shortcuts have first refusal. An
+            // otherwise unclaimed Command combination is a Kitty Super combination.
+            if modifiers.contains(cterm_ui::events::Modifiers::SUPER)
+                && !keyboard_flags.intersects(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                )
+            {
                 return;
             }
 
@@ -430,13 +480,6 @@ define_class!(
                     self.set_needs_display();
                 }
             }
-
-            let keyboard_flags = self
-                .ivars()
-                .terminal
-                .lock()
-                .screen()
-                .keyboard_enhancement_flags();
 
             // Handle Option+Arrow keys specially to match macOS Terminal.app behavior
             // when no application has requested enhanced keyboard events.
@@ -464,7 +507,14 @@ define_class!(
                     self.ivars()
                         .reported_keys
                         .borrow_mut()
-                        .insert(raw_keycode, key);
+                        .insert(
+                            raw_keycode,
+                            ReportedKey {
+                                key,
+                                shifted_key: None,
+                                base_layout_key: None,
+                            },
+                        );
                     log::debug!("Special key: {:?} -> {:?}", key, data);
                     self.write_to_pty(&data);
                     return;
@@ -474,31 +524,60 @@ define_class!(
             // Kitty disambiguation needs the base key plus modifiers. Only bypass Cocoa text
             // input when both strings identify exactly one scalar; dead keys and composed text
             // stay on interpretKeyEvents so IME behavior is unchanged.
-            if keyboard_flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-                && modifiers.intersects(
-                    cterm_ui::events::Modifiers::CTRL | cterm_ui::events::Modifiers::ALT,
-                )
+            let report_all = keyboard_flags
+                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+            if report_all
+                || (keyboard_flags
+                    .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+                    && modifiers.intersects(
+                        cterm_ui::events::Modifiers::CTRL
+                            | cterm_ui::events::Modifiers::ALT
+                            | cterm_ui::events::Modifiers::SUPER,
+                    ))
             {
                 let event_text = keycode::characters_from_event(event);
                 let base_text = keycode::characters_ignoring_modifiers(event);
-                let key = event_text
-                    .as_deref()
-                    .zip(base_text.as_deref())
-                    .and_then(|(event_text, base_text)| {
-                        direct_modified_key_char(
-                            event_text,
-                            base_text,
-                            modifiers.contains(cterm_ui::events::Modifiers::ALT),
-                        )
-                    })
-                    .map(Key::Char);
+                let character = if report_all {
+                    base_text.as_deref().and_then(unmodified_key_char)
+                } else {
+                    event_text.as_deref().zip(base_text.as_deref()).and_then(
+                        |(event_text, base_text)| {
+                            direct_modified_key_char(
+                                event_text,
+                                base_text,
+                                modifiers.contains(cterm_ui::events::Modifiers::ALT),
+                            )
+                        },
+                    )
+                };
+                let key = character.map(Key::Char);
 
                 if let Some(key) = key {
-                    if let Some(data) = self.terminal_key_event(key, core_mods, kind) {
+                    let shifted_key = modifiers
+                        .contains(cterm_ui::events::Modifiers::SHIFT)
+                        .then(|| event_text.as_deref().and_then(exactly_one_char))
+                        .flatten();
+                    let base_layout_key = keycode::keycode_from_event(event)
+                        .and_then(|keycode| keycode.to_char());
+                    let associated_text = event_text.as_deref();
+                    let metadata = KeyEventMetadata::new()
+                        .with_shifted_key(shifted_key)
+                        .with_base_layout_key(base_layout_key)
+                        .with_associated_text(associated_text);
+                    if let Some(data) =
+                        self.terminal_key_event_with_metadata(key, core_mods, kind, metadata)
+                    {
                         self.ivars()
                             .reported_keys
                             .borrow_mut()
-                            .insert(raw_keycode, key);
+                            .insert(
+                                raw_keycode,
+                                ReportedKey {
+                                    key,
+                                    shifted_key,
+                                    base_layout_key,
+                                },
+                            );
                         log::debug!("Enhanced character key: {:?} -> {:?}", key, data);
                         self.write_to_pty(&data);
                         return;
@@ -538,18 +617,22 @@ define_class!(
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
             let raw_keycode = event.keyCode();
-            let key = self.ivars().reported_keys.borrow_mut().remove(&raw_keycode);
+            let reported = self.ivars().reported_keys.borrow_mut().remove(&raw_keycode);
 
-            if let Some(key) = key {
+            if let Some(reported) = reported {
                 let modifiers = keycode::modifiers_from_event(event);
                 let core_mods = CoreModifiers::from_bits_truncate(modifiers.bits());
                 let data = self
                     .ivars()
                     .terminal
                     .lock()
-                    .handle_reported_key_release(key, core_mods);
+                    .handle_reported_key_release_with_metadata(
+                        reported.key,
+                        core_mods,
+                        reported.metadata(),
+                    );
                 if let Some(data) = data {
-                    log::debug!("Key release: {:?} -> {:?}", key, data);
+                    log::debug!("Key release: {:?} -> {:?}", reported.key, data);
                     self.write_to_pty(&data);
                 }
                 return;
@@ -992,6 +1075,58 @@ define_class!(
 
             // Show/hide debug menu based on Shift key state
             crate::menu::set_debug_menu_visible(shift_pressed);
+
+            let keyboard_flags = self
+                .ivars()
+                .terminal
+                .lock()
+                .screen()
+                .keyboard_enhancement_flags();
+            if !keyboard_flags
+                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+            {
+                return;
+            }
+
+            let raw_keycode = event.keyCode();
+            let Some((named, modifier)) = modifier_key_for_keycode(raw_keycode) else {
+                return;
+            };
+            let was_pressed = self
+                .ivars()
+                .reported_keys
+                .borrow()
+                .contains_key(&raw_keycode);
+            let kind = if was_pressed {
+                KeyEventKind::Release
+            } else {
+                KeyEventKind::Press
+            };
+            let mut modifiers = keycode::modifiers_from_event(event);
+            if kind == KeyEventKind::Press {
+                modifiers.insert(modifier);
+            }
+            let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
+            let key = Key::Named(named);
+
+            if let Some(data) = self.terminal_key_event(key, core_modifiers, kind) {
+                if kind == KeyEventKind::Press {
+                    self.ivars().reported_keys.borrow_mut().insert(
+                        raw_keycode,
+                        ReportedKey {
+                            key,
+                            shifted_key: None,
+                            base_layout_key: None,
+                        },
+                    );
+                } else {
+                    self.ivars()
+                        .reported_keys
+                        .borrow_mut()
+                        .remove(&raw_keycode);
+                }
+                self.write_to_pty(&data);
+            }
         }
 
         /// Debug: Dump terminal state
@@ -1356,7 +1491,7 @@ define_class!(
 
             if !text.is_empty() {
                 log::debug!("IME insert text (old method): {:?}", text);
-                self.write_to_pty(text.as_bytes());
+                self.write_text_input(&text);
             }
         }
 
@@ -1398,7 +1533,7 @@ define_class!(
 
             if !text.is_empty() {
                 log::debug!("IME insert text: {:?}", text);
-                self.write_to_pty(text.as_bytes());
+                self.write_text_input(&text);
             }
         }
 
@@ -1568,6 +1703,19 @@ impl TerminalView {
             .terminal
             .lock()
             .handle_key_event(key, modifiers, kind)
+    }
+
+    fn terminal_key_event_with_metadata(
+        &self,
+        key: Key,
+        modifiers: CoreModifiers,
+        kind: KeyEventKind,
+        metadata: KeyEventMetadata<'_>,
+    ) -> Option<Vec<u8>> {
+        self.ivars()
+            .terminal
+            .lock()
+            .handle_key_event_with_metadata(key, modifiers, kind, metadata)
     }
 
     /// Common initialization: allocate NSView, set ivars, init frame, setup notification bar
@@ -2499,6 +2647,16 @@ impl TerminalView {
         }
     }
 
+    fn write_text_input(&self, text: &str) {
+        let mut terminal = self.ivars().terminal.lock();
+        let encoded = terminal.handle_text_input(text);
+        if !encoded.is_empty() {
+            if let Err(error) = terminal.write(&encoded) {
+                log::error!("Failed to write text input to PTY: {error}");
+            }
+        }
+    }
+
     /// Handle a drop operation — extract file URL, show dialog, write to PTY
     fn handle_drop(&self, sender: &AnyObject) -> bool {
         use cterm_app::file_drop::{build_pty_input, FileDropAction, FileDropInfo};
@@ -3371,7 +3529,28 @@ mod keyboard_event_tests {
         assert_eq!(terminal_key_for_keycode(0x6F), Some(Key::F(12)));
         assert_eq!(terminal_key_for_keycode(0x57), Some(Key::NumpadDigit(5)));
         assert_eq!(terminal_key_for_keycode(0x4C), Some(Key::NumpadEnter));
+        assert_eq!(terminal_key_for_keycode(0x5A), Some(Key::F(20)));
+        assert_eq!(
+            terminal_key_for_keycode(0x51),
+            Some(Key::Named(NamedKey::NumpadEqual))
+        );
         assert_eq!(terminal_key_for_keycode(0x00), None);
+    }
+
+    #[test]
+    fn modifier_keycodes_preserve_left_and_right_kitty_identity() {
+        assert_eq!(
+            modifier_key_for_keycode(0x38),
+            Some((NamedKey::LeftShift, Modifiers::SHIFT))
+        );
+        assert_eq!(
+            modifier_key_for_keycode(0x36),
+            Some((NamedKey::RightSuper, Modifiers::SUPER))
+        );
+        assert_eq!(
+            modifier_key_for_keycode(0x39),
+            Some((NamedKey::CapsLock, Modifiers::CAPS_LOCK))
+        );
     }
 
     #[test]

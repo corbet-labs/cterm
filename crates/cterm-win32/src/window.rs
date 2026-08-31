@@ -31,8 +31,8 @@ use cterm_core::mouse::{
 };
 use cterm_core::pty::{PtyConfig, PtySize};
 use cterm_core::screen::{FileTransferOperation, MouseEncoding, MouseMode, ScreenConfig};
-use cterm_core::term::{Key, Modifiers as CoreModifiers, Terminal, TerminalEvent};
-use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
+use cterm_core::term::{Key, Modifiers as CoreModifiers, NamedKey, Terminal, TerminalEvent};
+use cterm_core::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
 use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
 use cterm_ui::pane::{
     PaneBranch, PaneDirection, PaneId, PaneLayout, PaneRect, PaneTree, SplitDirection, SplitRatio,
@@ -222,11 +222,106 @@ fn ascii_key_for_vk(vk: u16) -> Option<char> {
     })
 }
 
+fn sided_virtual_key(vk: u16, scan_code: u8, extended: bool) -> u16 {
+    match vk as i32 {
+        winuser::VK_SHIFT => {
+            let scan = u32::from(scan_code) | if extended { 0xe000 } else { 0 };
+            let mapped =
+                unsafe { winuser::MapVirtualKeyW(scan, winuser::MAPVK_VSC_TO_VK_EX) } as u16;
+            if mapped == 0 {
+                vk
+            } else {
+                mapped
+            }
+        }
+        winuser::VK_CONTROL => {
+            if extended {
+                winuser::VK_RCONTROL as u16
+            } else {
+                winuser::VK_LCONTROL as u16
+            }
+        }
+        winuser::VK_MENU => {
+            if extended {
+                winuser::VK_RMENU as u16
+            } else {
+                winuser::VK_LMENU as u16
+            }
+        }
+        _ => vk,
+    }
+}
+
+fn translated_key_text(vk: u16, scan_code: u8, keyboard_state: &[u8; 256]) -> Option<String> {
+    let mut buffer = [0u16; 8];
+    let count = unsafe {
+        winuser::ToUnicodeEx(
+            u32::from(vk),
+            u32::from(scan_code),
+            keyboard_state.as_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len() as i32,
+            // Windows 10+ promises that bit 2 leaves the keyboard/dead-key
+            // state untouched, which is essential for a read-only probe.
+            1 << 2,
+            winuser::GetKeyboardLayout(0),
+        )
+    };
+    (count > 0)
+        .then(|| String::from_utf16(&buffer[..count as usize]).ok())
+        .flatten()
+}
+
+fn translated_key_char(vk: u16, scan_code: u8, shifted: bool) -> Option<char> {
+    let mut state = [0u8; 256];
+    if shifted {
+        state[winuser::VK_SHIFT as usize] = 0x80;
+    }
+    let text = translated_key_text(vk, scan_code, &state)?;
+    let mut characters = text.chars();
+    let character = characters.next()?;
+    characters.next().is_none().then_some(character)
+}
+
+fn associated_key_text(vk: u16, scan_code: u8) -> Option<String> {
+    let mut state = [0u8; 256];
+    let ok = unsafe { winuser::GetKeyboardState(state.as_mut_ptr()) };
+    if ok == 0 {
+        return None;
+    }
+    translated_key_text(vk, scan_code, &state)
+}
+
+fn pc101_key_for_scan_code(scan_code: u8) -> Option<char> {
+    Some(match scan_code {
+        0x02..=0x0b => "1234567890".chars().nth((scan_code - 0x02) as usize)?,
+        0x0c => '-',
+        0x0d => '=',
+        0x10..=0x1b => "qwertyuiop[]".chars().nth((scan_code - 0x10) as usize)?,
+        0x1e..=0x29 => "asdfghjkl;'`".chars().nth((scan_code - 0x1e) as usize)?,
+        0x2b => '\\',
+        0x2c..=0x35 => "zxcvbnm,./".chars().nth((scan_code - 0x2c) as usize)?,
+        0x39 => ' ',
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
 fn mapped_terminal_key(
     vk: u16,
     modifiers: Modifiers,
     enhanced_text: bool,
     extended: bool,
+) -> Option<Key> {
+    mapped_terminal_key_with_layout(vk, modifiers, enhanced_text, extended, None)
+}
+
+fn mapped_terminal_key_with_layout(
+    vk: u16,
+    modifiers: Modifiers,
+    enhanced_text: bool,
+    extended: bool,
+    layout_char: Option<char>,
 ) -> Option<Key> {
     let functional = match vk as i32 {
         winuser::VK_UP => Key::Up,
@@ -255,14 +350,39 @@ fn mapped_terminal_key(
         value if (winuser::VK_F1..=winuser::VK_F12).contains(&value) => {
             Key::F((value - winuser::VK_F1 + 1) as u8)
         }
+        value if (winuser::VK_F13..=winuser::VK_F24).contains(&value) => {
+            Key::F((value - winuser::VK_F1 + 1) as u8)
+        }
+        winuser::VK_CAPITAL => Key::Named(NamedKey::CapsLock),
+        winuser::VK_SCROLL => Key::Named(NamedKey::ScrollLock),
+        winuser::VK_NUMLOCK => Key::Named(NamedKey::NumLock),
+        winuser::VK_SNAPSHOT => Key::Named(NamedKey::PrintScreen),
+        winuser::VK_PAUSE => Key::Named(NamedKey::Pause),
+        winuser::VK_APPS => Key::Named(NamedKey::Menu),
+        winuser::VK_MEDIA_PLAY_PAUSE => Key::Named(NamedKey::MediaPlayPause),
+        winuser::VK_MEDIA_STOP => Key::Named(NamedKey::MediaStop),
+        winuser::VK_MEDIA_NEXT_TRACK => Key::Named(NamedKey::MediaTrackNext),
+        winuser::VK_MEDIA_PREV_TRACK => Key::Named(NamedKey::MediaTrackPrevious),
+        winuser::VK_VOLUME_DOWN => Key::Named(NamedKey::LowerVolume),
+        winuser::VK_VOLUME_UP => Key::Named(NamedKey::RaiseVolume),
+        winuser::VK_VOLUME_MUTE => Key::Named(NamedKey::MuteVolume),
+        winuser::VK_LSHIFT => Key::Named(NamedKey::LeftShift),
+        winuser::VK_RSHIFT => Key::Named(NamedKey::RightShift),
+        winuser::VK_LCONTROL => Key::Named(NamedKey::LeftControl),
+        winuser::VK_RCONTROL => Key::Named(NamedKey::RightControl),
+        winuser::VK_LMENU => Key::Named(NamedKey::LeftAlt),
+        winuser::VK_RMENU => Key::Named(NamedKey::RightAlt),
+        winuser::VK_LWIN => Key::Named(NamedKey::LeftSuper),
+        winuser::VK_RWIN => Key::Named(NamedKey::RightSuper),
         _ => {
             if enhanced_text {
-                return ascii_key_for_vk(vk).map(Key::Char);
+                return layout_char.or_else(|| ascii_key_for_vk(vk)).map(Key::Char);
             }
             if modifiers.contains(Modifiers::CTRL)
                 && !modifiers.intersects(Modifiers::ALT | Modifiers::SUPER)
             {
-                return ascii_key_for_vk(vk)
+                return layout_char
+                    .or_else(|| ascii_key_for_vk(vk))
                     .filter(char::is_ascii_alphabetic)
                     .map(Key::Char);
             }
@@ -395,6 +515,21 @@ impl TabEntry {
 }
 
 /// Window state
+#[derive(Debug, Clone, Copy)]
+struct ReportedKey {
+    key: Key,
+    shifted_key: Option<char>,
+    base_layout_key: Option<char>,
+}
+
+impl ReportedKey {
+    fn metadata(self) -> KeyEventMetadata<'static> {
+        KeyEventMetadata::new()
+            .with_shifted_key(self.shifted_key)
+            .with_base_layout_key(self.base_layout_key)
+    }
+}
+
 pub struct WindowState {
     pub hwnd: HWND,
     pub config: Config,
@@ -424,10 +559,12 @@ pub struct WindowState {
     /// shortcuts must not leak into enhanced keyboard reporting.
     suppressed_key_releases: HashSet<u16>,
     /// Physical keys whose presses were emitted as enhanced events.
-    reported_keys: HashMap<u16, Key>,
+    reported_keys: HashMap<u16, ReportedKey>,
     /// Modified text keys handled on WM_KEYDOWN; their generated WM_CHAR or
     /// WM_SYSCHAR messages must not be delivered a second time.
     enhanced_text_keys: HashSet<u16>,
+    /// First UTF-16 code unit of an astral WM_CHAR input sequence.
+    pending_high_surrogate: Option<u16>,
     /// Visibility of the native window; only its active tab is actually visible.
     window_visibility: cterm_core::WindowVisibility,
     menu_handle: winapi::shared::windef::HMENU,
@@ -544,6 +681,7 @@ impl WindowState {
             suppressed_key_releases: HashSet::new(),
             reported_keys: HashMap::new(),
             enhanced_text_keys: HashSet::new(),
+            pending_high_surrogate: None,
             window_visibility: cterm_core::WindowVisibility::Visible,
             menu_handle,
             tool_commands,
@@ -2399,7 +2537,14 @@ impl WindowState {
     /// Handle a physical keyboard event. Text-producing keys deliberately stay
     /// on WM_CHAR so Windows remains authoritative for layouts, dead keys, and
     /// IME composition.
-    pub fn on_key_event(&mut self, vk: u16, kind: KeyEventKind, extended: bool) -> bool {
+    pub fn on_key_event(
+        &mut self,
+        vk: u16,
+        kind: KeyEventKind,
+        extended: bool,
+        scan_code: u8,
+    ) -> bool {
+        let vk = sided_virtual_key(vk, scan_code, extended);
         let modifiers = keycode::get_modifiers();
 
         if kind == KeyEventKind::Release {
@@ -2407,11 +2552,15 @@ impl WindowState {
             if self.suppressed_key_releases.remove(&vk) {
                 return true;
             }
-            if let Some(key) = self.reported_keys.remove(&vk) {
+            if let Some(reported) = self.reported_keys.remove(&vk) {
                 if let Some(terminal) = self.active_terminal() {
                     let mut term = terminal.lock().unwrap();
                     let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
-                    if let Some(bytes) = term.handle_reported_key_release(key, core_modifiers) {
+                    if let Some(bytes) = term.handle_reported_key_release_with_metadata(
+                        reported.key,
+                        core_modifiers,
+                        reported.metadata(),
+                    ) {
                         if let Err(e) = term.write(&bytes) {
                             log::error!("Failed to write key release to PTY: {}", e);
                         }
@@ -2433,29 +2582,58 @@ impl WindowState {
             }
         }
 
-        let enhanced_text = modifiers
-            .intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-            && !keycode::is_altgr_active()
-            && self.active_terminal().is_some_and(|terminal| {
+        let keyboard_flags = self
+            .active_terminal()
+            .map(|terminal| {
                 terminal
                     .lock()
                     .unwrap()
                     .screen()
                     .keyboard_enhancement_flags()
-                    .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            });
+            })
+            .unwrap_or_default();
+        let report_all =
+            keyboard_flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+        let enhanced_text = !keycode::is_altgr_active()
+            && (report_all
+                || (keyboard_flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+                    && modifiers.intersects(
+                        Modifiers::CTRL
+                            | Modifiers::ALT
+                            | Modifiers::SUPER
+                            | Modifiers::HYPER
+                            | Modifiers::META,
+                    )));
+        let layout_char = translated_key_char(vk, scan_code, false);
 
-        let Some(key) = mapped_terminal_key(vk, modifiers, enhanced_text, extended) else {
+        let Some(key) =
+            mapped_terminal_key_with_layout(vk, modifiers, enhanced_text, extended, layout_char)
+        else {
             return false;
         };
         let core_modifiers = CoreModifiers::from_bits_truncate(modifiers.bits());
+        let shifted_key = matches!(key, Key::Char(_))
+            .then(|| translated_key_char(vk, scan_code, true))
+            .flatten();
+        let base_layout_key = matches!(key, Key::Char(_))
+            .then(|| pc101_key_for_scan_code(scan_code))
+            .flatten();
+        let associated_text = matches!(key, Key::Char(_))
+            .then(|| associated_key_text(vk, scan_code))
+            .flatten();
+        let metadata = KeyEventMetadata::new()
+            .with_shifted_key(shifted_key)
+            .with_base_layout_key(base_layout_key)
+            .with_associated_text(associated_text.as_deref());
 
         if let Some(terminal) = self.active_terminal() {
             let mut term = terminal.lock().unwrap();
-            if let Some(bytes) = term.handle_key_event(key, core_modifiers, kind) {
+            if let Some(bytes) =
+                term.handle_key_event_with_metadata(key, core_modifiers, kind, metadata)
+            {
                 let track_release = kind == KeyEventKind::Press
                     && term
-                        .handle_reported_key_release(key, core_modifiers)
+                        .handle_reported_key_release_with_metadata(key, core_modifiers, metadata)
                         .is_some();
                 if let Err(e) = term.write(&bytes) {
                     log::error!("Failed to write key event to PTY: {}", e);
@@ -2467,7 +2645,14 @@ impl WindowState {
                     self.enhanced_text_keys.insert(vk);
                 }
                 if track_release {
-                    self.reported_keys.insert(vk, key);
+                    self.reported_keys.insert(
+                        vk,
+                        ReportedKey {
+                            key,
+                            shifted_key,
+                            base_layout_key,
+                        },
+                    );
                 }
                 self.invalidate();
                 return true;
@@ -2487,12 +2672,37 @@ impl WindowState {
             let mut term = terminal.lock().unwrap();
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
-            term.write(s.as_bytes()).ok();
+            let encoded = term.handle_text_input(s);
+            if !encoded.is_empty() {
+                term.write(&encoded).ok();
+            }
             // Drop the lock before invalidate() — UpdateWindow dispatches WM_PAINT
             // synchronously, and render() needs to lock the terminal.
             drop(term);
         }
         self.invalidate();
+    }
+
+    pub fn on_utf16_code_unit(&mut self, unit: u16) {
+        if (0xd800..=0xdbff).contains(&unit) {
+            self.pending_high_surrogate = Some(unit);
+            return;
+        }
+
+        if (0xdc00..=0xdfff).contains(&unit) {
+            let Some(high) = self.pending_high_surrogate.take() else {
+                return;
+            };
+            if let Some(Ok(character)) = char::decode_utf16([high, unit]).next() {
+                self.on_char(character);
+            }
+            return;
+        }
+
+        self.pending_high_surrogate = None;
+        if let Some(character) = char::from_u32(u32::from(unit)) {
+            self.on_char(character);
+        }
     }
 
     fn launch_new_window(&self) {
@@ -5178,7 +5388,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             let key_data = lparam.0 as usize;
             let kind = key_event_kind(msg, key_data)
                 .expect("matched messages always have a key-event kind");
-            if state.on_key_event(vk, kind, key_data & EXTENDED_KEY_BIT != 0) {
+            let scan_code = ((key_data >> 16) & 0xff) as u8;
+            if state.on_key_event(vk, kind, key_data & EXTENDED_KEY_BIT != 0, scan_code) {
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -5187,14 +5398,26 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         WM_CHAR => {
             if !state.suppress_generated_text_message() {
-                if let Some(c) = char::from_u32(wparam.0 as u32) {
-                    // Only handle printable characters here. Control characters like
-                    // Enter (\r), Tab (\t), Backspace (\x08), and Escape (\x1b) are
-                    // already handled from their physical key messages.
-                    // TranslateMessage generates WM_CHAR for them too, so we must
-                    // skip them here to avoid double input.
-                    if !c.is_control() {
-                        state.on_char(c);
+                let unit = wparam.0 as u16;
+                // Control characters are already handled from physical key
+                // messages. Printable UTF-16, including surrogate pairs, stays
+                // on the layout/IME-authoritative text path.
+                if unit >= 0x20 && unit != 0x7f {
+                    state.on_utf16_code_unit(unit);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_UNICHAR => {
+            const UNICODE_NOCHAR: usize = 0xffff;
+            if wparam.0 == UNICODE_NOCHAR {
+                return LRESULT(1);
+            }
+            if !state.suppress_generated_text_message() {
+                if let Some(character) = char::from_u32(wparam.0 as u32) {
+                    if !character.is_control() {
+                        state.on_char(character);
                     }
                 }
             }
@@ -5779,6 +6002,19 @@ mod tests {
             Some(Key::F(12))
         );
         assert_eq!(
+            mapped_terminal_key(winuser::VK_F24 as u16, Modifiers::empty(), false, false),
+            Some(Key::F(24))
+        );
+        assert_eq!(
+            mapped_terminal_key(
+                winuser::VK_MEDIA_PLAY_PAUSE as u16,
+                Modifiers::empty(),
+                false,
+                false,
+            ),
+            Some(Key::Named(NamedKey::MediaPlayPause))
+        );
+        assert_eq!(
             mapped_terminal_key(0x41, Modifiers::empty(), false, false),
             None
         );
@@ -5830,6 +6066,23 @@ mod tests {
         assert_eq!(
             mapped_terminal_key(0x32, Modifiers::ALT, true, false),
             Some(Key::Char('2'))
+        );
+    }
+
+    #[test]
+    fn kitty_windows_physical_identity_and_sided_modifiers_are_stable() {
+        assert_eq!(pc101_key_for_scan_code(0x02), Some('1'));
+        assert_eq!(pc101_key_for_scan_code(0x1e), Some('a'));
+        assert_eq!(pc101_key_for_scan_code(0x2b), Some('\\'));
+        assert_eq!(pc101_key_for_scan_code(0x39), Some(' '));
+        assert_eq!(pc101_key_for_scan_code(0xff), None);
+        assert_eq!(
+            sided_virtual_key(winuser::VK_CONTROL as u16, 0x1d, false),
+            winuser::VK_LCONTROL as u16
+        );
+        assert_eq!(
+            sided_virtual_key(winuser::VK_CONTROL as u16, 0x1d, true),
+            winuser::VK_RCONTROL as u16
         );
     }
 

@@ -14,6 +14,10 @@ bitflags! {
         const CTRL = 1 << 1;
         const ALT = 1 << 2;
         const SUPER = 1 << 3;
+        const HYPER = 1 << 4;
+        const META = 1 << 5;
+        const CAPS_LOCK = 1 << 6;
+        const NUM_LOCK = 1 << 7;
     }
 }
 
