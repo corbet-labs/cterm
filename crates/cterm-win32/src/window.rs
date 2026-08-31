@@ -29,7 +29,7 @@ use cterm_core::pty::{PtyConfig, PtySize};
 use cterm_core::screen::{FileTransferOperation, MouseEncoding, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, Terminal, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
-use cterm_ui::events::{Action, Modifiers};
+use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
 use cterm_ui::pane::{
     PaneBranch, PaneDirection, PaneId, PaneLayout, PaneRect, PaneTree, SplitDirection, SplitRatio,
     SplitRequest,
@@ -418,10 +418,56 @@ pub struct WindowState {
     pub remote_manager: cterm_client::RemoteManager,
 }
 
+fn action_restricted_in_managed_mode(action: &Action) -> bool {
+    match action {
+        Action::NewTab
+        | Action::NewWindow
+        | Action::SplitPane(_)
+        | Action::ClosePane
+        | Action::FocusPane(_)
+        | Action::ResizePane(_)
+        | Action::TogglePaneZoom
+        | Action::OpenPreferences
+        | Action::QuickOpenTemplate => true,
+        Action::CloseTab
+        | Action::NextTab
+        | Action::PrevTab
+        | Action::NextAlertedTab
+        | Action::Tab(_)
+        | Action::CloseWindow
+        | Action::Copy
+        | Action::Paste
+        | Action::SelectAll
+        | Action::ZoomIn
+        | Action::ZoomOut
+        | Action::ZoomReset
+        | Action::ToggleFullscreen
+        | Action::ScrollUp
+        | Action::ScrollDown
+        | Action::ScrollPageUp
+        | Action::ScrollPageDown
+        | Action::ScrollToTop
+        | Action::ScrollToBottom
+        | Action::PromptPrevious
+        | Action::PromptNext
+        | Action::FindText
+        | Action::ResetTerminal => false,
+    }
+}
+
+fn win32_shortcut_manager(config: &cterm_app::config::ShortcutsConfig) -> ShortcutManager {
+    let mut shortcuts = ShortcutManager::from_config(config);
+    shortcuts.bind_extra(
+        Shortcut::new(KeyCode::F11, Modifiers::empty()),
+        Action::ToggleFullscreen,
+    );
+    shortcuts
+}
+
 impl WindowState {
     /// Create a new window state
     pub fn new(hwnd: HWND, config: &Config, theme: &Theme) -> Self {
-        let shortcuts = ShortcutManager::from_config(&config.shortcuts);
+        let shortcuts = win32_shortcut_manager(&config.shortcuts);
         let dpi = DpiInfo::for_window(hwnd);
 
         let mut tab_bar = TabBar::new(theme);
@@ -2317,8 +2363,64 @@ impl WindowState {
         self.invalidate();
     }
 
+    fn launch_new_window(&self) {
+        let result = std::env::current_exe()
+            .and_then(|executable| std::process::Command::new(executable).spawn())
+            .map(|_| ());
+        if let Err(error) = result {
+            log::error!("Failed to launch a new cterm window: {error}");
+        }
+    }
+
+    fn show_quick_open(&mut self) {
+        let templates = cterm_app::load_sticky_tabs().unwrap_or_default();
+        let Some(template) = crate::quick_open::show_quick_open(self.hwnd, templates) else {
+            return;
+        };
+
+        log::info!("Quick open selected: {}", template.name);
+        if let Err(error) = self.new_tab_from_template(&template) {
+            log::error!("Failed to open template '{}': {error}", template.name);
+            crate::dialogs::show_warning(
+                self.hwnd.0 as *mut _,
+                "Template unavailable",
+                &error.to_string(),
+            );
+        }
+    }
+
+    fn show_preferences(&mut self) {
+        if !crate::preferences_dialog::show_preferences_dialog(self.hwnd.0 as *mut _) {
+            return;
+        }
+
+        match cterm_app::load_config() {
+            Ok(config) => {
+                self.shortcuts = win32_shortcut_manager(&config.shortcuts);
+                self.config = config;
+                // TODO: Apply theme and other changes without restart.
+                log::info!("Preferences saved and reloaded");
+            }
+            Err(error) => log::error!("Failed to reload saved preferences: {error}"),
+        }
+    }
+
+    fn reset_terminal(&mut self) {
+        if let Some(terminal) = self.active_terminal() {
+            let mut term = terminal.lock().unwrap();
+            term.screen_mut().reset();
+            drop(term);
+        }
+        self.invalidate();
+    }
+
     /// Handle an action
     fn handle_action(&mut self, action: Action) {
+        if crate::get_args().managed && action_restricted_in_managed_mode(&action) {
+            log::warn!("Ignoring {} action in managed mode", action.id());
+            return;
+        }
+
         match action {
             Action::NewTab => {
                 self.new_tab().ok();
@@ -2344,9 +2446,11 @@ impl WindowState {
             }
             Action::Copy => self.copy_selection(),
             Action::Paste => self.paste(),
+            Action::SelectAll => self.select_all(),
             Action::ZoomIn => self.zoom_in(),
             Action::ZoomOut => self.zoom_out(),
             Action::ZoomReset => self.zoom_reset(),
+            Action::ToggleFullscreen => self.toggle_fullscreen(),
             Action::ScrollUp
             | Action::ScrollDown
             | Action::ScrollPageUp
@@ -2383,33 +2487,27 @@ impl WindowState {
                 };
             }
             Action::NewWindow => {
-                // New window requires app-level handling, not implemented for shortcuts
-                log::debug!("NewWindow action from shortcut not implemented");
+                self.launch_new_window();
             }
             Action::FindText => self.show_find_dialog(),
-            Action::ResetTerminal => {
-                if let Some(terminal) = self.active_terminal() {
-                    let mut term = terminal.lock().unwrap();
-                    term.screen_mut().reset();
-                    drop(term);
-                }
-                self.invalidate();
-            }
-            _ => {}
+            Action::ResetTerminal => self.reset_terminal(),
+            Action::OpenPreferences => self.show_preferences(),
+            Action::QuickOpenTemplate => self.show_quick_open(),
         }
     }
 
     /// Handle menu command
     pub fn on_menu_command(&mut self, cmd: u16) {
         if let Some(action) = MenuAction::from_id(cmd) {
+            if let Some(shared_action) = action.shared_action() {
+                self.handle_action(shared_action);
+                return;
+            }
+
             if crate::get_args().managed
                 && matches!(
                     action,
-                    MenuAction::NewTab
-                        | MenuAction::NewWindow
-                        | MenuAction::QuickOpen
-                        | MenuAction::DockerPicker
-                        | MenuAction::Preferences
+                    MenuAction::DockerPicker
                         | MenuAction::TabTemplates
                         | MenuAction::AttachSession
                         | MenuAction::SSHConnect
@@ -2420,21 +2518,6 @@ impl WindowState {
                 return;
             }
             match action {
-                MenuAction::NewTab => {
-                    self.new_tab().ok();
-                }
-                MenuAction::NewWindow => {
-                    // Launch a new instance of the application
-                    if let Ok(exe) = std::env::current_exe() {
-                        std::process::Command::new(exe).spawn().ok();
-                    }
-                }
-                MenuAction::CloseTab => {
-                    if let Some(tab) = self.tabs.get(self.active_tab_index) {
-                        let id = tab.id;
-                        self.close_tab(id);
-                    }
-                }
                 MenuAction::CloseOtherTabs => {
                     // Close all but active
                     let active_id = self.tabs.get(self.active_tab_index).map(|t| t.id);
@@ -2447,23 +2530,6 @@ impl WindowState {
                             .collect();
                         for id in ids {
                             self.close_tab(id);
-                        }
-                    }
-                }
-                MenuAction::QuickOpen => {
-                    // Show Quick Open dialog
-                    let templates = cterm_app::load_sticky_tabs().unwrap_or_default();
-                    if let Some(template) = crate::quick_open::show_quick_open(self.hwnd, templates)
-                    {
-                        // Create a new tab with the selected template
-                        log::info!("Quick open selected: {}", template.name);
-                        if let Err(error) = self.new_tab_from_template(&template) {
-                            log::error!("Failed to open template '{}': {error}", template.name);
-                            crate::dialogs::show_warning(
-                                self.hwnd.0 as *mut _,
-                                "Template unavailable",
-                                &error.to_string(),
-                            );
                         }
                     }
                 }
@@ -2483,30 +2549,9 @@ impl WindowState {
                         }
                     }
                 }
-                MenuAction::Quit => {
-                    unsafe {
-                        let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                    };
-                }
-                MenuAction::Copy => self.copy_selection(),
                 MenuAction::CopyHtml => self.copy_selection_as_html(),
-                MenuAction::Paste => self.paste(),
-                MenuAction::SelectAll => self.select_all(),
-                MenuAction::ZoomIn => self.zoom_in(),
-                MenuAction::ZoomOut => self.zoom_out(),
-                MenuAction::ZoomReset => self.zoom_reset(),
-                MenuAction::Fullscreen => self.toggle_fullscreen(),
                 MenuAction::SetTitle => self.show_set_title_dialog(),
                 MenuAction::SetColor => self.show_set_color_dialog(),
-                MenuAction::Find => self.show_find_dialog(),
-                MenuAction::Reset => {
-                    if let Some(terminal) = self.active_terminal() {
-                        let mut term = terminal.lock().unwrap();
-                        term.screen_mut().reset();
-                        drop(term);
-                    }
-                    self.invalidate();
-                }
                 MenuAction::ClearReset => {
                     if let Some(terminal) = self.active_terminal() {
                         let mut term = terminal.lock().unwrap();
@@ -2519,42 +2564,6 @@ impl WindowState {
                 MenuAction::SendSignalKill => self.send_signal(9), // SIGKILL
                 MenuAction::SendSignalHup => self.send_signal(1), // SIGHUP
                 MenuAction::SendSignalTerm => self.send_signal(15), // SIGTERM
-                MenuAction::SplitPaneHorizontal => {
-                    self.split_active_pane(SplitDirection::Horizontal)
-                }
-                MenuAction::SplitPaneVertical => self.split_active_pane(SplitDirection::Vertical),
-                MenuAction::ClosePane => self.close_active_pane(),
-                MenuAction::FocusPaneLeft => self.focus_pane(PaneDirection::Left),
-                MenuAction::FocusPaneRight => self.focus_pane(PaneDirection::Right),
-                MenuAction::FocusPaneUp => self.focus_pane(PaneDirection::Up),
-                MenuAction::FocusPaneDown => self.focus_pane(PaneDirection::Down),
-                MenuAction::ResizePaneLeft => self.resize_active_pane(PaneDirection::Left),
-                MenuAction::ResizePaneRight => self.resize_active_pane(PaneDirection::Right),
-                MenuAction::ResizePaneUp => self.resize_active_pane(PaneDirection::Up),
-                MenuAction::ResizePaneDown => self.resize_active_pane(PaneDirection::Down),
-                MenuAction::TogglePaneZoom => self.toggle_active_pane_zoom(),
-                MenuAction::PrevTab => self.prev_tab(),
-                MenuAction::NextTab => self.next_tab(),
-                MenuAction::NextAlertedTab => self.next_alerted_tab(),
-                MenuAction::Tab1 => self.switch_to_tab(0),
-                MenuAction::Tab2 => self.switch_to_tab(1),
-                MenuAction::Tab3 => self.switch_to_tab(2),
-                MenuAction::Tab4 => self.switch_to_tab(3),
-                MenuAction::Tab5 => self.switch_to_tab(4),
-                MenuAction::Tab6 => self.switch_to_tab(5),
-                MenuAction::Tab7 => self.switch_to_tab(6),
-                MenuAction::Tab8 => self.switch_to_tab(7),
-                MenuAction::Tab9 => self.switch_to_tab(8),
-                MenuAction::Preferences => {
-                    if crate::preferences_dialog::show_preferences_dialog(self.hwnd.0 as *mut _) {
-                        // Reload config and apply changes
-                        if let Ok(config) = cterm_app::load_config() {
-                            self.config = config;
-                            // TODO: Apply theme and other changes without restart
-                            log::info!("Preferences saved and reloaded");
-                        }
-                    }
-                }
                 MenuAction::TabTemplates => {
                     if crate::templates_dialog::show_templates_dialog(self.hwnd.0 as *mut _) {
                         log::info!("Tab templates saved");
@@ -2744,6 +2753,47 @@ impl WindowState {
                 }
                 MenuAction::ManageRemotes => {
                     crate::remotes_dialog::show_remotes_dialog(self.hwnd.0 as *mut _);
+                }
+                MenuAction::NewTab
+                | MenuAction::NewWindow
+                | MenuAction::QuickOpen
+                | MenuAction::CloseTab
+                | MenuAction::Quit
+                | MenuAction::Copy
+                | MenuAction::Paste
+                | MenuAction::SelectAll
+                | MenuAction::ZoomIn
+                | MenuAction::ZoomOut
+                | MenuAction::ZoomReset
+                | MenuAction::Fullscreen
+                | MenuAction::Find
+                | MenuAction::Reset
+                | MenuAction::SplitPaneHorizontal
+                | MenuAction::SplitPaneVertical
+                | MenuAction::ClosePane
+                | MenuAction::FocusPaneLeft
+                | MenuAction::FocusPaneRight
+                | MenuAction::FocusPaneUp
+                | MenuAction::FocusPaneDown
+                | MenuAction::ResizePaneLeft
+                | MenuAction::ResizePaneRight
+                | MenuAction::ResizePaneUp
+                | MenuAction::ResizePaneDown
+                | MenuAction::TogglePaneZoom
+                | MenuAction::PrevTab
+                | MenuAction::NextTab
+                | MenuAction::NextAlertedTab
+                | MenuAction::Tab1
+                | MenuAction::Tab2
+                | MenuAction::Tab3
+                | MenuAction::Tab4
+                | MenuAction::Tab5
+                | MenuAction::Tab6
+                | MenuAction::Tab7
+                | MenuAction::Tab8
+                | MenuAction::Tab9
+                | MenuAction::Preferences => {
+                    unreachable!("shared menu actions are dispatched before native commands")
                 }
             }
         }
@@ -5211,6 +5261,76 @@ fn template_session_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win32_shortcuts_add_f11_fullscreen_to_configured_bindings() {
+        let config = cterm_app::config::ShortcutsConfig::default();
+        let shortcuts = win32_shortcut_manager(&config);
+
+        assert_eq!(
+            shortcuts.match_event(KeyCode::F11, Modifiers::empty()),
+            Some(&Action::ToggleFullscreen)
+        );
+        assert_eq!(
+            shortcuts.match_event(KeyCode::T, Modifiers::CTRL | Modifiers::SHIFT),
+            Some(&Action::NewTab)
+        );
+    }
+
+    #[test]
+    fn managed_mode_blocks_hidden_creation_configuration_and_pane_actions() {
+        for action in [
+            Action::NewTab,
+            Action::NewWindow,
+            Action::QuickOpenTemplate,
+            Action::OpenPreferences,
+            Action::SplitPane(SplitDirection::Horizontal),
+            Action::SplitPane(SplitDirection::Vertical),
+            Action::ClosePane,
+            Action::FocusPane(PaneDirection::Left),
+            Action::FocusPane(PaneDirection::Right),
+            Action::FocusPane(PaneDirection::Up),
+            Action::FocusPane(PaneDirection::Down),
+            Action::ResizePane(PaneDirection::Left),
+            Action::ResizePane(PaneDirection::Right),
+            Action::ResizePane(PaneDirection::Up),
+            Action::ResizePane(PaneDirection::Down),
+            Action::TogglePaneZoom,
+        ] {
+            assert!(action_restricted_in_managed_mode(&action), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn managed_mode_keeps_non_creating_shared_actions_available() {
+        for action in [
+            Action::CloseTab,
+            Action::NextTab,
+            Action::PrevTab,
+            Action::NextAlertedTab,
+            Action::Tab(1),
+            Action::CloseWindow,
+            Action::Copy,
+            Action::Paste,
+            Action::SelectAll,
+            Action::ZoomIn,
+            Action::ZoomOut,
+            Action::ZoomReset,
+            Action::ToggleFullscreen,
+            Action::ScrollUp,
+            Action::ScrollDown,
+            Action::ScrollPageUp,
+            Action::ScrollPageDown,
+            Action::ScrollToTop,
+            Action::ScrollToBottom,
+            Action::PromptPrevious,
+            Action::PromptNext,
+            Action::FindText,
+            Action::ResetTerminal,
+        ] {
+            assert!(!action_restricted_in_managed_mode(&action), "{action:?}");
+        }
+    }
 
     #[test]
     fn key_message_kind_distinguishes_press_repeat_and_release() {

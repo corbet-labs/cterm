@@ -4,6 +4,8 @@
 
 use std::ptr;
 
+use cterm_ui::events::Action;
+use cterm_ui::pane::{PaneDirection, SplitDirection};
 use winapi::shared::windef::HMENU;
 use winapi::um::winuser::{
     AppendMenuW, CreateMenu, CreatePopupMenu, SetMenu, MF_POPUP, MF_SEPARATOR, MF_STRING,
@@ -161,6 +163,75 @@ impl MenuAction {
     /// Get the ID for this action
     pub fn id(self) -> u16 {
         self as u16
+    }
+
+    /// Convert menu commands backed by the shared action model.
+    ///
+    /// Commands that expose Win32-only behavior remain in the native menu
+    /// dispatcher and return `None`.
+    pub fn shared_action(self) -> Option<Action> {
+        match self {
+            Self::NewTab => Some(Action::NewTab),
+            Self::NewWindow => Some(Action::NewWindow),
+            Self::QuickOpen => Some(Action::QuickOpenTemplate),
+            Self::CloseTab => Some(Action::CloseTab),
+            Self::Quit => Some(Action::CloseWindow),
+            Self::Copy => Some(Action::Copy),
+            Self::Paste => Some(Action::Paste),
+            Self::SelectAll => Some(Action::SelectAll),
+            Self::ZoomIn => Some(Action::ZoomIn),
+            Self::ZoomOut => Some(Action::ZoomOut),
+            Self::ZoomReset => Some(Action::ZoomReset),
+            Self::Fullscreen => Some(Action::ToggleFullscreen),
+            Self::Find => Some(Action::FindText),
+            Self::Reset => Some(Action::ResetTerminal),
+            Self::SplitPaneHorizontal => Some(Action::SplitPane(SplitDirection::Horizontal)),
+            Self::SplitPaneVertical => Some(Action::SplitPane(SplitDirection::Vertical)),
+            Self::ClosePane => Some(Action::ClosePane),
+            Self::FocusPaneLeft => Some(Action::FocusPane(PaneDirection::Left)),
+            Self::FocusPaneRight => Some(Action::FocusPane(PaneDirection::Right)),
+            Self::FocusPaneUp => Some(Action::FocusPane(PaneDirection::Up)),
+            Self::FocusPaneDown => Some(Action::FocusPane(PaneDirection::Down)),
+            Self::ResizePaneLeft => Some(Action::ResizePane(PaneDirection::Left)),
+            Self::ResizePaneRight => Some(Action::ResizePane(PaneDirection::Right)),
+            Self::ResizePaneUp => Some(Action::ResizePane(PaneDirection::Up)),
+            Self::ResizePaneDown => Some(Action::ResizePane(PaneDirection::Down)),
+            Self::TogglePaneZoom => Some(Action::TogglePaneZoom),
+            Self::PrevTab => Some(Action::PrevTab),
+            Self::NextTab => Some(Action::NextTab),
+            Self::NextAlertedTab => Some(Action::NextAlertedTab),
+            Self::Tab1 => Some(Action::Tab(1)),
+            Self::Tab2 => Some(Action::Tab(2)),
+            Self::Tab3 => Some(Action::Tab(3)),
+            Self::Tab4 => Some(Action::Tab(4)),
+            Self::Tab5 => Some(Action::Tab(5)),
+            Self::Tab6 => Some(Action::Tab(6)),
+            Self::Tab7 => Some(Action::Tab(7)),
+            Self::Tab8 => Some(Action::Tab(8)),
+            Self::Tab9 => Some(Action::Tab(9)),
+            Self::Preferences => Some(Action::OpenPreferences),
+            Self::CloseOtherTabs
+            | Self::DockerPicker
+            | Self::CopyHtml
+            | Self::SetTitle
+            | Self::SetColor
+            | Self::ClearReset
+            | Self::SendSignalInt
+            | Self::SendSignalKill
+            | Self::SendSignalHup
+            | Self::SendSignalTerm
+            | Self::TabTemplates
+            | Self::CheckUpdates
+            | Self::About
+            | Self::AttachSession
+            | Self::SSHConnect
+            | Self::ManageRemotes
+            | Self::DebugRelaunch
+            | Self::DebugDumpState
+            | Self::ViewLogs
+            | Self::DebugRelaunchDaemon
+            | Self::KillDaemon => None,
+        }
     }
 }
 
@@ -519,6 +590,8 @@ pub fn get_accelerators() -> Vec<Accelerator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cterm_ui::events::Action;
+    use cterm_ui::pane::{PaneDirection, SplitDirection};
 
     #[test]
     fn test_menu_action_roundtrip() {
@@ -543,6 +616,114 @@ mod tests {
             MenuAction::TogglePaneZoom,
         ] {
             assert_eq!(MenuAction::from_id(action.id()), Some(action));
+        }
+    }
+
+    #[test]
+    fn shared_menu_actions_map_to_canonical_actions() {
+        let cases = [
+            (MenuAction::NewTab, Action::NewTab),
+            (MenuAction::NewWindow, Action::NewWindow),
+            (MenuAction::QuickOpen, Action::QuickOpenTemplate),
+            (MenuAction::CloseTab, Action::CloseTab),
+            (MenuAction::Quit, Action::CloseWindow),
+            (MenuAction::Copy, Action::Copy),
+            (MenuAction::Paste, Action::Paste),
+            (MenuAction::SelectAll, Action::SelectAll),
+            (MenuAction::ZoomIn, Action::ZoomIn),
+            (MenuAction::ZoomOut, Action::ZoomOut),
+            (MenuAction::ZoomReset, Action::ZoomReset),
+            (MenuAction::Fullscreen, Action::ToggleFullscreen),
+            (MenuAction::Find, Action::FindText),
+            (MenuAction::Reset, Action::ResetTerminal),
+            (
+                MenuAction::SplitPaneHorizontal,
+                Action::SplitPane(SplitDirection::Horizontal),
+            ),
+            (
+                MenuAction::SplitPaneVertical,
+                Action::SplitPane(SplitDirection::Vertical),
+            ),
+            (MenuAction::ClosePane, Action::ClosePane),
+            (
+                MenuAction::FocusPaneLeft,
+                Action::FocusPane(PaneDirection::Left),
+            ),
+            (
+                MenuAction::FocusPaneRight,
+                Action::FocusPane(PaneDirection::Right),
+            ),
+            (
+                MenuAction::FocusPaneUp,
+                Action::FocusPane(PaneDirection::Up),
+            ),
+            (
+                MenuAction::FocusPaneDown,
+                Action::FocusPane(PaneDirection::Down),
+            ),
+            (
+                MenuAction::ResizePaneLeft,
+                Action::ResizePane(PaneDirection::Left),
+            ),
+            (
+                MenuAction::ResizePaneRight,
+                Action::ResizePane(PaneDirection::Right),
+            ),
+            (
+                MenuAction::ResizePaneUp,
+                Action::ResizePane(PaneDirection::Up),
+            ),
+            (
+                MenuAction::ResizePaneDown,
+                Action::ResizePane(PaneDirection::Down),
+            ),
+            (MenuAction::TogglePaneZoom, Action::TogglePaneZoom),
+            (MenuAction::PrevTab, Action::PrevTab),
+            (MenuAction::NextTab, Action::NextTab),
+            (MenuAction::NextAlertedTab, Action::NextAlertedTab),
+            (MenuAction::Tab1, Action::Tab(1)),
+            (MenuAction::Tab2, Action::Tab(2)),
+            (MenuAction::Tab3, Action::Tab(3)),
+            (MenuAction::Tab4, Action::Tab(4)),
+            (MenuAction::Tab5, Action::Tab(5)),
+            (MenuAction::Tab6, Action::Tab(6)),
+            (MenuAction::Tab7, Action::Tab(7)),
+            (MenuAction::Tab8, Action::Tab(8)),
+            (MenuAction::Tab9, Action::Tab(9)),
+            (MenuAction::Preferences, Action::OpenPreferences),
+        ];
+
+        for (menu_action, expected) in cases {
+            assert_eq!(menu_action.shared_action(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn native_only_menu_actions_stay_outside_the_shared_dispatcher() {
+        for action in [
+            MenuAction::CloseOtherTabs,
+            MenuAction::DockerPicker,
+            MenuAction::CopyHtml,
+            MenuAction::SetTitle,
+            MenuAction::SetColor,
+            MenuAction::ClearReset,
+            MenuAction::SendSignalInt,
+            MenuAction::SendSignalKill,
+            MenuAction::SendSignalHup,
+            MenuAction::SendSignalTerm,
+            MenuAction::TabTemplates,
+            MenuAction::CheckUpdates,
+            MenuAction::About,
+            MenuAction::AttachSession,
+            MenuAction::SSHConnect,
+            MenuAction::ManageRemotes,
+            MenuAction::DebugRelaunch,
+            MenuAction::DebugDumpState,
+            MenuAction::ViewLogs,
+            MenuAction::DebugRelaunchDaemon,
+            MenuAction::KillDaemon,
+        ] {
+            assert_eq!(action.shared_action(), None);
         }
     }
 
