@@ -179,23 +179,31 @@ jobs:
           if-no-files-found: ignore
 
   test-freebsd:
-    name: Test core (FreeBSD 14.4)
+    name: Build and test (FreeBSD 14.4)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 35
     needs: format
     steps:
       - uses: actions/checkout@v7
 
-      # FreeBSD is a headless/core portability target for now; cterm's Linux
-      # desktop backend intentionally targets Wayland rather than X11.
-      - name: Run tests in FreeBSD VM
+      # This gate qualifies the native GTK build and local daemon stack. The
+      # compositor-backed Wayland smoke test is intentionally a separate slice.
+      - name: Build and test in FreeBSD VM
         uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1.5.5
         with:
           release: 14.4
           usesh: true
-          prepare: pkg install -y rust
+          prepare: |
+            pkg install -y \
+              gtk4 \
+              libadwaita \
+              pkgconf \
+              protobuf \
+              rust
           run: |
-            cargo test -p cterm-core -p cterm-ui --lib
+            cargo build --locked -p cterm -p cterm-headless
+            cargo test --locked --workspace --exclude cterm-cocoa --exclude cterm-win32 --lib
+            cargo test --locked -p cterm-headless --test grpc_integration -- --test-threads=1
 
   compatibility-linux:
     name: Compatibility (foot + real TUIs)

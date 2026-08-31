@@ -158,13 +158,13 @@ pub fn default_socket_path() -> PathBuf {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     {
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let mut path = PathBuf::from(runtime_dir);
-            path.push("cterm");
-            std::fs::create_dir_all(&path).ok();
-            path.push("ctermd.sock");
+            let path = runtime_socket_path(std::path::Path::new(&runtime_dir));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
             return path;
         }
     }
@@ -180,6 +180,11 @@ pub fn default_socket_path() -> PathBuf {
         let username = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
         PathBuf::from(format!(r"\\.\pipe\ctermd-{}", username))
     }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+fn runtime_socket_path(runtime_dir: &std::path::Path) -> PathBuf {
+    runtime_dir.join("cterm").join("ctermd.sock")
 }
 
 /// Get the path where the ctermd PID file is stored
@@ -265,5 +270,15 @@ mod tests {
     fn test_default_socket_path() {
         let path = default_socket_path();
         assert!(path.to_string_lossy().contains("ctermd"));
+    }
+
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+    #[test]
+    fn xdg_runtime_socket_path_matches_the_client_layout() {
+        let runtime_dir = std::path::Path::new("/var/run/user/1001");
+        assert_eq!(
+            runtime_socket_path(runtime_dir),
+            runtime_dir.join("cterm/ctermd.sock")
+        );
     }
 }

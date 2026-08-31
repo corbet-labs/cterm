@@ -11,6 +11,7 @@ use cterm_app::upgrade::{UpdateError, UpdateInfo, Updater, CTERM_GITHUB_REPOSITO
 use gtk4::prelude::*;
 use gtk4::{glib, Align, Box as GtkBox, Button, Label, Orientation, ProgressBar, Spinner, Window};
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -23,10 +24,25 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 enum UpdateState {
     Checking,
     NoUpdate,
+    #[cfg(target_os = "linux")]
     UpdateAvailable(UpdateInfo),
-    Downloading { progress: f64 },
-    Downloaded { path: PathBuf, info: UpdateInfo },
+    #[cfg(target_os = "linux")]
+    Downloaded {
+        path: PathBuf,
+        info: UpdateInfo,
+    },
+    ManualOnly,
     Error(String),
+}
+
+fn manual_update_message(version: Option<&str>) -> String {
+    let availability = version.map_or_else(
+        || "A newer version is available".to_string(),
+        |version| format!("Version {version} is available"),
+    );
+    format!(
+        "{availability}. Automatic installation is not available on this platform yet; install it from GitHub Releases or your package manager."
+    )
 }
 
 /// Create and show the update dialog
@@ -103,6 +119,7 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
 
     // State management
     let state: Rc<RefCell<UpdateState>> = Rc::new(RefCell::new(UpdateState::Checking));
+    #[cfg(target_os = "linux")]
     let downloaded_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
 
     // Close button handler
@@ -111,15 +128,22 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
         dialog_close.close();
     });
 
-    // Action button handler (Download / Install)
+    // Action button handler (Download / Install). Other GTK targets keep
+    // update checking, but never compile or offer Linux archive relaunch.
+    #[cfg(target_os = "linux")]
     let state_clone = state.clone();
+    #[cfg(target_os = "linux")]
     let progress_bar_clone = progress_bar.clone();
+    #[cfg(target_os = "linux")]
     let status_label_clone = status_label.clone();
+    #[cfg(target_os = "linux")]
     let action_button_clone = action_button.clone();
-    let _spinner_clone = spinner.clone();
+    #[cfg(target_os = "linux")]
     let downloaded_path_clone = downloaded_path.clone();
+    #[cfg(target_os = "linux")]
     let dialog_clone = dialog.clone();
 
+    #[cfg(target_os = "linux")]
     action_button.connect_clicked(move |btn| {
         let current_state = state_clone.borrow().clone();
 
@@ -240,6 +264,7 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
     let state_check = state.clone();
     let spinner_check = spinner.clone();
     let status_label_check = status_label.clone();
+    #[cfg(target_os = "linux")]
     let action_button_check = action_button.clone();
     let notes_scroll_check = notes_scroll.clone();
     let notes_label_check = notes_label.clone();
@@ -253,12 +278,21 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
 
             match result {
                 Ok(Some(info)) => {
-                    *state_check.borrow_mut() = UpdateState::UpdateAvailable(info.clone());
-                    status_label_check.set_text(&format!(
-                        "Version {} is available (current: {})",
-                        info.version, CURRENT_VERSION
-                    ));
-                    action_button_check.set_visible(true);
+                    #[cfg(target_os = "linux")]
+                    {
+                        *state_check.borrow_mut() = UpdateState::UpdateAvailable(info.clone());
+                        status_label_check.set_text(&format!(
+                            "Version {} is available (current: {})",
+                            info.version, CURRENT_VERSION
+                        ));
+                        action_button_check.set_visible(true);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        *state_check.borrow_mut() = UpdateState::ManualOnly;
+                        status_label_check
+                            .set_text(&manual_update_message(Some(info.version.as_str())));
+                    }
 
                     // Show release notes if available
                     if !info.release_notes.is_empty() {
@@ -272,6 +306,13 @@ pub fn show_update_dialog(parent: &impl IsA<Window>) {
                         "You're running the latest version ({})",
                         CURRENT_VERSION
                     ));
+                }
+                Err(UpdateError::UnsupportedPlatform { .. }) => {
+                    // Version comparison happens before release asset selection,
+                    // so this error means GitHub has a newer release but this
+                    // GTK platform has no safe automatic installer contract.
+                    *state_check.borrow_mut() = UpdateState::ManualOnly;
+                    status_label_check.set_text(&manual_update_message(None));
                 }
                 Err(e) => {
                     *state_check.borrow_mut() = UpdateState::Error(e.to_string());
@@ -306,6 +347,7 @@ async fn check_for_updates() -> Result<Option<UpdateInfo>, UpdateError> {
 ///
 /// Runs the blocking rsurl-based updater on a background thread and awaits the
 /// result via a oneshot channel so the GTK main loop stays responsive.
+#[cfg(target_os = "linux")]
 async fn download_update<F>(info: &UpdateInfo, on_progress: F) -> Result<PathBuf, UpdateError>
 where
     F: FnMut(u64, u64) + Send + 'static,
@@ -331,4 +373,20 @@ where
     });
 
     rx.await.unwrap_or(Err(UpdateError::NotFound))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::manual_update_message;
+
+    #[test]
+    fn manual_update_message_never_promises_automatic_installation() {
+        let known = manual_update_message(Some("1.2.3"));
+        assert!(known.contains("Version 1.2.3 is available"));
+        assert!(known.contains("Automatic installation is not available"));
+
+        let unknown = manual_update_message(None);
+        assert!(unknown.contains("A newer version is available"));
+        assert!(unknown.contains("package manager"));
+    }
 }

@@ -649,6 +649,16 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_release_targets_can_still_report_the_current_version() {
+        let updater = Updater::new("example/cterm", "0.0.20").unwrap();
+        let release = synthetic_release("cterm-freebsd-x86_64.tar.gz", true);
+        assert!(updater
+            .parse_release_for_target(&release, "freebsd", "x86_64")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn test_version_comparison() {
         let v1 = Version::parse("1.0.0").unwrap();
         let v2 = Version::parse("1.0.1").unwrap();
