@@ -732,7 +732,6 @@ name = "cterm-win32"
 version = "0.0.20"
 dependencies = [
  "bincode",
- "bitflags 2.11.0",
  "clap",
  "cterm-app",
  "cterm-client",
