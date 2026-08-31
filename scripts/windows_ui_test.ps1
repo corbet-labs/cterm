@@ -174,6 +174,12 @@ public class User32 {
     [DllImport("user32.dll")]
     public static extern int GetWindowTextLength(IntPtr hWnd);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")]
+    public static extern IntPtr SendMessageValue(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")]
+    public static extern IntPtr SendMessageText(IntPtr hWnd, uint msg, IntPtr wParam, System.Text.StringBuilder lParam);
+
     [DllImport("user32.dll")]
     public static extern IntPtr GetMenu(IntPtr hWnd);
 
@@ -194,6 +200,8 @@ public class User32 {
 
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_COMMAND = 0x0111;
+    public const uint WM_GETTEXT = 0x000D;
+    public const uint WM_GETTEXTLENGTH = 0x000E;
     public const uint BM_CLICK = 0x00F5;
     public const uint MF_BYPOSITION = 0x0400;
 
@@ -235,9 +243,23 @@ function Get-MenuLabel {
 
 function Get-NativeWindowText {
     param([System.IntPtr]$Hwnd)
-    $length = [User32]::GetWindowTextLength($Hwnd)
+
+    # GetWindowText cannot retrieve a child control's text across process
+    # boundaries. System messages below WM_USER are marshalled by Windows, so
+    # query MessageBox controls explicitly through WM_GETTEXT instead.
+    $length = [User32]::SendMessageValue(
+        $Hwnd,
+        [User32]::WM_GETTEXTLENGTH,
+        [System.IntPtr]::Zero,
+        [System.IntPtr]::Zero
+    ).ToInt32()
     $text = [System.Text.StringBuilder]::new($length + 1)
-    [User32]::GetWindowText($Hwnd, $text, $text.Capacity) | Out-Null
+    [User32]::SendMessageText(
+        $Hwnd,
+        [User32]::WM_GETTEXT,
+        [System.IntPtr]$text.Capacity,
+        $text
+    ) | Out-Null
     return $text.ToString()
 }
 
