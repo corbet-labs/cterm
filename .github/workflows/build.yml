@@ -255,6 +255,7 @@ jobs:
             pkg install -y \
               bash \
               cage \
+              coreutils \
               gtk4 \
               libadwaita \
               xwayland-run
@@ -283,12 +284,17 @@ jobs:
             export WLR_LIBINPUT_NO_DEVICES=1
 
             ui_status=0
-            wlheadless-run -c cage -- \
-              env -u DISPLAY \
-              ./scripts/linux_ui_test.sh \
-              ./freebsd-ui-binaries/cterm \
-              "$OUTPUT_DIR" \
-              >"$OUTPUT_DIR/wlheadless.log" 2>&1 || ui_status=$?
+            # Keep the VM action alive long enough to copy its workspace back
+            # to the runner even when Cage, cterm, or a descendant wedges.
+            # GNU timeout owns the whole child process group and escalates to
+            # SIGKILL, leaving the outer job timeout as a last-resort guard.
+            gtimeout --signal=TERM --kill-after=10s 3m \
+              wlheadless-run -c cage -- \
+                env -u DISPLAY \
+                ./scripts/linux_ui_test.sh \
+                ./freebsd-ui-binaries/cterm \
+                "$OUTPUT_DIR" \
+                >"$OUTPUT_DIR/wlheadless.log" 2>&1 || ui_status=$?
             printf '%s\n' "$ui_status" >"$OUTPUT_DIR/exit-code"
 
       - name: Upload FreeBSD UI test diagnostics
