@@ -168,8 +168,8 @@ public class User32 {
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")]
+    public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
     [DllImport("user32.dll")]
     public static extern int GetWindowTextLength(IntPtr hWnd);
@@ -221,6 +221,30 @@ public class User32 {
         }, IntPtr.Zero);
         return result;
     }
+
+    public static string GetDescendantText(IntPtr parent) {
+        System.Text.StringBuilder result = new System.Text.StringBuilder();
+        EnumChildWindows(parent, delegate(IntPtr hWnd, IntPtr lParam) {
+            int length = SendMessageValue(
+                hWnd,
+                WM_GETTEXTLENGTH,
+                IntPtr.Zero,
+                IntPtr.Zero
+            ).ToInt32();
+            if (length > 0) {
+                System.Text.StringBuilder text = new System.Text.StringBuilder(length + 1);
+                SendMessageText(hWnd, WM_GETTEXT, new IntPtr(text.Capacity), text);
+                if (text.Length > 0) {
+                    if (result.Length > 0) {
+                        result.AppendLine();
+                    }
+                    result.Append(text);
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return result.ToString();
+    }
 }
 "@
 
@@ -239,28 +263,6 @@ function Get-MenuLabel {
         [User32]::MF_BYPOSITION
     ) | Out-Null
     return (($label.ToString() -replace '&', '') -split "`t")[0].Trim()
-}
-
-function Get-NativeWindowText {
-    param([System.IntPtr]$Hwnd)
-
-    # GetWindowText cannot retrieve a child control's text across process
-    # boundaries. System messages below WM_USER are marshalled by Windows, so
-    # query MessageBox controls explicitly through WM_GETTEXT instead.
-    $length = [User32]::SendMessageValue(
-        $Hwnd,
-        [User32]::WM_GETTEXTLENGTH,
-        [System.IntPtr]::Zero,
-        [System.IntPtr]::Zero
-    ).ToInt32()
-    $text = [System.Text.StringBuilder]::new($length + 1)
-    [User32]::SendMessageText(
-        $Hwnd,
-        [User32]::WM_GETTEXT,
-        [System.IntPtr]$text.Capacity,
-        $text
-    ) | Out-Null
-    return $text.ToString()
 }
 
 function Find-SubmenuByLabel {
@@ -519,8 +521,10 @@ while ($pluginDialog -eq [System.IntPtr]::Zero -and (Get-Date) -lt $dialogDeadli
 if ($pluginDialog -eq [System.IntPtr]::Zero) {
     throw "Native plugin approval dialog did not appear"
 }
-$promptControl = [User32]::GetDlgItem($pluginDialog, -1)
-$promptText = Get-NativeWindowText -Hwnd $promptControl
+# MessageBox implementations do not promise a stable control ID for the text.
+# Read every descendant through WM_GETTEXT and assert against the combined
+# accessibility surface instead of assuming the traditional IDC_STATIC value.
+$promptText = [User32]::GetDescendantText($pluginDialog)
 if (-not $promptText.Contains("UI Test Plugin (org.example.ui)")) {
     throw "Plugin identity is absent from native prompt: $promptText"
 }
