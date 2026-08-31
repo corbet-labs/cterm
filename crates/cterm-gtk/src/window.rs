@@ -604,6 +604,8 @@ enum PaneCiStep {
     Zoom,
     Unzoom,
     WaitClose,
+    WaitTemplate,
+    WaitUniqueReuse,
 }
 
 #[derive(Clone)]
@@ -624,6 +626,36 @@ fn pane_ci_snapshot(
         pane_count: tab.panes.len(),
         active: tab.active_pane_id(),
         layout: tab.panes.layout().clone(),
+    })
+}
+
+struct TemplateCiSnapshot {
+    tab_count: usize,
+    tab_id: u64,
+    session_id: Option<String>,
+    template_name: Option<String>,
+    keep_open: bool,
+    color: Option<String>,
+    screen_text: String,
+}
+
+fn template_ci_snapshot(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+) -> Option<TemplateCiSnapshot> {
+    let page = notebook.current_page()?;
+    let tabs = tabs.borrow();
+    let tab = tabs.get(page as usize)?;
+    let pane = tab.panes.active();
+    let screen_text = pane.terminal.terminal().lock().screen().grid().text();
+    Some(TemplateCiSnapshot {
+        tab_count: tabs.len(),
+        tab_id: tab.id,
+        session_id: pane.session_id.clone(),
+        template_name: pane.template_name.clone(),
+        keep_open: pane.keep_open,
+        color: tab.color.clone(),
+        screen_text,
     })
 }
 
@@ -2150,14 +2182,46 @@ impl CtermWindow {
         let window = self.window.clone();
         let notebook = self.notebook.clone();
         let tabs = Rc::clone(&self.tabs);
+        let quick_open = self.quick_open.clone();
         let step = Rc::new(RefCell::new(PaneCiStep::WaitInitial));
         let started = std::time::Instant::now();
+        let template_name = std::env::var("CTERM_WAYLAND_TEMPLATE_CI_NAME")
+            .unwrap_or_else(|_| pane_ci_fail(PaneCiStep::WaitTemplate, "template name is unset"));
+        let template_marker = std::env::var("CTERM_WAYLAND_TEMPLATE_CI_MARKER")
+            .unwrap_or_else(|_| pane_ci_fail(PaneCiStep::WaitTemplate, "template marker is unset"));
+        let template_ready = std::env::var_os("CTERM_WAYLAND_TEMPLATE_CI_READY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                pane_ci_fail(PaneCiStep::WaitTemplate, "template ready path is unset")
+            });
+        let template_visible = std::env::var_os("CTERM_WAYLAND_TEMPLATE_CI_VISIBLE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                pane_ci_fail(PaneCiStep::WaitTemplate, "template visible path is unset")
+            });
+        let template_done = std::env::var_os("CTERM_WAYLAND_TEMPLATE_CI_DONE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                pane_ci_fail(
+                    PaneCiStep::WaitTemplate,
+                    "template completion path is unset",
+                )
+            });
+        let template_workspace = std::env::var_os("CTERM_WAYLAND_TEMPLATE_CI_WORKSPACE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                pane_ci_fail(PaneCiStep::WaitTemplate, "template workspace is unset")
+            });
+        let mut template_completed_at = None;
+        let mut template_tab_id = None;
+        let mut template_session_id = None;
+        let mut unique_requested_at = None;
 
         pane_ci_marker("CTERM_PANE_CI START backend=wayland");
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             let current_step = *step.borrow();
-            if started.elapsed() > std::time::Duration::from_secs(20) {
-                pane_ci_fail(current_step, "timed out after 20 seconds");
+            if started.elapsed() > std::time::Duration::from_secs(40) {
+                pane_ci_fail(current_step, "timed out after 40 seconds");
             }
 
             let Some(snapshot) = pane_ci_snapshot(&notebook, &tabs) else {
@@ -2274,6 +2338,139 @@ impl CtermWindow {
                         );
                     }
                     pane_ci_marker("CTERM_PANE_CI CLOSE_OK panes=2");
+
+                    pane_ci_activate(&window, "quick-open")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    if !quick_open.is_visible() {
+                        pane_ci_fail(current_step, "Quick Open overlay did not become visible");
+                    }
+                    if !quick_open.confirm_selection_for_ci() {
+                        pane_ci_fail(current_step, "Quick Open had no template selection");
+                    }
+                    pane_ci_marker("CTERM_TEMPLATE_CI INGRESS_OK source=quick-open");
+                    *step.borrow_mut() = PaneCiStep::WaitTemplate;
+                }
+                PaneCiStep::WaitTemplate => {
+                    let Some(template) = template_ci_snapshot(&notebook, &tabs) else {
+                        return glib::ControlFlow::Continue;
+                    };
+                    if template.tab_count == 1 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if template.tab_count != 2 {
+                        pane_ci_fail(
+                            current_step,
+                            format!(
+                                "template launch produced {} tabs instead of 2",
+                                template.tab_count
+                            ),
+                        );
+                    }
+                    if template.template_name.as_deref() != Some(template_name.as_str()) {
+                        pane_ci_fail(current_step, "new tab lost its template identity");
+                    }
+                    let Some(session_id) = template.session_id.clone() else {
+                        return glib::ControlFlow::Continue;
+                    };
+                    if !template_ready.exists() {
+                        std::fs::write(&template_ready, b"attached\n").unwrap_or_else(|error| {
+                            pane_ci_fail(
+                                current_step,
+                                format!("cannot signal attached template session: {error}"),
+                            )
+                        });
+                    }
+                    if !template.screen_text.contains(&template_marker) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if !template_visible.exists() {
+                        std::fs::write(&template_visible, b"visible\n").unwrap_or_else(|error| {
+                            pane_ci_fail(
+                                current_step,
+                                format!("cannot acknowledge visible template output: {error}"),
+                            )
+                        });
+                    }
+                    let completed_cwd = match std::fs::read_to_string(&template_done) {
+                        Ok(cwd) => cwd,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return glib::ControlFlow::Continue;
+                        }
+                        Err(error) => pane_ci_fail(
+                            current_step,
+                            format!("cannot read template completion evidence: {error}"),
+                        ),
+                    };
+                    if std::path::Path::new(completed_cwd.trim()) != template_workspace {
+                        pane_ci_fail(
+                            current_step,
+                            format!(
+                                "template cwd was {:?}, expected {:?}",
+                                completed_cwd.trim(),
+                                template_workspace
+                            ),
+                        );
+                    }
+
+                    let completed_at =
+                        template_completed_at.get_or_insert_with(std::time::Instant::now);
+                    if completed_at.elapsed() < std::time::Duration::from_millis(750) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if !template.keep_open {
+                        pane_ci_fail(current_step, "exited template tab was not marked keep_open");
+                    }
+                    if template.color.as_deref() != Some("#2a7fff") {
+                        pane_ci_fail(current_step, "template tab color was not applied");
+                    }
+                    template_tab_id = Some(template.tab_id);
+                    template_session_id = Some(session_id);
+                    pane_ci_marker(
+                        "CTERM_TEMPLATE_CI LAUNCH_OK argv=visible cwd=prepared keep_open=true color=#2a7fff",
+                    );
+
+                    pane_ci_activate(&window, "prev-tab")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    let left_template = template_ci_snapshot(&notebook, &tabs)
+                        .is_some_and(|current| current.tab_id != template.tab_id);
+                    if !left_template {
+                        pane_ci_fail(current_step, "could not leave the unique template tab");
+                    }
+                    pane_ci_activate(&window, "quick-open")
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    if !quick_open.is_visible() || !quick_open.confirm_selection_for_ci() {
+                        pane_ci_fail(current_step, "second Quick Open selection failed");
+                    }
+                    unique_requested_at = Some(std::time::Instant::now());
+                    *step.borrow_mut() = PaneCiStep::WaitUniqueReuse;
+                }
+                PaneCiStep::WaitUniqueReuse => {
+                    if unique_requested_at.is_none_or(|requested| {
+                        requested.elapsed() < std::time::Duration::from_secs(1)
+                    }) {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let template = template_ci_snapshot(&notebook, &tabs)
+                        .unwrap_or_else(|| pane_ci_fail(current_step, "active tab disappeared"));
+                    if template.tab_count != 2 {
+                        pane_ci_fail(
+                            current_step,
+                            format!(
+                                "unique template created a duplicate; tab count is {}",
+                                template.tab_count
+                            ),
+                        );
+                    }
+                    if Some(template.tab_id) != template_tab_id
+                        || template.session_id != template_session_id
+                        || template.template_name.as_deref() != Some(template_name.as_str())
+                    {
+                        pane_ci_fail(
+                            current_step,
+                            "unique template did not focus the existing tab/session",
+                        );
+                    }
+                    pane_ci_marker("CTERM_TEMPLATE_CI UNIQUE_OK tabs=2 session=reused");
                     pane_ci_marker("CTERM_PANE_CI COMPLETE");
                     destroy_all_pane_sessions(&tabs);
                     window.destroy();

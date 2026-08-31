@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wayland-only pane action test for cterm's GTK backend.
+# Wayland-only pane and template action test for cterm's GTK backend.
 
 set -euo pipefail
 
@@ -7,13 +7,17 @@ CTERM_PATH="${1:-target/debug/cterm}"
 OUTPUT_DIR="${2:-test_output}"
 
 mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
+if [[ "$CTERM_PATH" != /* ]]; then
+    CTERM_PATH="$(cd "$(dirname "$CTERM_PATH")" && pwd -P)/$(basename "$CTERM_PATH")"
+fi
 LOG_FILE="$OUTPUT_DIR/test.log"
 
 log() {
     printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" | tee -a "$LOG_FILE"
 }
 
-log "=== cterm Wayland pane action test ==="
+log "=== cterm Wayland pane and template action test ==="
 log "Executable: $CTERM_PATH"
 log "Output: $OUTPUT_DIR"
 
@@ -51,6 +55,87 @@ export CTERM_LOG_FILE="$OUTPUT_DIR/cterm.log"
 export WAYLAND_DEBUG=client
 export CTERM_WAYLAND_PANE_CI=1
 
+toml_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "$value"
+}
+
+TEMPLATE_NAME="GTK CI Template"
+TEMPLATE_COMMAND="$OUTPUT_DIR/template-command.sh"
+TEMPLATE_READY="$OUTPUT_DIR/template.ready"
+TEMPLATE_VISIBLE="$OUTPUT_DIR/template.visible"
+TEMPLATE_DONE="$OUTPUT_DIR/template.done"
+TEMPLATE_WORKSPACE="$OUTPUT_DIR/template-workspace"
+TEMPLATE_MARKER="CTERM_TEMPLATE_OK <alpha beta>|<gamma>|plan-env|config-env"
+CONFIG_ROOT="$OUTPUT_DIR/xdg-config"
+CONFIG_DIR="$CONFIG_ROOT/cterm"
+mkdir -p "$CONFIG_DIR"
+rm -f "$TEMPLATE_READY" "$TEMPLATE_VISIBLE" "$TEMPLATE_DONE"
+
+cat >"$TEMPLATE_COMMAND" <<'EOF'
+#!/bin/sh
+attempt=0
+while [ ! -f "$CTERM_TEMPLATE_READY" ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 200 ]; then
+        exit 91
+    fi
+    sleep 0.05
+done
+printf 'CTERM_TEMPLATE_OK <%s>|<%s>|%s|%s\n' \
+    "$1" "$2" "$CTERM_TEMPLATE_ENV" "$CTERM_CONFIG_ENV"
+attempt=0
+while [ ! -f "$CTERM_TEMPLATE_VISIBLE" ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 200 ]; then
+        exit 92
+    fi
+    sleep 0.05
+done
+pwd >"$CTERM_TEMPLATE_DONE"
+exit 23
+EOF
+chmod +x "$TEMPLATE_COMMAND"
+
+cat >"$CONFIG_DIR/config.toml" <<'EOF'
+[general]
+term = "cterm-ci"
+
+[general.env]
+CTERM_CONFIG_ENV = "config-env"
+EOF
+
+cat >"$CONFIG_DIR/sticky_tabs.toml" <<EOF
+[[tabs]]
+name = "$TEMPLATE_NAME"
+command = "$(toml_escape "$TEMPLATE_COMMAND")"
+args = ["alpha beta", "gamma"]
+working_directory = "$(toml_escape "$TEMPLATE_WORKSPACE")"
+color = "#2a7fff"
+theme = "nord"
+background_color = "#102030"
+keep_open = true
+unique = true
+
+[tabs.env]
+CTERM_TEMPLATE_ENV = "plan-env"
+CTERM_TEMPLATE_READY = "$(toml_escape "$TEMPLATE_READY")"
+CTERM_TEMPLATE_VISIBLE = "$(toml_escape "$TEMPLATE_VISIBLE")"
+CTERM_TEMPLATE_DONE = "$(toml_escape "$TEMPLATE_DONE")"
+EOF
+
+export XDG_CONFIG_HOME="$CONFIG_ROOT"
+export CTERM_WAYLAND_TEMPLATE_CI_NAME="$TEMPLATE_NAME"
+export CTERM_WAYLAND_TEMPLATE_CI_MARKER="$TEMPLATE_MARKER"
+export CTERM_WAYLAND_TEMPLATE_CI_READY="$TEMPLATE_READY"
+export CTERM_WAYLAND_TEMPLATE_CI_VISIBLE="$TEMPLATE_VISIBLE"
+export CTERM_WAYLAND_TEMPLATE_CI_DONE="$TEMPLATE_DONE"
+export CTERM_WAYLAND_TEMPLATE_CI_WORKSPACE="$TEMPLATE_WORKSPACE"
+
+log "Prepared isolated Quick Open template fixture"
+
 log "Starting cterm..."
 "$CTERM_PATH" >"$OUTPUT_DIR/cterm.stdout.log" 2>"$OUTPUT_DIR/cterm.stderr.log" &
 CTERM_PID=$!
@@ -65,7 +150,7 @@ cleanup() {
 trap cleanup EXIT
 
 surface_ready=0
-for _attempt in $(seq 1 120); do
+for _attempt in $(seq 1 240); do
     if grep -q 'wl_compositor.*create_surface' "$OUTPUT_DIR/cterm.stderr.log"; then
         surface_ready=1
     fi
@@ -104,6 +189,9 @@ required_markers=(
     "CTERM_PANE_CI ZOOM_OK"
     "CTERM_PANE_CI UNZOOM_OK"
     "CTERM_PANE_CI CLOSE_OK panes=2"
+    "CTERM_TEMPLATE_CI INGRESS_OK source=quick-open"
+    "CTERM_TEMPLATE_CI LAUNCH_OK argv=visible cwd=prepared keep_open=true color=#2a7fff"
+    "CTERM_TEMPLATE_CI UNIQUE_OK tabs=2 session=reused"
     "CTERM_PANE_CI COMPLETE"
 )
 for marker in "${required_markers[@]}"; do
@@ -120,5 +208,15 @@ if grep -Eqi 'panic|Gdk-CRITICAL|Gtk-ERROR|segmentation fault|CTERM_PANE_CI FAIL
     exit 1
 fi
 
-log "cterm created a native Wayland surface and completed every pane action"
+if [ ! -f "$TEMPLATE_DONE" ]; then
+    log "ERROR: template command did not leave completion evidence"
+    exit 1
+fi
+
+if [ "$(tr -d '\r\n' <"$TEMPLATE_DONE")" != "$TEMPLATE_WORKSPACE" ]; then
+    log "ERROR: template command did not run in the prepared workspace"
+    exit 1
+fi
+
+log "cterm created a native Wayland surface and completed pane/template actions"
 log "=== Test completed ==="

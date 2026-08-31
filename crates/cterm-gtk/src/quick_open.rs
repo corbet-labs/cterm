@@ -221,6 +221,25 @@ impl QuickOpenOverlay {
         self.container.is_visible()
     }
 
+    /// Confirm the selected row through the normal Quick Open callback in the
+    /// opt-in Wayland CI driver. This avoids compositor-specific input
+    /// injection while still exercising the native action, overlay, matcher,
+    /// and selection ingress used by keyboard and mouse activation.
+    pub(crate) fn confirm_selection_for_ci(&self) -> bool {
+        if std::env::var("CTERM_WAYLAND_PANE_CI").as_deref() != Ok("1") {
+            return false;
+        }
+        let has_selection = self
+            .filtered
+            .borrow()
+            .get(self.selected_index.get())
+            .is_some();
+        if has_selection {
+            self.confirm_selection();
+        }
+        has_selection
+    }
+
     /// Set the callback for template selection
     pub fn set_on_select<F>(&self, callback: F)
     where
