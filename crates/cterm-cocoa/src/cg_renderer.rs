@@ -18,6 +18,7 @@ use cterm_ui::theme::Theme;
 
 /// CoreGraphics renderer for terminal display
 pub struct CGRenderer {
+    font_name: String,
     font: Retained<NSFont>,
     bold_font: Retained<NSFont>,
     italic_font: Retained<NSFont>,
@@ -73,6 +74,7 @@ impl CGRenderer {
         );
 
         Self {
+            font_name: font_name.to_string(),
             font,
             bold_font,
             italic_font,
@@ -83,6 +85,35 @@ impl CGRenderer {
             bold_is_bright,
             background_override: None,
         }
+    }
+
+    /// Return the current font size in points.
+    pub fn font_size(&self) -> f64 {
+        self.font.pointSize()
+    }
+
+    /// Rebuild the renderer fonts and cell metrics for a new point size.
+    pub fn set_font_size(&mut self, mtm: MainThreadMarker, font_size: f64) {
+        let font = Self::load_font(&self.font_name, font_size);
+        let fm = NSFontManager::sharedFontManager(mtm);
+        let bold_font = fm.convertFont_toHaveTrait(&font, NSFontTraitMask::BoldFontMask);
+        let italic_font = fm.convertFont_toHaveTrait(&font, NSFontTraitMask::ItalicFontMask);
+        let bold_italic_font =
+            fm.convertFont_toHaveTrait(&bold_font, NSFontTraitMask::ItalicFontMask);
+
+        self.cell_width = Self::get_advance_for_glyph(&font);
+        self.cell_height = font_size * 1.2;
+        self.font = font;
+        self.bold_font = bold_font;
+        self.italic_font = italic_font;
+        self.bold_italic_font = bold_italic_font;
+
+        log::debug!(
+            "CGRenderer: font_size={}, cell_width={}, cell_height={}",
+            font_size,
+            self.cell_width,
+            self.cell_height
+        );
     }
 
     /// Set an optional background color override (hex string like "#1a1b26")

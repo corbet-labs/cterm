@@ -656,13 +656,8 @@ fn create_window_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // Window positioning
-    menu.addItem(&create_menu_item_with_key(
-        mtm,
-        "Fill",
-        Some(sel!(windowFill:)),
-        "f",
-        NSEventModifierFlags::Control.union(NSEventModifierFlags::Command),
-    ));
+    // Keep Command-Control-F exclusively for the standard full-screen action.
+    menu.addItem(&create_menu_item(mtm, "Fill", Some(sel!(windowFill:)), ""));
 
     menu.addItem(&create_menu_item_with_key(
         mtm,
@@ -677,33 +672,30 @@ fn create_window_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     move_resize_menu.setTitle(&NSString::from_str("Move & Resize"));
 
     // Halves
-    move_resize_menu.addItem(&create_menu_item_with_key(
+    // Control-Option-arrow belongs to the configurable pane-focus actions.
+    move_resize_menu.addItem(&create_menu_item(
         mtm,
         "Left Half",
         Some(sel!(windowLeftHalf:)),
-        "\u{f702}", // Left arrow
-        NSEventModifierFlags::Control.union(NSEventModifierFlags::Option),
+        "",
     ));
-    move_resize_menu.addItem(&create_menu_item_with_key(
+    move_resize_menu.addItem(&create_menu_item(
         mtm,
         "Right Half",
         Some(sel!(windowRightHalf:)),
-        "\u{f703}", // Right arrow
-        NSEventModifierFlags::Control.union(NSEventModifierFlags::Option),
+        "",
     ));
-    move_resize_menu.addItem(&create_menu_item_with_key(
+    move_resize_menu.addItem(&create_menu_item(
         mtm,
         "Top Half",
         Some(sel!(windowTopHalf:)),
-        "\u{f700}", // Up arrow
-        NSEventModifierFlags::Control.union(NSEventModifierFlags::Option),
+        "",
     ));
-    move_resize_menu.addItem(&create_menu_item_with_key(
+    move_resize_menu.addItem(&create_menu_item(
         mtm,
         "Bottom Half",
         Some(sel!(windowBottomHalf:)),
-        "\u{f701}", // Down arrow
-        NSEventModifierFlags::Control.union(NSEventModifierFlags::Option),
+        "",
     ));
 
     move_resize_menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -741,21 +733,22 @@ fn create_window_menu(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    // Tab navigation (Ctrl+Tab and Ctrl+Shift+Tab)
+    // Native macOS tab navigation. Configured Ctrl-Tab shortcuts are handled
+    // by the shared action dispatcher instead of being hardcoded here.
     menu.addItem(&create_menu_item_with_key(
         mtm,
         "Show Previous Tab",
         Some(sel!(selectPreviousTab:)),
-        "\t", // Tab character
-        NSEventModifierFlags::Control.union(NSEventModifierFlags::Shift),
+        "[",
+        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
     ));
 
     menu.addItem(&create_menu_item_with_key(
         mtm,
         "Show Next Tab",
         Some(sel!(selectNextTab:)),
-        "\t", // Tab character
-        NSEventModifierFlags::Control,
+        "]",
+        NSEventModifierFlags::Command.union(NSEventModifierFlags::Shift),
     ));
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));

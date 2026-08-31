@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSMenu,
@@ -20,8 +20,8 @@ use cterm_app::config::Config;
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_app::upgrade::{PaneLaunchContext, PaneUpgradeState, TabUpgradeState};
 use cterm_ui::{
-    PaneDirection, PaneId, PaneLayout, PaneLayoutError, PaneRect, SplitDirection, SplitPlacement,
-    SplitRatio, SplitRequest, Theme,
+    Action, PaneDirection, PaneId, PaneLayout, PaneLayoutError, PaneRect, SplitDirection,
+    SplitPlacement, SplitRatio, SplitRequest, Theme,
 };
 
 use crate::cg_renderer::CGRenderer;
@@ -38,6 +38,28 @@ struct NativePane {
 enum CloseTarget {
     Window,
     Pane(PaneId),
+}
+
+#[derive(Clone, Copy)]
+enum AppAction {
+    NewWindow,
+    NextAlertedTab,
+    OpenPreferences,
+}
+
+fn is_managed_restricted_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewTab
+            | Action::SplitPane(_)
+            | Action::ClosePane
+            | Action::FocusPane(_)
+            | Action::ResizePane(_)
+            | Action::TogglePaneZoom
+            | Action::NewWindow
+            | Action::OpenPreferences
+            | Action::QuickOpenTemplate
+    )
 }
 
 struct DaemonProcessQuery {
@@ -167,76 +189,92 @@ define_class!(
     impl CtermWindow {
         #[unsafe(method(newTab:))]
         fn action_new_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            if crate::app::get_args().managed {
-                log::warn!("Ignoring new-tab request in managed mode");
-                return;
-            }
-            self.create_new_tab();
+            self.dispatch_action(&Action::NewTab);
         }
 
         #[unsafe(method(closeTab:))]
         fn action_close_tab(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.close_current_tab();
+            self.dispatch_action(&Action::CloseTab);
         }
 
         #[unsafe(method(splitPaneHorizontal:))]
         fn action_split_pane_horizontal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.create_pane(SplitDirection::Horizontal);
+            self.dispatch_action(&Action::SplitPane(SplitDirection::Horizontal));
         }
 
         #[unsafe(method(splitPaneVertical:))]
         fn action_split_pane_vertical(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.create_pane(SplitDirection::Vertical);
+            self.dispatch_action(&Action::SplitPane(SplitDirection::Vertical));
         }
 
         #[unsafe(method(closePane:))]
         fn action_close_pane(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.close_active_pane();
+            self.dispatch_action(&Action::ClosePane);
         }
 
         #[unsafe(method(focusPaneLeft:))]
         fn action_focus_pane_left(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.focus_pane_direction(PaneDirection::Left);
+            self.dispatch_action(&Action::FocusPane(PaneDirection::Left));
         }
 
         #[unsafe(method(focusPaneRight:))]
         fn action_focus_pane_right(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.focus_pane_direction(PaneDirection::Right);
+            self.dispatch_action(&Action::FocusPane(PaneDirection::Right));
         }
 
         #[unsafe(method(focusPaneUp:))]
         fn action_focus_pane_up(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.focus_pane_direction(PaneDirection::Up);
+            self.dispatch_action(&Action::FocusPane(PaneDirection::Up));
         }
 
         #[unsafe(method(focusPaneDown:))]
         fn action_focus_pane_down(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.focus_pane_direction(PaneDirection::Down);
+            self.dispatch_action(&Action::FocusPane(PaneDirection::Down));
         }
 
         #[unsafe(method(resizePaneLeft:))]
         fn action_resize_pane_left(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.resize_active_pane(PaneDirection::Left);
+            self.dispatch_action(&Action::ResizePane(PaneDirection::Left));
         }
 
         #[unsafe(method(resizePaneRight:))]
         fn action_resize_pane_right(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.resize_active_pane(PaneDirection::Right);
+            self.dispatch_action(&Action::ResizePane(PaneDirection::Right));
         }
 
         #[unsafe(method(resizePaneUp:))]
         fn action_resize_pane_up(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.resize_active_pane(PaneDirection::Up);
+            self.dispatch_action(&Action::ResizePane(PaneDirection::Up));
         }
 
         #[unsafe(method(resizePaneDown:))]
         fn action_resize_pane_down(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.resize_active_pane(PaneDirection::Down);
+            self.dispatch_action(&Action::ResizePane(PaneDirection::Down));
         }
 
         #[unsafe(method(togglePaneZoom:))]
         fn action_toggle_pane_zoom(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            self.toggle_active_pane_zoom();
+            self.dispatch_action(&Action::TogglePaneZoom);
+        }
+
+        #[unsafe(method(zoomIn:))]
+        fn action_zoom_in(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.dispatch_action(&Action::ZoomIn);
+        }
+
+        #[unsafe(method(zoomOut:))]
+        fn action_zoom_out(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.dispatch_action(&Action::ZoomOut);
+        }
+
+        #[unsafe(method(zoomReset:))]
+        fn action_zoom_reset(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.dispatch_action(&Action::ZoomReset);
+        }
+
+        #[unsafe(method(performFindPanelAction:))]
+        fn action_find_text(&self, _sender: Option<&objc2::runtime::AnyObject>) {
+            self.dispatch_action(&Action::FindText);
         }
 
         #[unsafe(method(focusPaneForView:))]
@@ -474,6 +512,186 @@ fn destroy_unattached_session(session: cterm_client::SessionHandle) {
 }
 
 impl CtermWindow {
+    /// Execute a shared semantic action against this window's active context.
+    ///
+    /// Keep this match exhaustive so newly added actions cannot silently fall
+    /// through into terminal input on macOS.
+    pub(crate) fn dispatch_action(&self, action: &Action) {
+        if crate::app::get_args().managed && is_managed_restricted_action(action) {
+            log::warn!("Ignoring {action:?} request in managed mode");
+            return;
+        }
+
+        match action {
+            Action::NewTab => self.create_new_tab(),
+            Action::CloseTab => self.close_current_tab(),
+            Action::NextTab => {
+                let _: () =
+                    unsafe { msg_send![self, selectNextTab: std::ptr::null::<AnyObject>()] };
+            }
+            Action::PrevTab => {
+                let _: () =
+                    unsafe { msg_send![self, selectPreviousTab: std::ptr::null::<AnyObject>()] };
+            }
+            Action::NextAlertedTab => self.dispatch_app_action(AppAction::NextAlertedTab),
+            Action::Tab(number) => self.select_tab_number(*number),
+            Action::SplitPane(direction) => self.create_pane(*direction),
+            Action::ClosePane => self.close_active_pane(),
+            Action::FocusPane(direction) => self.focus_pane_direction(*direction),
+            Action::ResizePane(direction) => self.resize_active_pane(*direction),
+            Action::TogglePaneZoom => self.toggle_active_pane_zoom(),
+            Action::NewWindow => self.dispatch_app_action(AppAction::NewWindow),
+            Action::CloseWindow => self.performClose(None),
+            Action::Copy => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.copy_selection();
+                }
+            }
+            Action::Paste => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.paste_clipboard();
+                }
+            }
+            Action::SelectAll => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.select_all();
+                }
+            }
+            Action::ZoomIn => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.zoom_in();
+                }
+            }
+            Action::ZoomOut => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.zoom_out();
+                }
+            }
+            Action::ZoomReset => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.zoom_reset();
+                }
+            }
+            Action::ToggleFullscreen => self.toggleFullScreen(None),
+            Action::ScrollUp => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_viewport_up(1);
+                }
+            }
+            Action::ScrollDown => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_viewport_down(1);
+                }
+            }
+            Action::ScrollPageUp => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_page_up();
+                }
+            }
+            Action::ScrollPageDown => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_page_down();
+                }
+            }
+            Action::ScrollToTop => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_to_top();
+                }
+            }
+            Action::ScrollToBottom => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_to_bottom();
+                }
+            }
+            Action::PromptPrevious => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_to_previous_prompt();
+                }
+            }
+            Action::PromptNext => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.scroll_to_next_prompt();
+                }
+            }
+            Action::OpenPreferences => self.dispatch_app_action(AppAction::OpenPreferences),
+            Action::FindText => self.show_find_dialog(),
+            Action::ResetTerminal => {
+                if let Some(terminal) = self.active_terminal() {
+                    terminal.reset();
+                }
+            }
+            Action::QuickOpenTemplate => self.show_quick_open(),
+        }
+    }
+
+    fn dispatch_app_action(&self, action: AppAction) {
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        let Some(delegate) = app.delegate() else {
+            log::error!("Cannot dispatch Cocoa application action without a delegate");
+            return;
+        };
+        let sender = std::ptr::null::<AnyObject>();
+        unsafe {
+            match action {
+                AppAction::NewWindow => {
+                    let _: () = msg_send![&*delegate, newWindow: sender];
+                }
+                AppAction::NextAlertedTab => {
+                    let _: () = msg_send![&*delegate, selectNextAlertedTab: sender];
+                }
+                AppAction::OpenPreferences => {
+                    let _: () = msg_send![&*delegate, showPreferences: sender];
+                }
+            }
+        }
+    }
+
+    fn select_tab_number(&self, number: u8) {
+        let windows: Option<Retained<NSArray<NSWindow>>> =
+            unsafe { msg_send![self, tabbedWindows] };
+        let Some(windows) = windows else {
+            return;
+        };
+        let index = usize::from(number).saturating_sub(1);
+        if let Some(window) = windows.iter().nth(index) {
+            window.makeKeyAndOrderFront(None);
+            log::debug!("Selected tab {}", index + 1);
+        }
+    }
+
+    fn show_find_dialog(&self) {
+        let mtm = MainThreadMarker::from(self);
+        let Some(pattern) = crate::dialogs::show_input(
+            mtm,
+            None,
+            "Find in Terminal",
+            "Search the active terminal's scrollback and visible buffer:",
+            "",
+        ) else {
+            return;
+        };
+        if pattern.is_empty() {
+            return;
+        }
+
+        let count = self
+            .active_terminal()
+            .map(|terminal| terminal.find_text(&pattern, false, false))
+            .unwrap_or(0);
+        log::info!("Found {count} matches for: {pattern}");
+
+        if count == 0 {
+            let alert = objc2_app_kit::NSAlert::new(mtm);
+            alert.setAlertStyle(NSAlertStyle::Informational);
+            alert.setMessageText(&NSString::from_str("Find in Terminal"));
+            alert.setInformativeText(&NSString::from_str(&format!(
+                "No matches found for \"{pattern}\"."
+            )));
+            alert.addButtonWithTitle(&NSString::from_str("OK"));
+            alert.runModal();
+        }
+    }
+
     /// Common window initialization: calculate size, allocate, init NSWindow,
     /// set min size, tabbing mode, and delegate.
     fn init_window(
@@ -2157,4 +2375,74 @@ fn terminal_palette(theme: &Theme, background: Option<&str>) -> cterm_core::Colo
         palette.background = background;
     }
     palette
+}
+
+#[cfg(test)]
+mod action_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn managed_mode_restricts_secondary_topology_and_configuration_actions() {
+        let restricted = [
+            Action::NewTab,
+            Action::SplitPane(SplitDirection::Horizontal),
+            Action::SplitPane(SplitDirection::Vertical),
+            Action::ClosePane,
+            Action::FocusPane(PaneDirection::Left),
+            Action::FocusPane(PaneDirection::Right),
+            Action::FocusPane(PaneDirection::Up),
+            Action::FocusPane(PaneDirection::Down),
+            Action::ResizePane(PaneDirection::Left),
+            Action::ResizePane(PaneDirection::Right),
+            Action::ResizePane(PaneDirection::Up),
+            Action::ResizePane(PaneDirection::Down),
+            Action::TogglePaneZoom,
+            Action::NewWindow,
+            Action::OpenPreferences,
+            Action::QuickOpenTemplate,
+        ];
+
+        for action in restricted {
+            assert!(
+                is_managed_restricted_action(&action),
+                "expected {action:?} to be restricted"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_mode_keeps_session_safe_actions_available() {
+        let allowed = [
+            Action::CloseTab,
+            Action::NextTab,
+            Action::PrevTab,
+            Action::NextAlertedTab,
+            Action::Tab(1),
+            Action::CloseWindow,
+            Action::Copy,
+            Action::Paste,
+            Action::SelectAll,
+            Action::ZoomIn,
+            Action::ZoomOut,
+            Action::ZoomReset,
+            Action::ToggleFullscreen,
+            Action::ScrollUp,
+            Action::ScrollDown,
+            Action::ScrollPageUp,
+            Action::ScrollPageDown,
+            Action::ScrollToTop,
+            Action::ScrollToBottom,
+            Action::PromptPrevious,
+            Action::PromptNext,
+            Action::FindText,
+            Action::ResetTerminal,
+        ];
+
+        for action in allowed {
+            assert!(
+                !is_managed_restricted_action(&action),
+                "expected {action:?} to remain available"
+            );
+        }
+    }
 }

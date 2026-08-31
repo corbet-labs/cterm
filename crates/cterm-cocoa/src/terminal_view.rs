@@ -26,14 +26,21 @@ use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags, Terminal};
-use cterm_ui::events::Action;
 use cterm_ui::theme::Theme;
 
 use crate::cg_renderer::CGRenderer;
 use crate::file_transfer::PendingFileManager;
 use crate::mouse::{self, MouseButton, MouseEvent, MouseModifiers, MousePosition};
 use crate::notification_bar::{NotificationBar, NOTIFICATION_BAR_HEIGHT};
+use crate::window::CtermWindow;
 use crate::{clipboard, keycode};
+
+const MIN_FONT_SIZE: f64 = 6.0;
+const MAX_FONT_SIZE: f64 = 72.0;
+
+fn adjusted_font_size(current: f64, delta: f64) -> f64 {
+    (current + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
 
 fn key_event_kind(is_repeat: bool) -> KeyEventKind {
     if is_repeat {
@@ -191,8 +198,9 @@ pub struct TerminalViewIvars {
     terminal: Arc<Mutex<Terminal>>,
     shortcuts: ShortcutManager,
     renderer: RefCell<Option<CGRenderer>>,
-    cell_width: f64,
-    cell_height: f64,
+    cell_width: Cell<f64>,
+    cell_height: Cell<f64>,
+    default_font_size: f64,
     /// Shared state with PTY thread
     state: Arc<ViewState>,
     /// Whether we're currently in a selection drag
@@ -329,18 +337,13 @@ define_class!(
         #[unsafe(method(performKeyEquivalent:))]
         fn perform_key_equivalent(&self, event: &NSEvent) -> objc2::runtime::Bool {
             let modifiers = keycode::modifiers_from_event(event);
-            let raw_keycode = event.keyCode();
 
-            // Handle Ctrl+Tab / Ctrl+Shift+Tab for tab switching
-            // Tab key is virtual keycode 0x30 on macOS
-            if raw_keycode == 0x30 && modifiers.contains(cterm_ui::events::Modifiers::CTRL) {
-                if let Some(window) = self.window() {
-                    if modifiers.contains(cterm_ui::events::Modifiers::SHIFT) {
-                        let _: () = unsafe { msg_send![&*window, selectPreviousTab: std::ptr::null::<objc2::runtime::AnyObject>()] };
-                    } else {
-                        let _: () = unsafe { msg_send![&*window, selectNextTab: std::ptr::null::<objc2::runtime::AnyObject>()] };
-                    }
-                }
+            // Preserve AppKit's native Command-key menu handling. Other configured
+            // shortcuts are intercepted before a conflicting menu equivalent can
+            // claim them (notably pane focus on Control-Option-arrow).
+            if !modifiers.contains(cterm_ui::events::Modifiers::SUPER)
+                && self.dispatch_configured_shortcut(event)
+            {
                 return objc2::runtime::Bool::YES;
             }
 
@@ -360,54 +363,8 @@ define_class!(
             let modifiers = keycode::modifiers_from_event(event);
             let core_mods = CoreModifiers::from_bits_truncate(modifiers.bits());
 
-            if let Some(action) = keycode::keycode_from_event(event)
-                .and_then(|key| self.ivars().shortcuts.match_event(key, modifiers))
-            {
-                if self.dispatch_pane_action(action) {
-                    return;
-                }
-                let mut terminal = self.ivars().terminal.lock();
-                let page = terminal.rows().max(1);
-                let handled = match action {
-                    Action::ScrollUp => {
-                        terminal.scroll_viewport_up(1);
-                        true
-                    }
-                    Action::ScrollDown => {
-                        terminal.scroll_viewport_down(1);
-                        true
-                    }
-                    Action::ScrollPageUp => {
-                        terminal.scroll_viewport_up(page);
-                        true
-                    }
-                    Action::ScrollPageDown => {
-                        terminal.scroll_viewport_down(page);
-                        true
-                    }
-                    Action::ScrollToTop => {
-                        terminal.scroll_viewport_up(usize::MAX);
-                        true
-                    }
-                    Action::ScrollToBottom => {
-                        terminal.scroll_viewport_to_bottom();
-                        true
-                    }
-                    Action::PromptPrevious => {
-                        terminal.scroll_to_previous_prompt();
-                        true
-                    }
-                    Action::PromptNext => {
-                        terminal.scroll_to_next_prompt();
-                        true
-                    }
-                    _ => false,
-                };
-                drop(terminal);
-                if handled {
-                    self.set_needs_display();
-                    return;
-                }
+            if self.dispatch_configured_shortcut(event) {
+                return;
             }
 
             // Clear any stale press for a newly pressed physical key. Repeats retain the
@@ -594,8 +551,12 @@ define_class!(
             let location = self.convert_point_from_view(location_in_window, None);
 
             // Calculate cell position
-            let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-            let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+            let col = (location.x / self.ivars().cell_width.get())
+                .floor()
+                .max(0.0) as usize;
+            let row = (location.y / self.ivars().cell_height.get())
+                .floor()
+                .max(0.0) as usize;
 
             // Check for Cmd+click on hyperlinks
             let flags = event.modifierFlags();
@@ -713,8 +674,12 @@ define_class!(
             let location = self.convert_point_from_view(location_in_window, None);
 
             // Calculate cell position (clamp to valid range)
-            let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-            let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+            let col = (location.x / self.ivars().cell_width.get())
+                .floor()
+                .max(0.0) as usize;
+            let row = (location.y / self.ivars().cell_height.get())
+                .floor()
+                .max(0.0) as usize;
 
             // Forward drag motion to a tracking application (ButtonEvent /
             // AnyEvent modes); Shift bypasses so a Shift-drag extends a local
@@ -808,8 +773,12 @@ define_class!(
                 if mouse::should_capture_mouse(mouse_mode) {
                     let location_in_window = event.locationInWindow();
                     let location = self.convert_point_from_view(location_in_window, None);
-                    let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-                    let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+                    let col = (location.x / self.ivars().cell_width.get())
+                        .floor()
+                        .max(0.0) as usize;
+                    let row = (location.y / self.ivars().cell_height.get())
+                        .floor()
+                        .max(0.0) as usize;
                     let modifiers = self.get_mouse_modifiers(event);
                     let button = if up {
                         MouseButton::WheelUp
@@ -910,8 +879,12 @@ define_class!(
             let location_in_window = event.locationInWindow();
             let location = self.convert_point_from_view(location_in_window, None);
 
-            let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-            let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+            let col = (location.x / self.ivars().cell_width.get())
+                .floor()
+                .max(0.0) as usize;
+            let row = (location.y / self.ivars().cell_height.get())
+                .floor()
+                .max(0.0) as usize;
 
             let mouse_mode = self.ivars().terminal.lock().screen().modes.mouse_mode;
             if mouse_mode == cterm_core::MouseMode::AnyEvent
@@ -952,12 +925,7 @@ define_class!(
         /// Copy selection to clipboard (Command+C)
         #[unsafe(method(copy:))]
         fn action_copy(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let terminal = self.ivars().terminal.lock();
-            if let Some(text) = terminal.screen().get_selected_text() {
-                drop(terminal);
-                clipboard::set_text(&text);
-                log::debug!("Copied {} chars to clipboard", text.len());
-            }
+            self.copy_selection();
         }
 
         /// Copy selection to clipboard as HTML (Command+Shift+C)
@@ -976,39 +944,13 @@ define_class!(
         /// Paste from clipboard (Command+V)
         #[unsafe(method(paste:))]
         fn action_paste(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            if let Some(text) = clipboard::get_text() {
-                // Check if bracketed paste mode is enabled
-                let terminal = self.ivars().terminal.lock();
-                let bracketed = terminal.screen().modes.bracketed_paste;
-                drop(terminal);
-
-                let paste_text = if bracketed {
-                    format!("\x1b[200~{}\x1b[201~", text)
-                } else {
-                    text
-                };
-
-                self.write_to_pty(paste_text.as_bytes());
-            }
+            self.paste_clipboard();
         }
 
         /// Select all text (Command+A)
         #[unsafe(method(selectAll:))]
         fn action_select_all(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let mut terminal = self.ivars().terminal.lock();
-            let total_lines = terminal.screen().total_lines();
-            let width = terminal.screen().width();
-
-            // Select from the first line to the last line
-            terminal
-                .screen_mut()
-                .start_selection(0, 0, SelectionMode::Char);
-            terminal
-                .screen_mut()
-                .extend_selection(total_lines.saturating_sub(1), width.saturating_sub(1));
-            drop(terminal);
-
-            self.set_needs_display();
+            self.select_all();
         }
 
         /// Handle modifier key changes (for secret debug menu)
@@ -1048,23 +990,13 @@ define_class!(
         /// Reset terminal to initial state
         #[unsafe(method(resetTerminal:))]
         fn action_reset_terminal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            let mut terminal = self.ivars().terminal.lock();
-            terminal.screen_mut().reset();
-            drop(terminal);
-            self.set_needs_display();
-            log::debug!("Terminal reset");
+            self.reset();
         }
 
         /// Clear screen and reset terminal
         #[unsafe(method(clearAndResetTerminal:))]
         fn action_clear_and_reset_terminal(&self, _sender: Option<&objc2::runtime::AnyObject>) {
-            use cterm_core::screen::ClearMode;
-            let mut terminal = self.ivars().terminal.lock();
-            terminal.screen_mut().clear(ClearMode::All);
-            terminal.screen_mut().reset();
-            drop(terminal);
-            self.set_needs_display();
-            log::debug!("Terminal cleared and reset");
+            self.clear_and_reset();
         }
 
         /// Set terminal title via dialog
@@ -1202,8 +1134,12 @@ define_class!(
             let location = self.convert_point_from_view(location_in_window, None);
 
             // Calculate cell position
-            let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-            let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+            let col = (location.x / self.ivars().cell_width.get())
+                .floor()
+                .max(0.0) as usize;
+            let row = (location.y / self.ivars().cell_height.get())
+                .floor()
+                .max(0.0) as usize;
 
             let terminal = self.ivars().terminal.lock();
             let absolute_line = terminal.screen().visible_row_to_absolute_line(row);
@@ -1529,8 +1465,8 @@ define_class!(
             // Use cursor position
             let terminal = self.ivars().terminal.lock();
             let cursor = &terminal.screen().cursor;
-            let cell_width = self.ivars().cell_width;
-            let cell_height = self.ivars().cell_height;
+            let cell_width = self.ivars().cell_width.get();
+            let cell_height = self.ivars().cell_height.get();
 
             let x = cursor.col as f64 * cell_width;
             let y = cursor.row as f64 * cell_height;
@@ -1564,52 +1500,30 @@ struct ViewInitOptions {
 }
 
 impl TerminalView {
-    fn dispatch_pane_action(&self, action: &Action) -> bool {
-        let Some(window) = self.window() else {
+    fn dispatch_configured_shortcut(&self, event: &NSEvent) -> bool {
+        let Some(action) = keycode::keycode_from_event(event).and_then(|key| {
+            self.ivars()
+                .shortcuts
+                .match_event(key, keycode::modifiers_from_event(event))
+        }) else {
             return false;
         };
-        let sender = std::ptr::null::<AnyObject>();
-        unsafe {
-            match action {
-                Action::SplitPane(cterm_ui::SplitDirection::Horizontal) => {
-                    let _: () = msg_send![&*window, splitPaneHorizontal: sender];
-                }
-                Action::SplitPane(cterm_ui::SplitDirection::Vertical) => {
-                    let _: () = msg_send![&*window, splitPaneVertical: sender];
-                }
-                Action::ClosePane => {
-                    let _: () = msg_send![&*window, closePane: sender];
-                }
-                Action::FocusPane(cterm_ui::PaneDirection::Left) => {
-                    let _: () = msg_send![&*window, focusPaneLeft: sender];
-                }
-                Action::FocusPane(cterm_ui::PaneDirection::Right) => {
-                    let _: () = msg_send![&*window, focusPaneRight: sender];
-                }
-                Action::FocusPane(cterm_ui::PaneDirection::Up) => {
-                    let _: () = msg_send![&*window, focusPaneUp: sender];
-                }
-                Action::FocusPane(cterm_ui::PaneDirection::Down) => {
-                    let _: () = msg_send![&*window, focusPaneDown: sender];
-                }
-                Action::ResizePane(cterm_ui::PaneDirection::Left) => {
-                    let _: () = msg_send![&*window, resizePaneLeft: sender];
-                }
-                Action::ResizePane(cterm_ui::PaneDirection::Right) => {
-                    let _: () = msg_send![&*window, resizePaneRight: sender];
-                }
-                Action::ResizePane(cterm_ui::PaneDirection::Up) => {
-                    let _: () = msg_send![&*window, resizePaneUp: sender];
-                }
-                Action::ResizePane(cterm_ui::PaneDirection::Down) => {
-                    let _: () = msg_send![&*window, resizePaneDown: sender];
-                }
-                Action::TogglePaneZoom => {
-                    let _: () = msg_send![&*window, togglePaneZoom: sender];
-                }
-                _ => return false,
-            }
+
+        let Some(window) = self.window() else {
+            log::warn!("Ignoring configured action {action:?} without an owning window");
+            return true;
+        };
+
+        let is_cterm: bool =
+            unsafe { msg_send![&*window, isKindOfClass: objc2::class!(CtermWindow)] };
+        if !is_cterm {
+            log::error!("Ignoring configured action {action:?} for a non-cterm window");
+            return true;
         }
+
+        let cterm_window =
+            unsafe { &*(&*window as *const objc2_app_kit::NSWindow as *const CtermWindow) };
+        cterm_window.dispatch_action(action);
         true
     }
 
@@ -1643,8 +1557,9 @@ impl TerminalView {
             terminal: terminal.clone(),
             shortcuts: ShortcutManager::from_config(&config.shortcuts),
             renderer: RefCell::new(Some(renderer)),
-            cell_width,
-            cell_height,
+            cell_width: Cell::new(cell_width),
+            cell_height: Cell::new(cell_height),
+            default_font_size: config.appearance.font.size,
             state: state.clone(),
             is_selecting: Cell::new(false),
             auto_scroll_direction: Cell::new(0),
@@ -2477,8 +2392,8 @@ impl TerminalView {
     /// Handle window resize
     pub fn handle_resize(&self) {
         let frame = self.frame();
-        let cell_width = self.ivars().cell_width;
-        let cell_height = self.ivars().cell_height;
+        let cell_width = self.ivars().cell_width.get();
+        let cell_height = self.ivars().cell_height.get();
 
         log::debug!(
             "handle_resize: frame={}x{}, cell={}x{}",
@@ -2621,7 +2536,174 @@ impl TerminalView {
 
     /// Get the cell size (width, height) for grid snapping
     pub fn cell_size(&self) -> (f64, f64) {
-        (self.ivars().cell_width, self.ivars().cell_height)
+        (
+            self.ivars().cell_width.get(),
+            self.ivars().cell_height.get(),
+        )
+    }
+
+    pub(crate) fn copy_selection(&self) {
+        let terminal = self.ivars().terminal.lock();
+        if let Some(text) = terminal.screen().get_selected_text() {
+            drop(terminal);
+            clipboard::set_text(&text);
+            log::debug!("Copied {} chars to clipboard", text.len());
+        }
+    }
+
+    pub(crate) fn paste_clipboard(&self) {
+        let Some(text) = clipboard::get_text() else {
+            return;
+        };
+        let bracketed = self.ivars().terminal.lock().screen().modes.bracketed_paste;
+        let paste_text = if bracketed {
+            format!("\x1b[200~{}\x1b[201~", text)
+        } else {
+            text
+        };
+        self.write_to_pty(paste_text.as_bytes());
+    }
+
+    pub(crate) fn select_all(&self) {
+        let mut terminal = self.ivars().terminal.lock();
+        let total_lines = terminal.screen().total_lines();
+        let width = terminal.screen().width();
+        terminal
+            .screen_mut()
+            .start_selection(0, 0, SelectionMode::Char);
+        terminal
+            .screen_mut()
+            .extend_selection(total_lines.saturating_sub(1), width.saturating_sub(1));
+        drop(terminal);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn reset(&self) {
+        self.ivars().terminal.lock().screen_mut().reset();
+        self.set_needs_display();
+        log::debug!("Terminal reset");
+    }
+
+    fn clear_and_reset(&self) {
+        use cterm_core::screen::ClearMode;
+
+        let mut terminal = self.ivars().terminal.lock();
+        terminal.screen_mut().clear(ClearMode::All);
+        terminal.screen_mut().reset();
+        drop(terminal);
+        self.set_needs_display();
+        log::debug!("Terminal cleared and reset");
+    }
+
+    pub(crate) fn scroll_viewport_up(&self, lines: usize) {
+        self.ivars().terminal.lock().scroll_viewport_up(lines);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_viewport_down(&self, lines: usize) {
+        self.ivars().terminal.lock().scroll_viewport_down(lines);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_page_up(&self) {
+        let mut terminal = self.ivars().terminal.lock();
+        let page = terminal.rows().max(1);
+        terminal.scroll_viewport_up(page);
+        drop(terminal);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_page_down(&self) {
+        let mut terminal = self.ivars().terminal.lock();
+        let page = terminal.rows().max(1);
+        terminal.scroll_viewport_down(page);
+        drop(terminal);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_to_top(&self) {
+        self.ivars().terminal.lock().scroll_viewport_up(usize::MAX);
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_to_bottom(&self) {
+        self.ivars().terminal.lock().scroll_viewport_to_bottom();
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_to_previous_prompt(&self) {
+        self.ivars().terminal.lock().scroll_to_previous_prompt();
+        self.set_needs_display();
+    }
+
+    pub(crate) fn scroll_to_next_prompt(&self) {
+        self.ivars().terminal.lock().scroll_to_next_prompt();
+        self.set_needs_display();
+    }
+
+    pub(crate) fn find_text(&self, pattern: &str, case_sensitive: bool, regex: bool) -> usize {
+        let mut terminal = self.ivars().terminal.lock();
+        let results = terminal.find(pattern, case_sensitive, regex);
+        let count = results.len();
+        if let Some(first) = results.first() {
+            terminal.scroll_to_line(first.line);
+        }
+        drop(terminal);
+        self.set_needs_display();
+        count
+    }
+
+    pub(crate) fn zoom_in(&self) {
+        let current = self
+            .ivars()
+            .renderer
+            .borrow()
+            .as_ref()
+            .map(CGRenderer::font_size);
+        if let Some(current) = current {
+            self.apply_font_size(adjusted_font_size(current, 1.0));
+        }
+    }
+
+    pub(crate) fn zoom_out(&self) {
+        let current = self
+            .ivars()
+            .renderer
+            .borrow()
+            .as_ref()
+            .map(CGRenderer::font_size);
+        if let Some(current) = current {
+            self.apply_font_size(adjusted_font_size(current, -1.0));
+        }
+    }
+
+    pub(crate) fn zoom_reset(&self) {
+        self.apply_font_size(self.ivars().default_font_size);
+    }
+
+    fn apply_font_size(&self, font_size: f64) {
+        let cell_size = {
+            let mut renderer = self.ivars().renderer.borrow_mut();
+            let Some(renderer) = renderer.as_mut() else {
+                return;
+            };
+            renderer.set_font_size(MainThreadMarker::from(self), font_size);
+            renderer.cell_size()
+        };
+
+        self.ivars().cell_width.set(cell_size.0);
+        self.ivars().cell_height.set(cell_size.1);
+        {
+            let mut terminal = self.ivars().terminal.lock();
+            terminal.screen_mut().set_cell_width_hint(cell_size.0);
+            terminal.screen_mut().set_cell_height_hint(cell_size.1);
+        }
+        if let Some(window) = self.window() {
+            window.setContentResizeIncrements(NSSize::new(cell_size.0, cell_size.1));
+        }
+        self.handle_resize();
+        self.set_needs_display();
+        log::info!("Terminal font size set to {font_size}");
     }
 
     /// Send focus event to terminal if focus events mode is enabled (DECSET 1004)
@@ -2783,8 +2865,12 @@ impl TerminalView {
         }
 
         let location = self.convert_point_from_view(native_event.locationInWindow(), None);
-        let col = (location.x / self.ivars().cell_width).floor().max(0.0) as usize;
-        let row = (location.y / self.ivars().cell_height).floor().max(0.0) as usize;
+        let col = (location.x / self.ivars().cell_width.get())
+            .floor()
+            .max(0.0) as usize;
+        let row = (location.y / self.ivars().cell_height.get())
+            .floor()
+            .max(0.0) as usize;
         let position = MousePosition::new(
             col,
             row,
@@ -3255,5 +3341,12 @@ mod keyboard_event_tests {
         assert_eq!(direct_modified_key_char("å", "a", true), None);
         assert_eq!(direct_modified_key_char("\u{1}", "A", false), Some('a'));
         assert_eq!(direct_modified_key_char("\u{1}", "A", true), Some('a'));
+    }
+
+    #[test]
+    fn font_zoom_stays_within_supported_bounds() {
+        assert_eq!(adjusted_font_size(12.0, 1.0), 13.0);
+        assert_eq!(adjusted_font_size(MIN_FONT_SIZE, -1.0), MIN_FONT_SIZE);
+        assert_eq!(adjusted_font_size(MAX_FONT_SIZE, 1.0), MAX_FONT_SIZE);
     }
 }
