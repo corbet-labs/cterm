@@ -272,6 +272,7 @@ jobs:
 
             ui_status=0
             wlheadless-run -c cage -- \
+              env -u DISPLAY \
               ./scripts/linux_ui_test.sh \
               ./freebsd-ui-binaries/cterm \
               "$OUTPUT_DIR" \
