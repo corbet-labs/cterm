@@ -2542,15 +2542,6 @@ impl TerminalView {
         )
     }
 
-    pub(crate) fn copy_selection(&self) {
-        let terminal = self.ivars().terminal.lock();
-        if let Some(text) = terminal.screen().get_selected_text() {
-            drop(terminal);
-            clipboard::set_text(&text);
-            log::debug!("Copied {} chars to clipboard", text.len());
-        }
-    }
-
     pub(crate) fn paste_clipboard(&self) {
         let Some(text) = clipboard::get_text() else {
             return;
