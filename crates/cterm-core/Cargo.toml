@@ -33,6 +33,9 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["consoleapi", "handleapi", "namedpipeapi", "processthreadsapi", "synchapi", "winbase", "wincon", "winnt", "winerror"] }
 
+[target.'cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos", windows))'.dependencies]
+shared_memory.workspace = true
+
 [dev-dependencies]
 criterion = "0.8.2"
 env_logger.workspace = true

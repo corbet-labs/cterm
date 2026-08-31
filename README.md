@@ -473,9 +473,10 @@ transmit/display/place/delete actions; cropping, cell scaling, pixel offsets,
 quiet replies, storage quotas, cursor suppression, and the complete placement
 delete selectors. Signed z-ordering is shared by Cocoa, GTK, and Direct2D,
 including Kitty's below-background and below-text layers; image identifiers and
-z-indices also survive daemon snapshots. Animation, shared-memory transport,
-and Unicode placeholders remain staged follow-up work rather than silently
-advertised capabilities.
+z-indices also survive daemon snapshots. POSIX and Windows named shared-memory
+transport supports bounded size/offset reads and protocol-required cleanup.
+Animation and Unicode placeholders remain staged follow-up work rather than
+silently advertised capabilities.
 
 Test with:
 ```bash

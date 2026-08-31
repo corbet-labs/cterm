@@ -26,6 +26,7 @@ const MAX_APC_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENCODED_UPLOAD_BYTES: usize = 90 * 1024 * 1024;
 const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 10_000;
+const MAX_SHARED_MEMORY_NAME_BYTES: usize = 2 * 1024;
 const STORE_QUOTA_BYTES: usize = 320 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +189,7 @@ enum Medium {
     Direct,
     File,
     TempFile,
+    SharedMemory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,12 +499,7 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
                     b"d" => Medium::Direct,
                     b"f" => Medium::File,
                     b"t" => Medium::TempFile,
-                    b"s" => {
-                        return Err(echo.error(
-                            ErrorCode::NotSupported,
-                            "shared memory transfer is not supported",
-                        ))
-                    }
+                    b"s" => Medium::SharedMemory,
                     _ => return Err(echo.error(ErrorCode::Invalid, "invalid medium")),
                 }
             }
@@ -589,6 +586,7 @@ fn decode_command_payload(mut command: Command, encoded: &[u8]) -> Result<Comman
     let data = match command.medium {
         Medium::Direct => decoded,
         Medium::File | Medium::TempFile => read_file_payload(&command, decoded, echo)?,
+        Medium::SharedMemory => read_shared_memory_payload(&command, decoded, echo)?,
     };
     let data = if command.compressed {
         let mut inflated = Vec::new();
@@ -647,6 +645,85 @@ fn read_file_payload(
         let _ = std::fs::remove_file(&path);
     }
     read_result.map_err(|_| echo.error(ErrorCode::BadFile, "could not read file"))
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "macos",
+    windows
+))]
+fn read_shared_memory_payload(
+    command: &Command,
+    name_bytes: Vec<u8>,
+    echo: EchoFields,
+) -> Result<Vec<u8>, ProtocolError> {
+    if name_bytes.is_empty() || name_bytes.len() > MAX_SHARED_MEMORY_NAME_BYTES {
+        return Err(echo.error(ErrorCode::BadFile, "invalid shared memory name"));
+    }
+    let name = String::from_utf8(name_bytes)
+        .map_err(|_| echo.error(ErrorCode::BadFile, "invalid shared memory name"))?;
+    #[cfg(unix)]
+    if !name.starts_with('/') || name[1..].contains('/') {
+        return Err(echo.error(ErrorCode::BadFile, "invalid POSIX shared memory name"));
+    }
+    let configuration = shared_memory::ShmemConf::new().os_id(name);
+    #[cfg(windows)]
+    let configuration = configuration.allow_raw(true);
+    let mut mapping = configuration
+        .open()
+        .map_err(|_| echo.error(ErrorCode::BadFile, "could not open shared memory"))?;
+
+    // Kitty transfers ownership of POSIX shared memory cleanup to the
+    // terminal. Windows named mappings disappear when all handles close.
+    #[cfg(unix)]
+    mapping.set_owner(true);
+
+    let start = usize::try_from(command.data_offset.unwrap_or(0))
+        .map_err(|_| echo.error(ErrorCode::BadFile, "shared memory offset is out of range"))?;
+    if start > mapping.len() {
+        return Err(echo.error(ErrorCode::BadFile, "shared memory offset is out of range"));
+    }
+    let available = mapping.len() - start;
+    let length = command
+        .data_size
+        .filter(|size| *size > 0)
+        .map_or(available, |size| available.min(size as usize));
+    if length > MAX_DECODED_BYTES {
+        return Err(echo.error(ErrorCode::NoSpace, "image data too large"));
+    }
+
+    let mut bytes = vec![0; length];
+    // SAFETY: `mapping` owns a live mapping of `mapping.len()` bytes. The
+    // checked source range and newly allocated destination cannot overlap.
+    // The protocol requires the sender to finish writing before sending the
+    // APC command; after this snapshot all decoding uses ordinary Rust-owned
+    // memory.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            mapping.as_ptr().add(start).cast_const(),
+            bytes.as_mut_ptr(),
+            length,
+        );
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "macos",
+    windows
+)))]
+fn read_shared_memory_payload(
+    _command: &Command,
+    _name_bytes: Vec<u8>,
+    echo: EchoFields,
+) -> Result<Vec<u8>, ProtocolError> {
+    Err(echo.error(
+        ErrorCode::NotSupported,
+        "shared memory transfer is not supported on this platform",
+    ))
 }
 
 fn safe_temporary_graphics_path(path: &Path) -> bool {
@@ -1477,6 +1554,63 @@ mod tests {
 
         assert!(path.exists());
         assert_eq!(screen.images()[0].data.as_slice(), [1, 2, 3, 4]);
+    }
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "macos",
+        windows
+    ))]
+    #[test]
+    fn shared_memory_transfer_obeys_range_and_cleanup_semantics() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        let mut mapping = shared_memory::ShmemConf::new().size(7).create().unwrap();
+        let name = mapping.get_os_id().to_owned();
+        // SAFETY: this test created and exclusively owns the mapping, and the
+        // terminal is not asked to open it until after the write completes.
+        unsafe {
+            mapping
+                .as_slice_mut()
+                .copy_from_slice(&[99, 98, 1, 2, 3, 4, 97]);
+        }
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,t=s,f=32,s=1,v=1,O=2,S=4,i=14,C=1", name.as_bytes()),
+        );
+
+        assert_eq!(screen.images()[0].data.as_slice(), [1, 2, 3, 4]);
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b_Gi=14;OK\x1b\\".to_vec()]
+        );
+        #[cfg(unix)]
+        assert!(shared_memory::ShmemConf::new().os_id(name).open().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_memory_errors_still_unlink_the_posix_object() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        let mapping = shared_memory::ShmemConf::new().size(4).create().unwrap();
+        let name = mapping.get_os_id().to_owned();
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,t=s,f=32,s=1,v=1,O=5,i=15,C=1", name.as_bytes()),
+        );
+
+        assert!(screen.images().is_empty());
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b_Gi=15;EBADF:shared memory offset is out of range\x1b\\".to_vec()]
+        );
+        assert!(shared_memory::ShmemConf::new().os_id(name).open().is_err());
     }
 
     #[test]
