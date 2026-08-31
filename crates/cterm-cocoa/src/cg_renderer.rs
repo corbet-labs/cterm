@@ -890,6 +890,7 @@ impl CGRenderer {
     }
 
     /// Draw underline for a cell
+    #[allow(clippy::too_many_arguments)]
     fn draw_underline(
         &self,
         x: f64,
