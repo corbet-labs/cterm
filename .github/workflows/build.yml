@@ -239,7 +239,7 @@ jobs:
 
       - name: Compare cterm behavior with foot
         run: |
-          OUTPUT_DIR="${{ runner.temp }}/cterm_compat_test"
+          OUTPUT_DIR="test-results/compatibility"
           mkdir -p "$OUTPUT_DIR"
           chmod +x scripts/foot_compat_test.sh
           export XDG_RUNTIME_DIR="${{ runner.temp }}/cterm-compat-xdg-runtime"
@@ -285,7 +285,7 @@ jobs:
         if: always()
         with:
           name: linux-compatibility-results
-          path: ${{ runner.temp }}/cterm_compat_test/
+          path: test-results/compatibility/
           if-no-files-found: ignore
 
   test-macos:
