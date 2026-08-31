@@ -180,8 +180,10 @@ See [docs/configuration.md](docs/configuration.md) for detailed configuration op
 
 The fail-closed command-plugin package, ABI, isolated runner, deterministic
 discovery, machine-local grants, and shared authorization/execution bridge are
-documented in [docs/plugins.md](docs/plugins.md). Native permission prompts
-and UI command integration are not enabled yet.
+documented in [docs/plugins.md](docs/plugins.md). GTK/Wayland, macOS, and
+Windows expose installed commands under **Tools → Plugins**, request exact
+permissions in native dialogs, and execute them outside the UI thread. Managed
+mode keeps the complete plugin surface disabled.
 
 ## Keyboard Shortcuts
 
@@ -555,10 +557,10 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 - [x] Docker and SSH templates
 - [x] Auto-update with release notes
 - [x] Native split panes (macOS/Linux/Windows)
+- [x] Isolated command plugins with native permission prompts
 
 ### Future
 
-- Plugin system
 - Additional foot-compatible behavior and performance work
 - Android and iOS local-terminal frontends (distant targets)
 

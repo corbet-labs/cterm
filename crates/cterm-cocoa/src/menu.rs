@@ -612,6 +612,33 @@ fn populate_tools_menu(menu: &NSMenu, mtm: MainThreadMarker) {
             menu.addItem(&item);
         }
     }
+
+    match cterm_app::PluginRuntime::for_current_user() {
+        Ok(runtime) if !runtime.catalog().commands().is_empty() => {
+            if menu.numberOfItems() > 0 {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+            }
+            let plugin_menu = NSMenu::new(mtm);
+            plugin_menu.setTitle(&NSString::from_str("Plugins"));
+            for command in runtime.catalog().commands() {
+                let item = NSMenuItem::new(mtm);
+                item.setTitle(&NSString::from_str(&format!(
+                    "{} — {}",
+                    command.plugin_name(),
+                    command.command_title()
+                )));
+                unsafe { item.setAction(Some(sel!(runPluginCommand:))) };
+                item.setRepresentedObject(Some(&NSString::from_str(command.action_id())));
+                plugin_menu.addItem(&item);
+            }
+            let plugin_item = NSMenuItem::new(mtm);
+            plugin_item.setTitle(&NSString::from_str("Plugins"));
+            plugin_item.setSubmenu(Some(&plugin_menu));
+            menu.addItem(&plugin_item);
+        }
+        Ok(_) => {}
+        Err(error) => log::error!("Failed to load plugin commands: {error}"),
+    }
 }
 
 /// Rebuild the Tools menu items (called after preferences save)

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ptr;
 
 use cterm_app::config::ToolShortcutEntry;
+use cterm_app::PluginCommandDescriptor;
 use cterm_ui::events::Action;
 use cterm_ui::pane::{PaneDirection, SplitDirection};
 use winapi::shared::windef::HMENU;
@@ -16,6 +17,8 @@ use winapi::um::winuser::{
 
 const TOOL_COMMAND_ID_START: u16 = 0x8000;
 const TOOL_COMMAND_ID_END: u16 = 0xefff;
+const PLUGIN_COMMAND_ID_START: u16 = 0x7000;
+const PLUGIN_COMMAND_ID_END: u16 = 0x7fff;
 
 /// Stable command IDs and the exact configured tool snapshot shown in a menu.
 ///
@@ -73,8 +76,67 @@ impl ToolCommandRegistry {
     }
 }
 
+/// Stable menu IDs bound to the exact descriptor snapshot currently shown.
+#[derive(Debug, Default)]
+pub struct PluginCommandRegistry {
+    identity_ids: HashMap<String, u16>,
+    active: BTreeMap<u16, PluginCommandDescriptor>,
+    order: Vec<u16>,
+}
+
+impl PluginCommandRegistry {
+    pub fn reload(&mut self, commands: &[PluginCommandDescriptor]) {
+        let mut new_identities = commands
+            .iter()
+            .map(|command| command.action_id().to_string())
+            .filter(|identity| !self.identity_ids.contains_key(identity))
+            .collect::<Vec<_>>();
+        new_identities.sort();
+        new_identities.dedup();
+
+        let mut used = self.identity_ids.values().copied().collect::<HashSet<_>>();
+        for identity in new_identities {
+            let Some(id) = allocate_command_id(
+                identity.as_bytes(),
+                &used,
+                PLUGIN_COMMAND_ID_START,
+                PLUGIN_COMMAND_ID_END,
+            ) else {
+                log::error!("Too many distinct plugin commands for the Win32 menu ID range");
+                continue;
+            };
+            used.insert(id);
+            self.identity_ids.insert(identity, id);
+        }
+
+        self.active.clear();
+        self.order.clear();
+        for command in commands {
+            let Some(&id) = self.identity_ids.get(command.action_id()) else {
+                continue;
+            };
+            self.active.entry(id).or_insert_with(|| command.clone());
+            self.order.push(id);
+        }
+    }
+
+    pub fn get(&self, id: u16) -> Option<&PluginCommandDescriptor> {
+        self.active.get(&id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &PluginCommandDescriptor)> {
+        self.order
+            .iter()
+            .filter_map(|id| self.active.get(id).map(|command| (*id, command)))
+    }
+}
+
 pub fn is_tool_command_id(id: u16) -> bool {
     (TOOL_COMMAND_ID_START..=TOOL_COMMAND_ID_END).contains(&id)
+}
+
+pub fn is_plugin_command_id(id: u16) -> bool {
+    (PLUGIN_COMMAND_ID_START..=PLUGIN_COMMAND_ID_END).contains(&id)
 }
 
 fn tool_identity(tool: &ToolShortcutEntry) -> Vec<u8> {
@@ -94,11 +156,20 @@ fn push_identity_field(identity: &mut Vec<u8>, field: &[u8]) {
 }
 
 fn allocate_tool_command_id(identity: &[u8], used: &HashSet<u16>) -> Option<u16> {
-    let range_len = u32::from(TOOL_COMMAND_ID_END - TOOL_COMMAND_ID_START) + 1;
+    allocate_command_id(identity, used, TOOL_COMMAND_ID_START, TOOL_COMMAND_ID_END)
+}
+
+fn allocate_command_id(
+    identity: &[u8],
+    used: &HashSet<u16>,
+    range_start: u16,
+    range_end: u16,
+) -> Option<u16> {
+    let range_len = u32::from(range_end - range_start) + 1;
     let start = (stable_hash(identity) % u64::from(range_len)) as u32;
     (0..range_len).find_map(|offset| {
         let relative = (start + offset) % range_len;
-        let id = TOOL_COMMAND_ID_START + relative as u16;
+        let id = range_start + relative as u16;
         (!used.contains(&id)).then_some(id)
     })
 }
@@ -349,6 +420,7 @@ pub fn create_menu_bar(
     updates_enabled: bool,
     managed: bool,
     tool_commands: &ToolCommandRegistry,
+    plugin_commands: &PluginCommandRegistry,
 ) -> HMENU {
     unsafe {
         let menu_bar = CreateMenu();
@@ -478,6 +550,18 @@ pub fn create_menu_bar(
             let tools_menu = CreatePopupMenu();
             for (id, tool) in tool_commands.iter() {
                 append_command_item(tools_menu, id, &escape_menu_label(&tool.name));
+            }
+            let plugin_menu = CreatePopupMenu();
+            let mut has_plugins = false;
+            for (id, command) in plugin_commands.iter() {
+                has_plugins = true;
+                let label = format!("{} — {}", command.plugin_name(), command.command_title());
+                append_command_item(plugin_menu, id, &escape_menu_label(&label));
+            }
+            if has_plugins {
+                append_popup_menu(tools_menu, plugin_menu, "&Plugins");
+            } else {
+                DestroyMenu(plugin_menu);
             }
             append_popup_menu(menu_bar, tools_menu, "T&ools");
         }
@@ -612,9 +696,12 @@ pub fn replace_window_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cterm_app::PluginCatalog;
     use cterm_ui::events::Action;
     use cterm_ui::pane::{PaneDirection, SplitDirection};
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
 
     fn tool(name: &str, command: &str) -> ToolShortcutEntry {
         ToolShortcutEntry {
@@ -628,6 +715,34 @@ mod tests {
         registry
             .iter()
             .map(|(id, tool)| (tool.name.clone(), id))
+            .collect()
+    }
+
+    fn write_plugin(root: &Path, id: &str, command: &str) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("cterm-plugin.toml"),
+            format!(
+                "manifest_version = 1\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\nabi = \"1.0\"\n\n[[commands]]\nid = \"{command}\"\ntitle = \"{command}\"\n\n[capabilities.invoke-actions]\nallow = [\"cterm:new-tab\"]\n"
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("plugin.wasm"), b"\0asm\x01\0\0\0").unwrap();
+    }
+
+    fn plugin_commands() -> (tempfile::TempDir, Vec<PluginCommandDescriptor>) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("plugins");
+        write_plugin(&root.join("org.example.alpha"), "org.example.alpha", "run");
+        write_plugin(&root.join("org.example.beta"), "org.example.beta", "build");
+        let commands = PluginCatalog::discover(&root).unwrap().commands().to_vec();
+        (directory, commands)
+    }
+
+    fn plugin_ids(registry: &PluginCommandRegistry) -> HashMap<String, u16> {
+        registry
+            .iter()
+            .map(|(id, command)| (command.action_id().to_string(), id))
             .collect()
     }
 
@@ -808,6 +923,44 @@ mod tests {
             Some("Beta")
         );
         assert_eq!(MenuAction::from_id(beta_id), None);
+    }
+
+    #[test]
+    fn plugin_command_ids_are_stable_and_disjoint_from_tools() {
+        let (_directory, commands) = plugin_commands();
+        let mut registry = PluginCommandRegistry::default();
+        registry.reload(&commands);
+        let original = plugin_ids(&registry);
+
+        let mut reordered = commands.clone();
+        reordered.reverse();
+        registry.reload(&reordered);
+        assert_eq!(plugin_ids(&registry), original);
+
+        let mut fresh = PluginCommandRegistry::default();
+        fresh.reload(&reordered);
+        assert_eq!(plugin_ids(&fresh), original);
+        assert!(original.values().all(|id| is_plugin_command_id(*id)));
+        assert!(original.values().all(|id| !is_tool_command_id(*id)));
+    }
+
+    #[test]
+    fn retired_plugin_ids_never_target_another_command() {
+        let (_directory, commands) = plugin_commands();
+        let mut registry = PluginCommandRegistry::default();
+        registry.reload(std::slice::from_ref(&commands[0]));
+        let retired_id = plugin_ids(&registry)[commands[0].action_id()];
+
+        registry.reload(std::slice::from_ref(&commands[1]));
+        let active_id = plugin_ids(&registry)[commands[1].action_id()];
+
+        assert_ne!(retired_id, active_id);
+        assert!(registry.get(retired_id).is_none());
+        assert_eq!(
+            registry.get(active_id).map(|command| command.action_id()),
+            Some(commands[1].action_id())
+        );
+        assert_eq!(MenuAction::from_id(active_id), None);
     }
 
     #[test]

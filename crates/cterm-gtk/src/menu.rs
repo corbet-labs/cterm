@@ -206,6 +206,24 @@ fn create_tools_submenu() -> gio::Menu {
             menu.append(Some(&shortcut.name), Some(&action));
         }
     }
+
+    match cterm_app::PluginRuntime::for_current_user() {
+        Ok(runtime) if !runtime.catalog().commands().is_empty() => {
+            let plugins = gio::Menu::new();
+            for command in runtime.catalog().commands() {
+                let label = format!("{} — {}", command.plugin_name(), command.command_title());
+                let item = gio::MenuItem::new(Some(&label), None);
+                item.set_action_and_target_value(
+                    Some("win.run-plugin-command"),
+                    Some(&glib::Variant::from(command.action_id())),
+                );
+                plugins.append_item(&item);
+            }
+            menu.append_section(Some("Plugins"), &plugins);
+        }
+        Ok(_) => {}
+        Err(error) => log::error!("Failed to load plugin commands: {error}"),
+    }
     menu
 }
 

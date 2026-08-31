@@ -20,7 +20,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_app::{TemplateDaemonTarget, TemplateInstancePolicy, TemplateLaunchPlan};
+use cterm_app::{
+    PluginAuthorization, PluginExecution, PluginRuntime, PluginRuntimeError, TemplateDaemonTarget,
+    TemplateInstancePolicy, TemplateLaunchPlan,
+};
 use cterm_core::color::{ColorPalette, Rgb};
 use cterm_core::mouse::{
     encode_mouse_event, MouseButton as ReportButton, MouseEvent as ReportMouseEvent,
@@ -56,6 +59,9 @@ pub const WM_APP_BELL: u32 = WM_APP + 4;
 pub const WM_APP_DESKTOP_NOTIFICATION: u32 = WM_APP + 5;
 pub const WM_APP_NATIVE_NOTIFICATION: u32 = WM_APP + 6;
 pub const WM_APP_DAEMON_SESSION_READY: u32 = WM_APP + 7;
+pub const WM_APP_PLUGIN_RESULT: u32 = WM_APP + 8;
+
+type PluginCommandResult = Result<PluginExecution, PluginRuntimeError>;
 
 /// Commands sent to the daemon I/O thread
 pub enum DaemonCmd {
@@ -426,6 +432,7 @@ pub struct WindowState {
     window_visibility: cterm_core::WindowVisibility,
     menu_handle: winapi::shared::windef::HMENU,
     tool_commands: menu::ToolCommandRegistry,
+    plugin_commands: menu::PluginCommandRegistry,
     /// Skip close confirmation (set during relaunch)
     pub skip_close_confirm: bool,
     /// Remote host connection manager
@@ -493,10 +500,15 @@ impl WindowState {
         notification_bar.set_dpi(dpi);
 
         let mut tool_commands = menu::ToolCommandRegistry::default();
+        let mut plugin_commands = menu::PluginCommandRegistry::default();
         if !crate::get_args().managed {
             match cterm_app::load_tool_shortcuts() {
                 Ok(tools) => tool_commands.reload(&tools),
                 Err(error) => log::error!("Failed to load configured tool commands: {error}"),
+            }
+            match PluginRuntime::for_current_user() {
+                Ok(runtime) => plugin_commands.reload(runtime.catalog().commands()),
+                Err(error) => log::error!("Failed to load plugin commands: {error}"),
             }
         }
 
@@ -506,6 +518,7 @@ impl WindowState {
             crate::get_args().updater_enabled(),
             crate::get_args().managed,
             &tool_commands,
+            &plugin_commands,
         );
         menu::set_window_menu(hwnd.0 as *mut _, menu_handle);
 
@@ -534,6 +547,7 @@ impl WindowState {
             window_visibility: cterm_core::WindowVisibility::Visible,
             menu_handle,
             tool_commands,
+            plugin_commands,
             skip_close_confirm: false,
             remote_manager: cterm_client::RemoteManager::new(),
             blink_clock: BlinkClock::default(),
@@ -2510,6 +2524,7 @@ impl WindowState {
     fn reload_tool_commands_and_menu(&mut self) {
         if crate::get_args().managed {
             self.tool_commands.reload(&[]);
+            self.plugin_commands.reload(&[]);
         } else {
             let tools = match cterm_app::load_tool_shortcuts() {
                 Ok(tools) => tools,
@@ -2519,6 +2534,13 @@ impl WindowState {
                 }
             };
             self.tool_commands.reload(&tools);
+            match PluginRuntime::for_current_user() {
+                Ok(runtime) => self.plugin_commands.reload(runtime.catalog().commands()),
+                Err(error) => {
+                    log::error!("Failed to reload plugin commands: {error}");
+                    self.plugin_commands.reload(&[]);
+                }
+            }
         }
 
         let new_menu = menu::create_menu_bar(
@@ -2526,6 +2548,7 @@ impl WindowState {
             crate::get_args().updater_enabled(),
             crate::get_args().managed,
             &self.tool_commands,
+            &self.plugin_commands,
         );
         if menu::replace_window_menu(self.hwnd.0 as *mut _, self.menu_handle, new_menu) {
             self.menu_handle = new_menu;
@@ -2568,6 +2591,83 @@ impl WindowState {
             }
         }
         true
+    }
+
+    fn run_plugin_command(&self, command_id: u16) -> bool {
+        let Some(command) = self.plugin_commands.get(command_id) else {
+            return false;
+        };
+        let mut runtime = match PluginRuntime::for_current_user() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                crate::dialogs::show_error(
+                    self.hwnd.0 as *mut _,
+                    "Plugin command failed",
+                    &error.to_string(),
+                );
+                return true;
+            }
+        };
+        let invocation = match runtime.authorize_action(command.action_id()) {
+            Ok(PluginAuthorization::Granted(invocation)) => invocation,
+            Ok(PluginAuthorization::ApprovalRequired(prompt)) => {
+                if !crate::dialogs::show_confirm(
+                    self.hwnd.0 as *mut _,
+                    "Allow plugin command?",
+                    &prompt.message(),
+                ) {
+                    return true;
+                }
+                match runtime.approve(prompt) {
+                    Ok(invocation) => invocation,
+                    Err(error) => {
+                        crate::dialogs::show_error(
+                            self.hwnd.0 as *mut _,
+                            "Plugin command failed",
+                            &error.to_string(),
+                        );
+                        return true;
+                    }
+                }
+            }
+            Err(error) => {
+                crate::dialogs::show_error(
+                    self.hwnd.0 as *mut _,
+                    "Plugin command failed",
+                    &error.to_string(),
+                );
+                return true;
+            }
+        };
+        let hwnd = self.hwnd.0 as usize;
+        std::thread::spawn(move || {
+            post_plugin_result(hwnd, invocation.execute_blocking());
+        });
+        true
+    }
+
+    fn on_plugin_result(&mut self, result: PluginCommandResult) {
+        match result {
+            Ok(execution) => {
+                for diagnostic in execution.diagnostics() {
+                    log::info!("Plugin diagnostic: {diagnostic}");
+                }
+                if !execution.host_stderr().is_empty() {
+                    log::warn!(
+                        "Plugin host stderr: {}",
+                        String::from_utf8_lossy(execution.host_stderr())
+                    );
+                }
+                for action in execution.actions().iter().cloned() {
+                    self.handle_action(action);
+                }
+            }
+            Err(error) => crate::dialogs::show_error(
+                self.hwnd.0 as *mut _,
+                "Plugin command failed",
+                &error.to_string(),
+            ),
+        }
     }
 
     fn show_preferences(&mut self) {
@@ -2680,6 +2780,14 @@ impl WindowState {
 
     /// Handle menu command
     pub fn on_menu_command(&mut self, cmd: u16) {
+        if menu::is_plugin_command_id(cmd) {
+            if crate::get_args().managed {
+                log::warn!("Ignoring plugin command in managed mode");
+            } else if !self.run_plugin_command(cmd) {
+                log::warn!("Ignoring stale or unknown plugin command ID {cmd}");
+            }
+            return;
+        }
         if menu::is_tool_command_id(cmd) {
             if crate::get_args().managed {
                 log::warn!("Ignoring tool command in managed mode");
@@ -4943,6 +5051,21 @@ fn post_daemon_session_ready(hwnd: usize, source_id: u64, ready: DaemonSessionRe
     }
 }
 
+fn post_plugin_result(hwnd: usize, result: PluginCommandResult) {
+    let result = Box::into_raw(Box::new(result));
+    let posted = unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_APP_PLUGIN_RESULT,
+            WPARAM(0),
+            LPARAM(result as isize),
+        )
+    };
+    if posted.is_err() {
+        unsafe { drop(Box::from_raw(result)) };
+    }
+}
+
 /// Window procedure
 /// Whether Shift is currently held (used to bypass mouse forwarding so local
 /// interaction — hyperlink menu, scrollback — keeps working under a tracking app).
@@ -5202,6 +5325,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             if lparam.0 != 0 {
                 let ready = unsafe { Box::from_raw(lparam.0 as *mut DaemonSessionReady) };
                 state.on_daemon_session_ready(wparam.0 as u64, *ready);
+            }
+            LRESULT(0)
+        }
+
+        WM_APP_PLUGIN_RESULT => {
+            if lparam.0 != 0 {
+                let result = unsafe { Box::from_raw(lparam.0 as *mut PluginCommandResult) };
+                state.on_plugin_result(*result);
             }
             LRESULT(0)
         }

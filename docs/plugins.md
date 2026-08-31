@@ -3,10 +3,12 @@
 cterm's plugin work currently provides a fail-closed package and ABI
 foundation, an isolated one-shot runner, an application-side broker,
 deterministic package discovery, bounded machine-local grant persistence, and
-a frontend-neutral authorization/execution bridge. It does **not** yet expose
-plugin commands in released UI builds. Native permission prompts and command
-palette integration are the next implementation stage. Release packages
-already include the runner as a verified sibling executable.
+a frontend-neutral authorization/execution bridge. GTK/Wayland, Cocoa, and
+Win32 expose discovered commands below **Tools → Plugins**, use their native
+modal dialogs for exact permission approval, run accepted commands away from
+the UI thread, and return only typed built-in actions to the existing native
+dispatcher. Release packages include the runner as a verified sibling
+executable.
 
 ## Version 1 package
 
@@ -52,7 +54,8 @@ The ABI is intentionally independent of cterm's Rust UI enum layout. The
 application broker verifies each wire action against the exact manifest and
 grant. The shared application runtime then converts it to the same typed
 action used by shortcuts; unknown actions and parameter-kind mismatches are
-rejected before native dispatch. Managed mode will initially disable plugins.
+rejected before native dispatch. Managed mode disables plugin discovery,
+menus, approval, and execution.
 
 ## Package identity and grants
 
@@ -111,6 +114,20 @@ parameters are converted to typed tab, split, and pane values and then checked
 against the stable built-in action contract. Native frontends still apply
 their existing action policy when dispatching the returned actions.
 
+Every menu entry carries the stable
+`plugin:<plugin-id>/<command-id>` action ID, not a list index or raw executable
+path. Selection loads the current catalog again and resolves that ID before
+authorization, so a reordered menu cannot invoke another command and a stale
+entry fails closed. GTK, Cocoa, and Win32 all show the same exact scopes and a
+content-change warning in native dialogs. Declining does not write a grant.
+
+Execution uses a dedicated worker thread and a short-lived Tokio runtime. Only
+the validated result crosses back onto the native main thread: GLib dispatch
+on GTK, the main Grand Central Dispatch queue on Cocoa, and a private window
+message on Win32. Diagnostics and bounded host stderr go to cterm's log; typed
+actions go through the same managed-mode and native policy checks as shortcuts
+and menus.
+
 ## Application broker
 
 `cterm-app` resolves the canonical `cterm-plugin-host` sibling next to the
@@ -152,9 +169,9 @@ malformed protobuf, undeclared actions, digest mismatches, unsupported imports,
 and ambient environment/filesystem state.
 
 Fuel is not a wall-clock deadline, so the application broker independently
-enforces the process deadline and tree termination. Frontend integration must
-apply managed-mode and native action policy after the shared runtime returns.
-The runner deliberately contains no downloader, grant storage, permission UI,
+enforces the process deadline and tree termination. Frontends apply
+managed-mode and native action policy after the shared runtime returns. The
+runner deliberately contains no downloader, grant storage, permission UI,
 daemon dependency, or frontend dependency.
 
 Keeping that runtime out of the UI process limits the effect of guest bugs. It

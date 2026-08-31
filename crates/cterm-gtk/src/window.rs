@@ -12,7 +12,10 @@ use gtk4::{
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_app::{TemplateDaemonTarget, TemplateInstancePolicy, TemplateLaunchPlan};
+use cterm_app::{
+    PluginAuthorization, PluginInvocation, PluginRuntime, TemplateDaemonTarget,
+    TemplateInstancePolicy, TemplateLaunchPlan,
+};
 use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
 use cterm_ui::theme::Theme;
 use cterm_ui::{
@@ -280,6 +283,56 @@ fn show_upgrade_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::D
     );
     dialog.connect_response(|d, _| d.close());
     dialog.present();
+}
+
+fn show_plugin_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::Display) {
+    let dialog = gtk4::MessageDialog::new(
+        Some(window),
+        gtk4::DialogFlags::MODAL,
+        gtk4::MessageType::Error,
+        gtk4::ButtonsType::Ok,
+        format!("Plugin command failed:\n\n{error}"),
+    );
+    dialog.connect_response(|dialog, _| dialog.close());
+    dialog.present();
+}
+
+fn run_plugin_invocation(window: &ApplicationWindow, invocation: PluginInvocation) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(invocation.execute_blocking());
+    });
+
+    let window = window.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(25), move || {
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::error!("Plugin worker disconnected without a result");
+                return glib::ControlFlow::Break;
+            }
+        };
+
+        match result {
+            Ok(execution) => {
+                for diagnostic in execution.diagnostics() {
+                    log::info!("Plugin diagnostic: {diagnostic}");
+                }
+                if !execution.host_stderr().is_empty() {
+                    log::warn!(
+                        "Plugin host stderr: {}",
+                        String::from_utf8_lossy(execution.host_stderr())
+                    );
+                }
+                for action in execution.actions() {
+                    activate_shared_action(&window, action);
+                }
+            }
+            Err(error) => show_plugin_error_dialog(&window, &error),
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 fn reject_managed_secondary_action(action: &str) -> bool {
@@ -1763,6 +1816,69 @@ impl CtermWindow {
                             }
                         }
                     }
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new(
+                "run-plugin-command",
+                Some(&glib::VariantType::new("s").unwrap()),
+            );
+            action.connect_activate(move |_, parameter| {
+                if reject_managed_secondary_action("plugin command") {
+                    return;
+                }
+                let Some(action_id) = parameter.and_then(|value| value.get::<String>()) else {
+                    log::error!("Plugin menu action omitted its stable command ID");
+                    return;
+                };
+                let runtime = match PluginRuntime::for_current_user() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        show_plugin_error_dialog(&window_clone, &error);
+                        return;
+                    }
+                };
+                match runtime.authorize_action(&action_id) {
+                    Ok(PluginAuthorization::Granted(invocation)) => {
+                        run_plugin_invocation(&window_clone, invocation);
+                    }
+                    Ok(PluginAuthorization::ApprovalRequired(prompt)) => {
+                        let dialog = gtk4::MessageDialog::new(
+                            Some(&window_clone),
+                            gtk4::DialogFlags::MODAL,
+                            gtk4::MessageType::Question,
+                            gtk4::ButtonsType::YesNo,
+                            prompt.message(),
+                        );
+                        let pending = Rc::new(RefCell::new(Some((runtime, prompt))));
+                        let pending_for_response = Rc::clone(&pending);
+                        let window_for_response = window_clone.clone();
+                        dialog.connect_response(move |dialog, response| {
+                            dialog.close();
+                            let Some((mut runtime, prompt)) =
+                                pending_for_response.borrow_mut().take()
+                            else {
+                                return;
+                            };
+                            if response != gtk4::ResponseType::Yes {
+                                return;
+                            }
+                            match runtime.approve(prompt) {
+                                Ok(invocation) => {
+                                    run_plugin_invocation(&window_for_response, invocation);
+                                }
+                                Err(error) => {
+                                    show_plugin_error_dialog(&window_for_response, &error);
+                                }
+                            }
+                        });
+                        dialog.present();
+                    }
+                    Err(error) => show_plugin_error_dialog(&window_clone, &error),
                 }
             });
             window.add_action(&action);

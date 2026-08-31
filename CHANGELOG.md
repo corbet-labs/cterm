@@ -19,8 +19,11 @@ is omitted for readability.
   grant persistence, stale-descriptor rejection, exact pre/post-execution
   grant enforcement, typed native-action conversion, bounded framed process
   I/O, a strict wall timeout, and Unix process-group / Windows Job Object
-  termination. Release packages include the runner; native grant prompts and
-  UI command integration remain a subsequent stage.
+  termination. GTK/Wayland, Cocoa, and Win32 expose discovered commands in a
+  native Tools → Plugins menu, show exact native grant prompts, execute on
+  worker threads, and dispatch validated results through their existing native
+  action policy. Managed mode disables the complete plugin surface. Release
+  packages include the runner.
 - Native FreeBSD builds now compile the GTK4/Wayland client and daemon and run
   their portable library and daemon-integration tests in a FreeBSD 14.4 VM.
 - Foot-compatible independent cursor blink sources and native cursor/text

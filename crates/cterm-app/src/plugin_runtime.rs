@@ -95,6 +95,21 @@ impl PluginRuntime {
         }
     }
 
+    /// Resolve a stable menu action ID against the currently loaded catalog
+    /// before applying the normal authorization flow.
+    pub fn authorize_action(
+        &self,
+        action_id: &str,
+    ) -> Result<PluginAuthorization, PluginRuntimeError> {
+        let command = self
+            .catalog
+            .commands()
+            .iter()
+            .find(|command| command.action_id() == action_id)
+            .ok_or_else(|| PluginRuntimeError::UnknownCommand(action_id.to_string()))?;
+        self.authorize(command)
+    }
+
     /// Persist approval for the exact package shown by a native prompt and
     /// return a worker-thread-safe invocation snapshot.
     pub fn approve(
@@ -181,6 +196,34 @@ impl PluginApprovalPrompt {
     pub const fn content_changed(&self) -> bool {
         self.content_changed
     }
+
+    /// Consistent, native-dialog-ready explanation of the exact authority
+    /// that will be granted.
+    pub fn message(&self) -> String {
+        let mut message = format!(
+            "Plugin: {} ({})\nVersion: {}\nCommand: {}\n\nThis plugin may invoke:\n",
+            self.command.plugin_name(),
+            self.command.plugin_id(),
+            self.command.plugin_version(),
+            self.command.command_title(),
+        );
+        for action in self.command.requested_actions() {
+            message.push_str("  • ");
+            message.push_str(action.as_str());
+            if self.missing.contains(action) {
+                message.push_str(" (new)");
+            }
+            message.push('\n');
+        }
+        if self.content_changed {
+            message.push_str(
+                "\nThe plugin contents changed since the previous approval. Approving replaces the old grant.",
+            );
+        } else {
+            message.push_str("\nApprove these exact permissions for this plugin version?");
+        }
+        message
+    }
 }
 
 /// Immutable invocation data that can be moved off a native UI thread.
@@ -209,6 +252,16 @@ impl PluginInvocation {
             .invoke(&self.grants, &self.plugin, &self.command)
             .await?;
         PluginExecution::from_broker_output(output)
+    }
+
+    /// Execute on a dedicated worker thread without requiring each native
+    /// frontend to construct its own Tokio runtime.
+    pub fn execute_blocking(self) -> Result<PluginExecution, PluginRuntimeError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(PluginRuntimeError::WorkerRuntime)?;
+        runtime.block_on(self.execute())
     }
 }
 
@@ -311,12 +364,16 @@ pub enum PluginRuntimeError {
     },
     #[error("plugin command `{0}` changed after catalog discovery; refresh is required")]
     CatalogChanged(String),
+    #[error("plugin command `{0}` is absent from the current catalog")]
+    UnknownCommand(String),
     #[error(transparent)]
     Broker(#[from] PluginBrokerError),
     #[error("plugin returned an invalid {kind} parameter value {value}")]
     InvalidWireParameter { kind: &'static str, value: i64 },
     #[error("plugin action cannot be dispatched: {0}")]
     Action(#[from] ActionInvocationError),
+    #[error("failed to initialize the plugin worker runtime: {0}")]
+    WorkerRuntime(#[source] io::Error),
 }
 
 #[cfg(test)]
@@ -358,6 +415,9 @@ mod tests {
         assert_eq!(prompt.command().action_id(), command.action_id());
         assert_eq!(prompt.missing_actions(), command.requested_actions());
         assert!(!prompt.content_changed());
+        let message = prompt.message();
+        assert!(message.contains("Runtime Test (org.example.runtime)"));
+        assert!(message.contains("cterm:new-tab (new)"));
 
         let invocation = runtime.approve(prompt).unwrap();
         assert_eq!(invocation.plugin_id(), command.plugin_id());
@@ -371,6 +431,19 @@ mod tests {
         assert!(matches!(
             runtime.authorize(&command).unwrap(),
             PluginAuthorization::ApprovalRequired(_)
+        ));
+    }
+
+    #[test]
+    fn stable_action_lookup_never_falls_back_to_another_command() {
+        let (_directory, runtime, command) = test_runtime();
+        assert!(matches!(
+            runtime.authorize_action(command.action_id()).unwrap(),
+            PluginAuthorization::ApprovalRequired(_)
+        ));
+        assert!(matches!(
+            runtime.authorize_action("plugin:org.example.runtime/missing"),
+            Err(PluginRuntimeError::UnknownCommand(_))
         ));
     }
 

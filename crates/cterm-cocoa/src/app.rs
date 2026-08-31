@@ -16,7 +16,10 @@ use objc2_foundation::{
 };
 
 use cterm_app::config::{load_config, Config};
-use cterm_app::{TemplateInstancePolicy, TemplateLaunchPlan};
+use cterm_app::{
+    PluginAuthorization, PluginInvocation, PluginRuntime, TemplateInstancePolicy,
+    TemplateLaunchPlan,
+};
 use cterm_ui::theme::Theme;
 
 use crate::menu;
@@ -69,6 +72,53 @@ fn reject_managed_secondary_action(action: &str) -> bool {
     } else {
         false
     }
+}
+
+fn key_cterm_window(mtm: MainThreadMarker) -> Option<Retained<CtermWindow>> {
+    let app = NSApplication::sharedApplication(mtm);
+    let window = app.keyWindow()?;
+    let is_cterm: bool = unsafe { msg_send![&window, isKindOfClass: objc2::class!(CtermWindow)] };
+    if !is_cterm {
+        return None;
+    }
+    unsafe { Retained::retain(Retained::as_ptr(&window) as *mut CtermWindow) }
+}
+
+fn run_plugin_invocation(
+    mtm: MainThreadMarker,
+    window: Retained<CtermWindow>,
+    invocation: PluginInvocation,
+) {
+    let window = dispatch2::MainThreadBound::new(window, mtm);
+    std::thread::spawn(move || {
+        let result = invocation.execute_blocking();
+        dispatch2::Queue::main().exec_async(move || {
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            let window = window.into_inner(mtm);
+            match result {
+                Ok(execution) => {
+                    for diagnostic in execution.diagnostics() {
+                        log::info!("Plugin diagnostic: {diagnostic}");
+                    }
+                    if !execution.host_stderr().is_empty() {
+                        log::warn!(
+                            "Plugin host stderr: {}",
+                            String::from_utf8_lossy(execution.host_stderr())
+                        );
+                    }
+                    for action in execution.actions() {
+                        window.dispatch_action(action);
+                    }
+                }
+                Err(error) => crate::dialogs::show_error(
+                    mtm,
+                    Some(&window),
+                    "Plugin command failed",
+                    &error.to_string(),
+                ),
+            }
+        });
+    });
 }
 
 async fn detach_snapshot_handles(sessions: &[cterm_app::daemon_reconnect::ReconnectedSession]) {
@@ -531,6 +581,76 @@ define_class!(
                         }
                     }
                 }
+            }
+        }
+
+        #[unsafe(method(runPluginCommand:))]
+        fn action_run_plugin_command(&self, sender: Option<&objc2::runtime::AnyObject>) {
+            if reject_managed_secondary_action("plugin command") {
+                return;
+            }
+            use objc2_app_kit::NSMenuItem;
+
+            let Some(sender) = sender else {
+                return;
+            };
+            let item: &NSMenuItem = unsafe { &*(sender as *const _ as *const NSMenuItem) };
+            let Some(object) = item.representedObject() else {
+                log::error!("Plugin menu item omitted its stable command ID");
+                return;
+            };
+            let action_id: &NSString = unsafe { &*(&*object as *const _ as *const NSString) };
+            let mtm = MainThreadMarker::from(self);
+            let Some(window) = key_cterm_window(mtm) else {
+                crate::dialogs::show_error(
+                    mtm,
+                    None,
+                    "Plugin command failed",
+                    "No cterm window is available for this command.",
+                );
+                return;
+            };
+            let mut runtime = match PluginRuntime::for_current_user() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    crate::dialogs::show_error(
+                        mtm,
+                        Some(&window),
+                        "Plugin command failed",
+                        &error.to_string(),
+                    );
+                    return;
+                }
+            };
+            match runtime.authorize_action(&action_id.to_string()) {
+                Ok(PluginAuthorization::Granted(invocation)) => {
+                    run_plugin_invocation(mtm, window, invocation);
+                }
+                Ok(PluginAuthorization::ApprovalRequired(prompt)) => {
+                    if !crate::dialogs::show_confirm(
+                        mtm,
+                        Some(&window),
+                        "Allow plugin command?",
+                        &prompt.message(),
+                    ) {
+                        return;
+                    }
+                    match runtime.approve(prompt) {
+                        Ok(invocation) => run_plugin_invocation(mtm, window, invocation),
+                        Err(error) => crate::dialogs::show_error(
+                            mtm,
+                            Some(&window),
+                            "Plugin command failed",
+                            &error.to_string(),
+                        ),
+                    }
+                }
+                Err(error) => crate::dialogs::show_error(
+                    mtm,
+                    Some(&window),
+                    "Plugin command failed",
+                    &error.to_string(),
+                ),
             }
         }
 
