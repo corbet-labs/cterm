@@ -200,8 +200,9 @@ wait_for_preferences_window() {
     exit 1
 }
 
-apply_horizontal_pane_shortcut() {
-    local new_shortcut="$1"
+save_horizontal_pane_shortcut() {
+    local old_shortcut="$1"
+    local new_shortcut="$2"
 
     focus_cterm
     osascript <<EOF
@@ -222,33 +223,19 @@ tell application "System Events"
         if paneTabPressed is false then error "Pane Shortcuts tab not found"
 
         delay 0.25
-        set shortcutChanged to false
-        repeat with candidate in entire contents of preferencesWindow
-            try
-                set candidateElement to contents of candidate
-                set candidateIdentifier to (value of attribute "AXIdentifier" of candidateElement) as text
-                if candidateIdentifier is "cterm.preferences.pane.split-horizontal" then
-                    set value of candidateElement to "$new_shortcut"
-                    set shortcutChanged to true
-                    exit repeat
-                end if
-            end try
-        end repeat
-        if shortcutChanged is false then error "Horizontal pane shortcut field not found"
+        set focusedControl to value of attribute "AXFocusedUIElement" of ctermProcess
+        if (role of focusedControl as text) is not "AXTextField" then
+            key code 48
+            delay 0.25
+            set focusedControl to value of attribute "AXFocusedUIElement" of ctermProcess
+        end if
+        if (role of focusedControl as text) is not "AXTextField" then error "Pane shortcut field did not receive keyboard focus"
+        if (value of focusedControl as text) is not "$old_shortcut" then error "Unexpected first pane shortcut value"
+        set value of focusedControl to "$new_shortcut"
 
-        set applyPressed to false
-        repeat with candidate in entire contents of preferencesWindow
-            try
-                set candidateElement to contents of candidate
-                set candidateIdentifier to (value of attribute "AXIdentifier" of candidateElement) as text
-                if candidateIdentifier is "cterm.preferences.apply" then
-                    perform action "AXPress" of candidateElement
-                    set applyPressed to true
-                    exit repeat
-                end if
-            end try
-        end repeat
-        if applyPressed is false then error "Apply button not found"
+        -- Return invokes the native default OK button, which saves through
+        -- the same callback as Apply and then closes Preferences.
+        key code 36
     end tell
 end tell
 EOF
@@ -454,22 +441,19 @@ take_screenshot "07_closed_pane"
 
 # Preferences must replace ShortcutManager instances already owned by every
 # open terminal view, including panes that were created before the dialog.
-log "Testing live shortcut reload through Preferences Apply..."
+log "Testing live shortcut reload through Preferences save..."
 focus_cterm
 osascript -e 'tell application "System Events" to keystroke "," using command down'
 wait_for_preferences_window
 PREFERENCES_LOG_MARK=$(cterm_log_line_count)
-apply_horizontal_pane_shortcut "Ctrl+Shift+P"
+save_horizontal_pane_shortcut "Ctrl+Shift+Backslash" "Ctrl+Shift+P"
 wait_for_new_cterm_log \
     'Preferences saved; refreshed shortcuts for [1-9][0-9]* window\(s\) and ([2-9]|[1-9][0-9]+) terminal view\(s\)' \
-    "Preferences Apply refreshed every pre-existing window and split pane" \
+    "Preferences save refreshed every pre-existing window and split pane" \
     "$PREFERENCES_LOG_MARK"
-take_screenshot "08_preferences_applied"
+take_screenshot "08_preferences_saved"
 
-# Close without another save so the following assertion specifically depends
-# on Apply, then focus a pane that was inactive while Preferences was open.
-send_key "w" "cmd"
-sleep 0.5
+# Focus a pane that was inactive while Preferences was open.
 FOCUS_LOG_MARK=$(cterm_log_line_count)
 select_pane_menu_item "Focus Left"
 wait_for_new_cterm_log 'Focused pane .*Left' \
