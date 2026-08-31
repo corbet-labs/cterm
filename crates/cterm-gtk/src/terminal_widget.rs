@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 use gtk4::{
@@ -21,6 +21,10 @@ use cterm_core::mouse::{
 use cterm_core::screen::{ClipboardOperation, CursorStyle, MouseEncoding, MouseMode, ScreenConfig};
 use cterm_core::term::{Key, Modifiers, Terminal, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags};
+use cterm_ui::blink::{
+    cell_foreground_visible, cursor_visible, BlinkClock, BlinkNeeds, BlinkPhase,
+    BLINK_POLL_INTERVAL,
+};
 use cterm_ui::sprite::{Sprite, SpriteCache};
 use cterm_ui::theme::Theme;
 
@@ -56,6 +60,8 @@ pub struct TerminalWidget {
     default_font_size: f64,
     cell_dims: Rc<RefCell<CellDimensions>>,
     sprite_cache: Rc<RefCell<SpriteCache>>,
+    blink_clock: Rc<RefCell<BlinkClock>>,
+    blink_started: Instant,
     /// Optional background color override (from template)
     background_override: Rc<RefCell<Option<cterm_core::color::Rgb>>>,
     /// Input method preedit (composition) state
@@ -565,6 +571,7 @@ impl TerminalWidget {
         let background_override = Rc::clone(&self.background_override);
         let preedit = Rc::clone(&self.preedit);
         let sprite_cache = Rc::clone(&self.sprite_cache);
+        let blink_clock = Rc::clone(&self.blink_clock);
 
         self.drawing_area
             .set_draw_func(move |_area, cr, _width, _height| {
@@ -579,6 +586,7 @@ impl TerminalWidget {
                     background_override: bg_override,
                 };
                 let mut sprites = sprite_cache.borrow_mut();
+                let blink_phase = blink_clock.borrow().phase();
                 draw_terminal(
                     cr,
                     &terminal,
@@ -586,8 +594,29 @@ impl TerminalWidget {
                     &render_config,
                     &preedit_state,
                     &mut sprites,
+                    blink_phase,
                 );
             });
+    }
+
+    /// Drive blink phases independently of PTY output and invalidate only on
+    /// phase edges that are relevant to the currently visible screen.
+    fn setup_blink_clock(&self) {
+        let drawing_area = self.drawing_area.downgrade();
+        let terminal = Arc::clone(&self.terminal);
+        let blink_clock = Rc::clone(&self.blink_clock);
+        let started = self.blink_started;
+
+        glib::timeout_add_local(BLINK_POLL_INTERVAL, move || {
+            let Some(drawing_area) = drawing_area.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let needs = BlinkNeeds::for_screen(terminal.lock().screen());
+            if blink_clock.borrow_mut().update(started.elapsed(), needs) {
+                drawing_area.queue_draw();
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     /// Set up input handling
@@ -1437,6 +1466,7 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY — write callback forwards via channel
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        configure_terminal_cursor(&mut terminal, config);
         terminal.set_base_palette(frontend_palette(theme, None));
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -1462,6 +1492,8 @@ impl TerminalWidget {
             default_font_size: font_size,
             cell_dims,
             sprite_cache: Rc::new(RefCell::new(SpriteCache::default())),
+            blink_clock: Rc::new(RefCell::new(BlinkClock::default())),
+            blink_started: Instant::now(),
             background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
@@ -1473,6 +1505,7 @@ impl TerminalWidget {
 
         let daemon_socket = session.socket_path().map(|p| p.to_owned());
         widget.setup_drawing();
+        widget.setup_blink_clock();
         widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
@@ -1518,6 +1551,7 @@ impl TerminalWidget {
 
         // Create a Terminal with no PTY
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        configure_terminal_cursor(&mut terminal, config);
         terminal.set_base_palette(frontend_palette(theme, None));
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -1554,6 +1588,8 @@ impl TerminalWidget {
             default_font_size: font_size,
             cell_dims,
             sprite_cache: Rc::new(RefCell::new(SpriteCache::default())),
+            blink_clock: Rc::new(RefCell::new(BlinkClock::default())),
+            blink_started: Instant::now(),
             background_override: Rc::new(RefCell::new(None)),
             on_exit: Rc::new(RefCell::new(None)),
             on_bell: Rc::new(RefCell::new(None)),
@@ -1565,6 +1601,7 @@ impl TerminalWidget {
 
         let daemon_socket = recon.handle.socket_path().map(|p| p.to_owned());
         widget.setup_drawing();
+        widget.setup_blink_clock();
         widget.setup_visibility_reporting();
         widget.setup_input();
         widget.setup_drop();
@@ -1885,6 +1922,8 @@ impl TerminalWidget {
         let on_bell = Rc::clone(&self.on_bell);
         let on_title_change = Rc::clone(&self.on_title_change);
         let on_file_transfer = Rc::clone(&self.on_file_transfer);
+        let blink_clock = Rc::clone(&self.blink_clock);
+        let blink_started = self.blink_started;
         glib::timeout_add_local(Duration::from_millis(10), move || {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -1961,6 +2000,9 @@ impl TerminalWidget {
                         }
 
                         if content_changed {
+                            blink_clock
+                                .borrow_mut()
+                                .rearm_cursor(blink_started.elapsed());
                             terminal_main.lock().screen_mut().dirty = false;
                             drawing_area.queue_draw();
                         }
@@ -2113,6 +2155,13 @@ struct RenderConfig<'a> {
     background_override: Option<cterm_core::color::Rgb>,
 }
 
+fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
+    terminal.screen_mut().configure_cursor(
+        config.appearance.cursor_style.core_style(),
+        config.appearance.cursor_blink,
+    );
+}
+
 /// Draw the terminal contents
 fn draw_terminal(
     cr: &cairo::Context,
@@ -2121,6 +2170,7 @@ fn draw_terminal(
     config: &RenderConfig<'_>,
     preedit: &PreeditState,
     sprite_cache: &mut SpriteCache,
+    blink_phase: BlinkPhase,
 ) {
     let term = terminal.lock();
     let screen = term.screen();
@@ -2171,6 +2221,7 @@ fn draw_terminal(
                 continue;
             };
             let x = col_idx as f64 * cell_width;
+            let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
 
             // Skip wide char spacers
             if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
@@ -2236,7 +2287,7 @@ fn draw_terminal(
             }
 
             // Draw character
-            if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
+            if foreground_visible && cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
                 let sprite_width = cell_width.round().max(1.0) as u32;
                 let sprite_height = cell_height.round().max(1.0) as u32;
                 if let Some(sprite) = cell
@@ -2272,7 +2323,7 @@ fn draw_terminal(
                 }
             }
 
-            if !cell.attrs.contains(CellAttrs::HIDDEN) {
+            if foreground_visible && !cell.attrs.contains(CellAttrs::HIDDEN) {
                 draw_cell_decorations(
                     cr,
                     cell,
@@ -2291,7 +2342,7 @@ fn draw_terminal(
     draw_terminal_images(cr, screen, cell_width, cell_height);
 
     // Draw cursor
-    if screen.modes.show_cursor && scroll_offset == 0 {
+    if cursor_visible(screen, blink_phase) {
         let cursor = &screen.cursor;
         let x = cursor.col as f64 * cell_width;
         let y = cursor.row as f64 * cell_height;
@@ -2738,4 +2789,27 @@ fn keyval_to_key(keyval: gdk::Key) -> Option<Key> {
         GK::F12 => Key::F(12),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_cursor_config_initializes_protocol_defaults() {
+        let mut config = Config::default();
+        config.appearance.cursor_style = cterm_app::config::CursorStyleConfig::Bar;
+        config.appearance.cursor_blink = false;
+        let mut terminal = Terminal::new(8, 2, ScreenConfig::default());
+
+        configure_terminal_cursor(&mut terminal, &config);
+
+        assert_eq!(terminal.screen().cursor.style, CursorStyle::Bar);
+        assert!(!terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12h");
+        assert!(terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12l\x1b[0 q");
+        assert_eq!(terminal.screen().cursor.style, CursorStyle::Bar);
+        assert!(!terminal.screen().cursor.blink.enabled());
+    }
 }

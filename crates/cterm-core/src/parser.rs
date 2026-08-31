@@ -1219,29 +1219,30 @@ impl vte::Perform for ScreenPerformer<'_> {
             ('q', [b' ']) => {
                 let style = first_param(&params_vec, 0);
                 match style {
-                    0 | 1 => {
+                    0 => self.screen.cursor.reset_style_to_config(),
+                    1 => {
                         self.screen.cursor.style = CursorStyle::Block;
-                        self.screen.cursor.blink = true;
+                        self.screen.cursor.blink.set_decscusr(Some(true));
                     }
                     2 => {
                         self.screen.cursor.style = CursorStyle::Block;
-                        self.screen.cursor.blink = false;
+                        self.screen.cursor.blink.set_decscusr(Some(false));
                     }
                     3 => {
                         self.screen.cursor.style = CursorStyle::Underline;
-                        self.screen.cursor.blink = true;
+                        self.screen.cursor.blink.set_decscusr(Some(true));
                     }
                     4 => {
                         self.screen.cursor.style = CursorStyle::Underline;
-                        self.screen.cursor.blink = false;
+                        self.screen.cursor.blink.set_decscusr(Some(false));
                     }
                     5 => {
                         self.screen.cursor.style = CursorStyle::Bar;
-                        self.screen.cursor.blink = true;
+                        self.screen.cursor.blink.set_decscusr(Some(true));
                     }
                     6 => {
                         self.screen.cursor.style = CursorStyle::Bar;
-                        self.screen.cursor.blink = false;
+                        self.screen.cursor.blink.set_decscusr(Some(false));
                     }
                     _ => {}
                 }
@@ -1376,7 +1377,7 @@ fn decrqss_response(query: &[u8], screen: &Screen) -> Vec<u8> {
         ),
         b"m" => sgr_status_string(screen),
         b" q" => {
-            let mode = match (screen.cursor.style, screen.cursor.blink) {
+            let mode = match (screen.cursor.style, screen.cursor.blink.style_enabled()) {
                 (CursorStyle::Block, true) => 1,
                 (CursorStyle::Block, false) => 2,
                 (CursorStyle::Underline, true) => 3,
@@ -1401,6 +1402,7 @@ fn sgr_status_string(screen: &Screen) -> String {
         (CellAttrs::DIM, "2"),
         (CellAttrs::ITALIC, "3"),
         (CellAttrs::BLINK, "5"),
+        (CellAttrs::RAPID_BLINK, "6"),
         (CellAttrs::INVERSE, "7"),
         (CellAttrs::HIDDEN, "8"),
         (CellAttrs::STRIKETHROUGH, "9"),
@@ -1972,8 +1974,15 @@ impl ScreenPerformer<'_> {
                         _ => self.screen.style.attrs.insert(CellAttrs::UNDERLINE),
                     }
                 }
-                // Blink
-                [5] | [6] => self.screen.style.attrs.insert(CellAttrs::BLINK),
+                // Slow and rapid blink are mutually exclusive.
+                [5] => {
+                    self.screen.style.attrs.clear_blink();
+                    self.screen.style.attrs.insert(CellAttrs::BLINK);
+                }
+                [6] => {
+                    self.screen.style.attrs.clear_blink();
+                    self.screen.style.attrs.insert(CellAttrs::RAPID_BLINK);
+                }
                 // Inverse
                 [7] => self.screen.style.attrs.insert(CellAttrs::INVERSE),
                 // Hidden
@@ -1990,7 +1999,7 @@ impl ScreenPerformer<'_> {
                 // Not underlined
                 [24] => self.screen.style.attrs.clear_underline(),
                 // Not blinking
-                [25] => self.screen.style.attrs.remove(CellAttrs::BLINK),
+                [25] => self.screen.style.attrs.clear_blink(),
                 // Not inverse
                 [27] => self.screen.style.attrs.remove(CellAttrs::INVERSE),
                 // Not hidden
@@ -2192,7 +2201,7 @@ impl ScreenPerformer<'_> {
             // DECTCEM - Show Cursor
             25 => self.screen.modes.show_cursor = set,
             // Cursor blinking mode
-            12 => self.screen.cursor.blink = set,
+            12 => self.screen.cursor.blink.set_dec_mode_12(set),
             // DECNKM - Numeric Keypad Mode.  This is equivalent to DECKPAM /
             // DECKPNM, but expressed as a DEC private mode.
             66 => self.screen.modes.application_keypad = set,
@@ -2283,7 +2292,7 @@ impl ScreenPerformer<'_> {
             6 => self.screen.modes.origin_mode,
             7 => self.screen.modes.auto_wrap,
             45 => self.screen.modes.reverse_wrap,
-            12 => self.screen.cursor.blink,
+            12 => self.screen.cursor.blink.dec_mode_12(),
             25 => self.screen.modes.show_cursor,
             47 | 1047 | 1049 => self.screen.modes.alternate_screen,
             66 => self.screen.modes.application_keypad,
@@ -2697,6 +2706,55 @@ mod tests {
         parser.parse(&mut screen, b"\x1b[0m");
         assert_eq!(screen.style.fg, Color::Default);
         assert_eq!(screen.style.bg, Color::Default);
+    }
+
+    #[test]
+    fn test_sgr_slow_and_rapid_blink_are_distinct() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[5mA\x1b[6mB\x1b[25mC");
+
+        let slow = screen.get_cell(0, 0).unwrap().attrs;
+        assert!(slow.contains(CellAttrs::BLINK));
+        assert!(!slow.contains(CellAttrs::RAPID_BLINK));
+        let rapid = screen.get_cell(0, 1).unwrap().attrs;
+        assert!(!rapid.contains(CellAttrs::BLINK));
+        assert!(rapid.contains(CellAttrs::RAPID_BLINK));
+        assert!(!screen.get_cell(0, 2).unwrap().attrs.has_blink());
+    }
+
+    #[test]
+    fn test_cursor_blink_sources_match_foot() {
+        let mut screen = make_screen();
+        screen.configure_cursor(CursorStyle::Bar, false);
+        let mut parser = Parser::new();
+
+        assert!(!screen.cursor.blink.enabled());
+        parser.parse(&mut screen, b"\x1b[?12h\x1b[4 q");
+        assert!(screen.cursor.blink.enabled());
+        assert!(screen.cursor.blink.dec_mode_12());
+        assert!(!screen.cursor.blink.style_enabled());
+        assert_eq!(screen.cursor.style, CursorStyle::Underline);
+
+        parser.parse(&mut screen, b"\x1bP$q q\x1b\\\x1b[?12$p");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1bP1$r4 q\x1b\\".to_vec(), b"\x1b[?12;1$y".to_vec()]
+        );
+
+        parser.parse(&mut screen, b"\x1b[?12l");
+        assert!(!screen.cursor.blink.enabled());
+        parser.parse(&mut screen, b"\x1b[1 q");
+        assert!(screen.cursor.blink.enabled());
+        parser.parse(&mut screen, b"\x1b[0 q");
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert!(!screen.cursor.blink.enabled());
+
+        parser.parse(&mut screen, b"\x1b[?12h");
+        screen.reset();
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert!(!screen.cursor.blink.enabled());
     }
 
     #[test]

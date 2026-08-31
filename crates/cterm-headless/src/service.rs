@@ -1,9 +1,9 @@
 //! gRPC TerminalService implementation
 
 use crate::convert::{
-    cell_to_proto, cursor_to_proto, event_to_proto, modes_to_proto, proto_to_frontend_state,
-    proto_to_key, proto_to_modifiers, proto_to_palette, screen_to_proto, screen_to_text,
-    terminal_images_to_proto, visible_rows_to_proto,
+    cell_to_proto, cursor_to_proto, event_to_proto, modes_to_proto, proto_to_cursor_style,
+    proto_to_frontend_state, proto_to_key, proto_to_modifiers, proto_to_palette, screen_to_proto,
+    screen_to_text, terminal_images_to_proto, visible_rows_to_proto,
 };
 use crate::proto::terminal_service_server::TerminalService;
 use crate::proto::*;
@@ -97,6 +97,12 @@ impl TerminalService for TerminalServiceImpl {
         };
         let frontend_state = proto_to_frontend_state(req.theme_appearance, req.window_visibility)
             .ok_or_else(|| Status::invalid_argument("invalid frontend state"))?;
+        let cursor_style = match req.cursor_style {
+            Some(style) => proto_to_cursor_style(style)
+                .ok_or_else(|| Status::invalid_argument("invalid cursor style"))?,
+            None => cterm_core::CursorStyle::Block,
+        };
+        let cursor_blink = req.cursor_blink.unwrap_or(true);
 
         let cols = req.cols.max(1) as usize;
         let rows = req.rows.max(1) as usize;
@@ -149,6 +155,8 @@ impl TerminalService for TerminalServiceImpl {
                     ssh_config,
                     base_palette,
                     frontend_state,
+                    cursor_style,
+                    cursor_blink,
                 )
                 .map_err(Status::from)?;
 
@@ -172,6 +180,8 @@ impl TerminalService for TerminalServiceImpl {
                 req.term,
                 base_palette,
                 frontend_state,
+                cursor_style,
+                cursor_blink,
             )
             .map_err(Status::from)?;
 
@@ -547,12 +557,7 @@ impl TerminalService for TerminalServiceImpl {
 
         let cursor = session.with_terminal(|term| {
             let screen = term.screen();
-            CursorPosition {
-                row: screen.cursor.row as u32,
-                col: screen.cursor.col as u32,
-                visible: screen.modes.show_cursor,
-                style: CursorStyle::Block as i32,
-            }
+            cursor_to_proto(screen)
         });
 
         Ok(Response::new(GetCursorResponse {

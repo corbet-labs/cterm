@@ -229,6 +229,22 @@ impl SshTunnelHandle {
     }
 }
 
+/// Cursor defaults installed before the daemon consumes child output.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorDefaults {
+    pub style: cterm_core::CursorStyle,
+    pub blink: bool,
+}
+
+impl Default for CursorDefaults {
+    fn default() -> Self {
+        Self {
+            style: cterm_core::CursorStyle::Block,
+            blink: true,
+        }
+    }
+}
+
 /// Options for creating a new terminal session
 #[derive(Default)]
 pub struct CreateSessionOpts {
@@ -249,6 +265,15 @@ pub struct CreateSessionOpts {
     pub base_palette: Option<cterm_core::ColorPalette>,
     /// Native theme and window state for foot-compatible protocol reports.
     pub frontend_state: cterm_core::FrontendState,
+    /// Native cursor defaults for daemon-authoritative DECSCUSR reports.
+    pub cursor: CursorDefaults,
+}
+
+impl CreateSessionOpts {
+    /// Keep daemon-authoritative cursor queries aligned with native rendering.
+    pub fn set_cursor_defaults(&mut self, style: cterm_core::CursorStyle, blink: bool) {
+        self.cursor = CursorDefaults { style, blink };
+    }
 }
 
 /// Connection to a ctermd instance
@@ -809,6 +834,10 @@ impl DaemonConnection {
                     .map(cterm_proto::convert::palette_to_proto),
                 theme_appearance,
                 window_visibility,
+                cursor_style: Some(
+                    cterm_proto::convert::cursor_style_to_proto(opts.cursor.style) as i32,
+                ),
+                cursor_blink: Some(opts.cursor.blink),
             })
             .await?;
 

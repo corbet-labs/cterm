@@ -166,6 +166,17 @@ pub enum CursorStyleConfig {
     Bar,
 }
 
+impl CursorStyleConfig {
+    /// Convert the persisted native preference to the terminal-core shape.
+    pub const fn core_style(self) -> cterm_core::CursorStyle {
+        match self {
+            Self::Block => cterm_core::CursorStyle::Block,
+            Self::Underline => cterm_core::CursorStyle::Underline,
+            Self::Bar => cterm_core::CursorStyle::Bar,
+        }
+    }
+}
+
 /// Tab settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

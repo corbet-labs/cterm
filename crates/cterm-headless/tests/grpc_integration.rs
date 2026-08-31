@@ -400,6 +400,8 @@ async fn test_create_and_list_sessions() {
             base_palette: None,
             theme_appearance: 0,
             window_visibility: 0,
+            cursor_style: None,
+            cursor_blink: None,
         })
         .await
         .expect("create_session failed");
@@ -456,6 +458,8 @@ async fn test_get_session() {
             base_palette: None,
             theme_appearance: 0,
             window_visibility: 0,
+            cursor_style: None,
+            cursor_blink: None,
         })
         .await
         .expect("create_session failed");
@@ -529,6 +533,8 @@ async fn test_write_input_and_get_screen() {
             base_palette: None,
             theme_appearance: 0,
             window_visibility: 0,
+            cursor_style: None,
+            cursor_blink: None,
         })
         .await
         .expect("create_session failed");
@@ -601,6 +607,8 @@ async fn test_stream_input_reaches_conpty() {
             base_palette: None,
             theme_appearance: 0,
             window_visibility: 0,
+            cursor_style: None,
+            cursor_blink: None,
         })
         .await
         .expect("create_session failed");
@@ -668,6 +676,8 @@ async fn test_resize() {
             base_palette: None,
             theme_appearance: 0,
             window_visibility: 0,
+            cursor_style: None,
+            cursor_blink: None,
         })
         .await
         .expect("create_session failed");
@@ -730,6 +740,8 @@ async fn test_get_cursor() {
             base_palette: None,
             theme_appearance: 0,
             window_visibility: 0,
+            cursor_style: Some(CursorStyle::Bar as i32),
+            cursor_blink: Some(false),
         })
         .await
         .expect("create_session failed");
@@ -750,6 +762,7 @@ async fn test_get_cursor() {
     let cursor = cursor_response.get_ref().cursor.as_ref().unwrap();
     // Cursor should be visible
     assert!(cursor.visible);
+    assert_eq!(cursor.style, CursorStyle::Bar as i32);
 
     // Cleanup
     let _ = client
@@ -781,6 +794,8 @@ async fn test_get_screen_full() {
             base_palette: None,
             theme_appearance: 0,
             window_visibility: 0,
+            cursor_style: None,
+            cursor_blink: None,
         })
         .await
         .expect("create_session failed");
@@ -838,6 +853,8 @@ async fn test_multiple_sessions() {
                 base_palette: None,
                 theme_appearance: 0,
                 window_visibility: 0,
+                cursor_style: None,
+                cursor_blink: None,
             })
             .await
             .expect("create_session failed");

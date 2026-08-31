@@ -81,6 +81,8 @@ impl SessionManager {
             term,
             None,
             cterm_core::FrontendState::default(),
+            cterm_core::CursorStyle::Block,
+            true,
         )
     }
 
@@ -97,6 +99,8 @@ impl SessionManager {
         term: Option<String>,
         base_palette: Option<cterm_core::ColorPalette>,
         frontend_state: cterm_core::FrontendState,
+        cursor_style: cterm_core::CursorStyle,
+        cursor_blink: bool,
     ) -> Result<Arc<SessionState>> {
         let size = size.normalized();
         let cols = size.cols as usize;
@@ -123,6 +127,7 @@ impl SessionManager {
             state.set_base_palette(palette);
         }
         state.set_frontend_state(frontend_state);
+        state.configure_cursor(cursor_style, cursor_blink);
 
         // Start the PTY reader task
         let state = state.start_reader()?;
@@ -168,6 +173,8 @@ impl SessionManager {
             ssh_config,
             None,
             cterm_core::FrontendState::default(),
+            cterm_core::CursorStyle::Block,
+            true,
         )
     }
 
@@ -178,6 +185,8 @@ impl SessionManager {
         ssh_config: cterm_core::SshConfig,
         base_palette: Option<cterm_core::ColorPalette>,
         frontend_state: cterm_core::FrontendState,
+        cursor_style: cterm_core::CursorStyle,
+        cursor_blink: bool,
     ) -> Result<Arc<SessionState>> {
         let size = size.normalized();
         let cols = size.cols as usize;
@@ -194,6 +203,7 @@ impl SessionManager {
             state.set_base_palette(palette);
         }
         state.set_frontend_state(frontend_state);
+        state.configure_cursor(cursor_style, cursor_blink);
 
         // Store the session before driving the connection so prompt/event
         // subscribers can attach immediately.

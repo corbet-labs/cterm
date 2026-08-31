@@ -87,6 +87,14 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Install native cursor defaults before daemon-authoritative parsing starts.
+    pub fn configure_cursor(&self, style: cterm_core::CursorStyle, blink: bool) {
+        self.terminal
+            .write()
+            .screen_mut()
+            .configure_cursor(style, blink);
+    }
+
     /// Replace the palette used for daemon-authoritative OSC color replies.
     pub fn set_base_palette(&self, palette: cterm_core::ColorPalette) {
         self.terminal.write().set_base_palette(palette);
@@ -706,5 +714,17 @@ mod tests {
         session.detach();
         session.detach();
         assert_eq!(session.attached_clients(), 0);
+    }
+
+    #[test]
+    fn cursor_defaults_are_authoritative_before_child_output() {
+        let session =
+            SessionState::new_ssh_connecting("cursor-defaults".to_string(), PtySize::default(), 0);
+        session.configure_cursor(cterm_core::CursorStyle::Bar, false);
+
+        let (_, responses) =
+            session.with_terminal_mut(|terminal| terminal.process_collecting(b"\x1bP$q q\x1b\\"));
+
+        assert_eq!(responses, vec![b"\x1bP1$r6 q\x1b\\".to_vec()]);
     }
 }

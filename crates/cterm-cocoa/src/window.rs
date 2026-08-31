@@ -1191,6 +1191,10 @@ impl CtermWindow {
         launch_context.apply_to(&mut opts);
         opts.base_palette = Some(terminal_palette(&theme, None));
         opts.frontend_state.appearance = theme.appearance();
+        opts.set_cursor_defaults(
+            config.appearance.cursor_style.core_style(),
+            config.appearance.cursor_blink,
+        );
         let window = unsafe {
             Retained::retain(self as *const _ as *mut CtermWindow)
                 .expect("a live pane window can be retained")
@@ -1410,6 +1414,10 @@ impl CtermWindow {
         let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         opts.frontend_state.appearance = theme.appearance();
+        opts.set_cursor_defaults(
+            config.appearance.cursor_style.core_style(),
+            config.appearance.cursor_blink,
+        );
         let launch_context = PaneLaunchContext::capture(&opts);
         let window = unsafe {
             Retained::retain(self as *const _ as *mut CtermWindow)
@@ -1802,6 +1810,10 @@ impl CtermWindow {
         ensure_session_pixel_size(&config, &mut opts);
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         opts.frontend_state.appearance = theme.appearance();
+        opts.set_cursor_defaults(
+            config.appearance.cursor_style.core_style(),
+            config.appearance.cursor_blink,
+        );
         let launch_context = PaneLaunchContext::capture(&opts);
         let remote_name = remote.as_ref().map(|(_, name, _, _)| name.clone());
         let tab_owner = tab_owner.map(|tab_owner| {

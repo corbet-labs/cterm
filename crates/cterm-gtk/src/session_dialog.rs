@@ -247,8 +247,11 @@ fn create_session_row(session: &SessionEntry) -> ListBoxRow {
 /// Prompts the user for a hostname (user@host), connects via SSH, attaches to
 /// all existing sessions on the remote daemon, and creates one new session.
 /// The callback receives a list of reconnected sessions (existing + new).
-pub fn show_ssh_dialog<F>(parent: &impl IsA<Window>, callback: F)
-where
+pub fn show_ssh_dialog<F>(
+    parent: &impl IsA<Window>,
+    cursor: cterm_client::CursorDefaults,
+    callback: F,
+) where
     F: Fn(Vec<cterm_app::daemon_reconnect::ReconnectedSession>) + 'static,
 {
     let callback = Rc::new(callback);
@@ -360,6 +363,7 @@ where
                             .create_session(cterm_client::CreateSessionOpts {
                                 cols: 80,
                                 rows: 24,
+                                cursor,
                                 ..Default::default()
                             })
                             .await?;

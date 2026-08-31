@@ -14,6 +14,7 @@ use cterm_core::color::{Color, ColorPalette, Rgb};
 use cterm_core::drcs::DrcsGlyph;
 use cterm_core::TerminalImage;
 use cterm_core::{CursorStyle, Terminal};
+use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
 use cterm_ui::theme::Theme;
 
 /// CoreGraphics renderer for terminal display
@@ -152,7 +153,7 @@ impl CGRenderer {
     }
 
     /// Render the terminal content
-    pub fn render(&self, terminal: &Terminal, bounds: NSRect) {
+    pub fn render(&self, terminal: &Terminal, bounds: NSRect, blink_phase: BlinkPhase) {
         let Some(_context) = NSGraphicsContext::currentContext() else {
             log::warn!("No graphics context");
             return;
@@ -185,6 +186,7 @@ impl CGRenderer {
 
                     let x = col as f64 * self.cell_width;
                     let y = row as f64 * self.cell_height;
+                    let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
 
                     // Check if cell is selected
                     let is_selected = screen.is_selected(absolute_line, col);
@@ -263,7 +265,8 @@ impl CGRenderer {
                     }
 
                     // Draw character
-                    if cell.text() != " "
+                    if foreground_visible
+                        && cell.text() != " "
                         && cell.text() != "\0"
                         && !cell.attrs.contains(CellAttrs::HIDDEN)
                     {
@@ -279,7 +282,7 @@ impl CGRenderer {
 
                     // Draw underlines (regular underline attributes or hyperlinks)
                     let has_hyperlink = cell.hyperlink.is_some();
-                    let visible = !cell.attrs.contains(CellAttrs::HIDDEN);
+                    let visible = foreground_visible && !cell.attrs.contains(CellAttrs::HIDDEN);
                     if visible && (cell.attrs.has_underline() || has_hyperlink) {
                         // Use hyperlink color (blue) for hyperlinks, otherwise use underline color or fg
                         let underline_color = if has_hyperlink {
@@ -322,7 +325,7 @@ impl CGRenderer {
 
         // Draw cursor (only when visible and not scrolled back)
         let cursor = &screen.cursor;
-        if screen.modes.show_cursor && screen.scroll_offset == 0 {
+        if cursor_visible(screen, blink_phase) {
             let cursor_x = cursor.col as f64 * self.cell_width;
             let cursor_y = cursor.row as f64 * self.cell_height;
 

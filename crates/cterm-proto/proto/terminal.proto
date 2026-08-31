@@ -165,6 +165,11 @@ message CreateSessionRequest {
   // Native frontend state used for foot-compatible theme/visibility reports.
   FrontendTheme theme_appearance = 12;
   FrontendVisibility window_visibility = 13;
+
+  // Native cursor defaults must be installed before child output is consumed,
+  // so an immediate DECRQSS query observes the same defaults as the renderer.
+  optional CursorStyle cursor_style = 14;
+  optional bool cursor_blink = 15;
 }
 
 message CreateSessionResponse {
@@ -590,6 +595,7 @@ message CellAttributes {
   bool overline = 13;
   bool wide = 14;
   bool wide_spacer = 15;
+  bool rapid_blink = 16;
 }
 
 message Hyperlink {
@@ -602,6 +608,11 @@ message CursorPosition {
   uint32 col = 2;
   bool visible = 3;
   CursorStyle style = 4;
+  // Present only after an application selects a DECSCUSR style. Absence
+  // preserves the frontend's configured cursor shape/blink defaults.
+  optional bool style_blink_override = 5;
+  // DEC private mode 12 is independent from the DECSCUSR blink source.
+  optional bool dec_mode_12 = 6;
 }
 
 enum CursorStyle {

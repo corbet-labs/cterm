@@ -12,16 +12,26 @@ is omitted for readability.
 ### Added
 - A fail-closed command-plugin foundation with fixed WebAssembly packages,
   strict manifests, content-addressed trust, exact per-action grants, and a
-  bounded versioned protobuf ABI. Plugin execution and UI discovery remain a
-  subsequent stage.
+  bounded versioned protobuf ABI, plus a separate one-shot Wasmi/WASIp1 runner
+  with digest revalidation, fuel, memory, stack, table, input, and output
+  limits. Broker grant enforcement, wall timeout, packaging, and UI discovery
+  remain a subsequent stage.
 - Native FreeBSD builds now compile the GTK4/Wayland client and daemon and run
   their portable library and daemon-integration tests in a FreeBSD 14.4 VM.
+- Foot-compatible independent cursor blink sources and native cursor/text
+  blink rendering across GTK/Wayland, Cocoa, and Win32, including distinct
+  slow and rapid SGR phases and daemon snapshot persistence.
 
 ### Fixed
 - Streamed OSC 1337 interception now replays incomplete, cancelled, and
   oversized sequences atomically instead of leaving the VTE parser inside a
   partial control string. Large replay and decoded-transfer spill files are
   unique and private, and failed receptions remove their temporary storage.
+
+### Security
+- Added a hard RustSec advisory gate, upgraded `anyhow`, `bytes`, `h2`, and
+  `tar` to patched compatible releases, and removed the unused, unmaintained
+  `bincode` dependency.
 
 ## [0.0.20] - 2026-08-31
 

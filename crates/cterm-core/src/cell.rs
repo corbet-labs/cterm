@@ -34,7 +34,7 @@ bitflags! {
         const DOTTED_UNDERLINE = 1 << 5;
         /// Dashed underline
         const DASHED_UNDERLINE = 1 << 6;
-        /// Blinking text
+        /// Slowly blinking text (SGR 5)
         const BLINK = 1 << 7;
         /// Reverse video (swap fg/bg)
         const INVERSE = 1 << 8;
@@ -50,10 +50,22 @@ bitflags! {
         const WIDE = 1 << 13;
         /// Placeholder for second cell of wide char
         const WIDE_SPACER = 1 << 14;
+        /// Rapidly blinking text (SGR 6)
+        const RAPID_BLINK = 1 << 15;
     }
 }
 
 impl CellAttrs {
+    /// Check if either slow or rapid blinking is selected.
+    pub fn has_blink(&self) -> bool {
+        self.intersects(Self::BLINK | Self::RAPID_BLINK)
+    }
+
+    /// Clear both mutually exclusive blink speeds.
+    pub fn clear_blink(&mut self) {
+        self.remove(Self::BLINK | Self::RAPID_BLINK);
+    }
+
     /// Check if any underline style is set
     pub fn has_underline(&self) -> bool {
         self.intersects(

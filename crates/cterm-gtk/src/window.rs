@@ -1261,7 +1261,14 @@ impl CtermWindow {
                 let file_manager = Rc::clone(&file_manager);
                 let notification_bar = notification_bar.clone();
 
-                crate::session_dialog::show_ssh_dialog(&window_clone, move |sessions| {
+                let cursor = {
+                    let config = config.borrow();
+                    cterm_client::CursorDefaults {
+                        style: config.appearance.cursor_style.core_style(),
+                        blink: config.appearance.cursor_blink,
+                    }
+                };
+                crate::session_dialog::show_ssh_dialog(&window_clone, cursor, move |sessions| {
                     for recon in sessions {
                         let sid = recon.handle.session_id().to_string();
                         let daemon_socket = recon.handle.socket_path().map(|p| p.to_owned());
@@ -3801,6 +3808,10 @@ fn spawn_daemon_pane(context: &PaneActionContext, direction: SplitDirection) {
     );
     opts.base_palette = Some(frontend_palette(&context.theme, None));
     opts.frontend_state.appearance = context.theme.appearance();
+    opts.set_cursor_defaults(
+        config.appearance.cursor_style.core_style(),
+        config.appearance.cursor_blink,
+    );
     opts.pixel_width = (cell_dims.width * 80.0).round().max(1.0) as u32;
     opts.pixel_height = (cell_dims.height * 24.0).round().max(1.0) as u32;
     let split_native_ssh = opts.ssh.clone();
@@ -3949,6 +3960,13 @@ fn spawn_daemon_tab(
         background_color.as_deref().and_then(parse_rgb),
     ));
     opts.frontend_state.appearance = theme.appearance();
+    {
+        let config = config.borrow();
+        opts.set_cursor_defaults(
+            config.appearance.cursor_style.core_style(),
+            config.appearance.cursor_blink,
+        );
+    }
     if opts.pixel_width == 0 || opts.pixel_height == 0 {
         let cell_dims = calculate_initial_cell_dimensions(&config.borrow());
         opts.pixel_width = (cell_dims.width * opts.cols.max(1) as f64)

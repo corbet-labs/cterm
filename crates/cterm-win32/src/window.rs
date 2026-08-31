@@ -36,6 +36,7 @@ use cterm_ui::pane::{
     SplitRequest,
 };
 use cterm_ui::theme::Theme;
+use cterm_ui::{BlinkClock, BlinkNeeds, BLINK_POLL_INTERVAL};
 use winapi::um::winuser;
 
 use crate::clipboard;
@@ -172,6 +173,14 @@ struct PaneDivider {
 
 const PREVIOUS_KEY_STATE_BIT: usize = 1 << 30;
 const EXTENDED_KEY_BIT: usize = 1 << 24;
+const BLINK_TIMER_ID: usize = 0x4354;
+
+fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
+    terminal.screen_mut().configure_cursor(
+        config.appearance.cursor_style.core_style(),
+        config.appearance.cursor_blink,
+    );
+}
 
 /// Classify a Win32 key message without consulting mutable keyboard state.
 fn key_event_kind(msg: u32, key_data: usize) -> Option<KeyEventKind> {
@@ -421,6 +430,8 @@ pub struct WindowState {
     pub skip_close_confirm: bool,
     /// Remote host connection manager
     pub remote_manager: cterm_client::RemoteManager,
+    blink_clock: BlinkClock,
+    blink_started: Instant,
 }
 
 fn action_restricted_in_managed_mode(action: &Action) -> bool {
@@ -525,6 +536,24 @@ impl WindowState {
             tool_commands,
             skip_close_confirm: false,
             remote_manager: cterm_client::RemoteManager::new(),
+            blink_clock: BlinkClock::default(),
+            blink_started: Instant::now(),
+        }
+    }
+
+    fn on_blink_timer(&mut self) {
+        let Some(tab) = self.tabs.get(self.active_tab_index) else {
+            return;
+        };
+        let mut needs = BlinkNeeds::default();
+        for pane in tab.panes.values() {
+            let pane_needs = BlinkNeeds::for_screen(pane.terminal.lock().unwrap().screen());
+            needs.cursor |= pane_needs.cursor;
+            needs.slow_cells |= pane_needs.slow_cells;
+            needs.rapid_cells |= pane_needs.rapid_cells;
+        }
+        if self.blink_clock.update(self.blink_started.elapsed(), needs) {
+            self.invalidate();
         }
     }
 
@@ -801,6 +830,10 @@ impl WindowState {
         opts.base_palette = Some(terminal_palette(&tab_theme, background_color.as_deref()));
         opts.frontend_state.appearance = tab_theme.appearance();
         opts.frontend_state.visibility = self.window_visibility;
+        opts.set_cursor_defaults(
+            self.config.appearance.cursor_style.core_style(),
+            self.config.appearance.cursor_blink,
+        );
         let backend = PaneBackendContext::Daemon(Box::new(DaemonPaneContext::from_options(
             &opts,
             remote.clone(),
@@ -810,6 +843,7 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        configure_terminal_cursor(&mut terminal, &self.config);
         terminal.set_base_palette(terminal_palette(&tab_theme, background_color.as_deref()));
         terminal.set_frontend_state(opts.frontend_state);
         terminal.resize_with_pixels(
@@ -935,6 +969,7 @@ impl WindowState {
             ..Default::default()
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        configure_terminal_cursor(&mut terminal, &self.config);
         terminal.set_base_palette(base_palette.clone());
         terminal.set_frontend_state(frontend_state);
 
@@ -1147,6 +1182,7 @@ impl WindowState {
             visibility: self.window_visibility,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        configure_terminal_cursor(&mut terminal, &self.config);
         terminal.set_base_palette(base_palette.clone());
         terminal.set_frontend_state(frontend_state);
         if let Some(ref screen) = screen_snapshot {
@@ -1211,6 +1247,7 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        configure_terminal_cursor(&mut terminal, &self.config);
         terminal.set_base_palette(terminal_palette(theme, background_color));
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -1559,6 +1596,7 @@ impl WindowState {
             .get(self.active_tab_index)
             .and_then(|tab| tab.background_color.as_deref());
         let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
+        configure_terminal_cursor(&mut terminal, &self.config);
         terminal.set_base_palette(terminal_palette(theme, background));
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -1612,12 +1650,17 @@ impl WindowState {
             ssh: context.ssh.clone(),
             base_palette: Some(terminal_palette(theme, background)),
             frontend_state,
+            cursor: cterm_client::CursorDefaults {
+                style: self.config.appearance.cursor_style.core_style(),
+                blink: self.config.appearance.cursor_blink,
+            },
         };
 
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
+        configure_terminal_cursor(&mut terminal, &self.config);
         terminal.set_base_palette(terminal_palette(theme, background));
         terminal.set_frontend_state(frontend_state);
         terminal.resize_with_pixels(
@@ -2304,6 +2347,7 @@ impl WindowState {
         };
         let tab_bar = &mut self.tab_bar;
         let notification_bar = &mut self.notification_bar;
+        let blink_phase = self.blink_clock.phase();
 
         {
             let terminal = first_terminal.lock().unwrap();
@@ -2314,7 +2358,13 @@ impl WindowState {
                 let terminal = terminal.lock().unwrap();
                 let mut rect = positioned.rect;
                 rect.y = rect.y.saturating_add(y_offset);
-                renderer.render_pane(terminal.screen(), rect, positioned.is_active, *alerted)?;
+                renderer.render_pane(
+                    terminal.screen(),
+                    rect,
+                    positioned.is_active,
+                    *alerted,
+                    blink_phase,
+                )?;
             }
             if let Some((target, dwrite, text_format)) = renderer.chrome_resources() {
                 tab_bar.render(&target, &dwrite, chrome_width, &text_format)?;
@@ -3212,6 +3262,7 @@ impl WindowState {
             }
         }
 
+        self.blink_clock.rearm_cursor(self.blink_started.elapsed());
         // Invalidate to redraw
         self.invalidate();
     }
@@ -4160,6 +4211,12 @@ pub fn create_window(config: &Config, theme: &Theme) -> windows::core::Result<HW
     let state_ptr = Box::into_raw(state);
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+        let _ = SetTimer(
+            Some(hwnd),
+            BLINK_TIMER_ID,
+            BLINK_POLL_INTERVAL.as_millis() as u32,
+            None,
+        );
     }
 
     if args.fullscreen {
@@ -4422,6 +4479,12 @@ pub fn create_window_from_upgrade(
     // Store state pointer in window
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        let _ = SetTimer(
+            Some(hwnd),
+            BLINK_TIMER_ID,
+            BLINK_POLL_INTERVAL.as_millis() as u32,
+            None,
+        );
     }
 
     // Restore fullscreen/maximized state
@@ -4941,6 +5004,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
 
+        WM_TIMER if wparam.0 == BLINK_TIMER_ID => {
+            state.on_blink_timer();
+            LRESULT(0)
+        }
+
         WM_SIZE => {
             state.set_window_visibility(if wparam.0 as u32 == SIZE_MINIMIZED {
                 cterm_core::WindowVisibility::Hidden
@@ -5193,6 +5261,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         WM_DESTROY => {
             // Clean up
+            unsafe {
+                let _ = KillTimer(Some(hwnd), BLINK_TIMER_ID);
+            }
             let mut state = unsafe { Box::from_raw(state_ptr) };
             if !state.skip_close_confirm {
                 for tab in &mut state.tabs {
@@ -5462,6 +5533,24 @@ fn reusable_template_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_cursor_config_initializes_protocol_defaults() {
+        let mut config = Config::default();
+        config.appearance.cursor_style = cterm_app::config::CursorStyleConfig::Bar;
+        config.appearance.cursor_blink = false;
+        let mut terminal = Terminal::new(8, 2, ScreenConfig::default());
+
+        configure_terminal_cursor(&mut terminal, &config);
+
+        assert_eq!(terminal.screen().cursor.style, cterm_core::CursorStyle::Bar);
+        assert!(!terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12h");
+        assert!(terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12l\x1b[0 q");
+        assert_eq!(terminal.screen().cursor.style, cterm_core::CursorStyle::Bar);
+        assert!(!terminal.screen().cursor.blink.enabled());
+    }
 
     #[test]
     fn win32_shortcuts_add_f11_fullscreen_to_configured_bindings() {

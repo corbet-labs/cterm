@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use cterm_core::color::{Color, Rgb};
 use cterm_core::{Cell, CellAttrs, CursorStyle, Screen};
+use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
 use cterm_ui::pane::PaneRect;
 use cterm_ui::theme::Theme;
 use windows::core::{Interface, PCWSTR};
@@ -348,6 +349,7 @@ impl TerminalRenderer {
         rect: PaneRect,
         active: bool,
         alerted: bool,
+        blink_phase: BlinkPhase,
     ) -> windows::core::Result<()> {
         let Some(rt) = self.render_target.clone() else {
             return Ok(());
@@ -378,10 +380,10 @@ impl TerminalRenderer {
             base.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
         let draw_result = (|| {
-            self.draw_grid(screen)?;
+            self.draw_grid(screen, blink_phase)?;
             self.draw_images(screen)?;
             if active {
-                self.draw_cursor(screen)?;
+                self.draw_cursor(screen, blink_phase)?;
             }
             Ok::<(), windows::core::Error>(())
         })();
@@ -415,7 +417,11 @@ impl TerminalRenderer {
     }
 
     /// Render the terminal screen as a single full-window pane.
-    pub fn render(&mut self, screen: &Screen) -> windows::core::Result<()> {
+    pub fn render(
+        &mut self,
+        screen: &Screen,
+        blink_phase: BlinkPhase,
+    ) -> windows::core::Result<()> {
         if self.render_target.is_none() {
             return Ok(());
         }
@@ -432,6 +438,7 @@ impl TerminalRenderer {
             ),
             true,
             false,
+            blink_phase,
         )?;
         self.end_frame()
     }
@@ -506,7 +513,7 @@ impl TerminalRenderer {
     }
 
     /// Draw the terminal grid
-    fn draw_grid(&mut self, screen: &Screen) -> windows::core::Result<()> {
+    fn draw_grid(&mut self, screen: &Screen, blink_phase: BlinkPhase) -> windows::core::Result<()> {
         let grid = screen.grid();
         let rows = grid.height();
         let cols = grid.width();
@@ -519,7 +526,7 @@ impl TerminalRenderer {
                     if cell.is_wide_spacer() {
                         continue;
                     }
-                    self.draw_cell(row, col, absolute_line, cell, screen)?;
+                    self.draw_cell(row, col, absolute_line, cell, screen, blink_phase)?;
                 }
             }
         }
@@ -535,11 +542,13 @@ impl TerminalRenderer {
         absolute_line: usize,
         cell: &Cell,
         screen: &Screen,
+        blink_phase: BlinkPhase,
     ) -> windows::core::Result<()> {
         let x = self.origin_x + col as f32 * self.cell_dims.width;
         let y = self.origin_y + row as f32 * self.cell_dims.height;
 
         let attrs = cell.attrs;
+        let foreground_visible = cell_foreground_visible(attrs, blink_phase);
         let is_selected = screen.is_selected(absolute_line, col);
         let (fg, bg) = self.resolve_colors(cell, screen, screen.modes.reverse_video, is_selected);
         let palette = self.resolved_palette(screen);
@@ -563,17 +572,18 @@ impl TerminalRenderer {
 
         let text = cell.text();
         let has_hyperlink = cell.hyperlink.is_some();
-        let needs_fg = text != " " && text != "\0"
-            || attrs.has_underline()
-            || has_hyperlink
-            || attrs.intersects(CellAttrs::STRIKETHROUGH | CellAttrs::OVERLINE);
+        let needs_fg = foreground_visible
+            && (text != " " && text != "\0"
+                || attrs.has_underline()
+                || has_hyperlink
+                || attrs.intersects(CellAttrs::STRIKETHROUGH | CellAttrs::OVERLINE));
         let fg_brush = if needs_fg {
             Some(self.get_brush(fg)?)
         } else {
             None
         };
 
-        let underline_brush = if attrs.has_underline() || has_hyperlink {
+        let underline_brush = if foreground_visible && (attrs.has_underline() || has_hyperlink) {
             let color = if has_hyperlink {
                 Rgb::new(100, 149, 237)
             } else if let Some(color) = cell.underline_color {
@@ -602,7 +612,7 @@ impl TerminalRenderer {
         }
 
         // Draw character
-        if text != " " && text != "\0" && !attrs.contains(CellAttrs::HIDDEN) {
+        if foreground_visible && text != " " && text != "\0" && !attrs.contains(CellAttrs::HIDDEN) {
             let text_format = match (
                 attrs.contains(CellAttrs::BOLD),
                 attrs.contains(CellAttrs::ITALIC),
@@ -636,7 +646,7 @@ impl TerminalRenderer {
         }
 
         // Draw underline (also for hyperlinks)
-        let visible = !attrs.contains(CellAttrs::HIDDEN);
+        let visible = foreground_visible && !attrs.contains(CellAttrs::HIDDEN);
         if visible && (attrs.has_underline() || has_hyperlink) {
             let underline_y = y + self.cell_dims.baseline + 2.0;
             self.draw_underline_pattern(
@@ -774,9 +784,13 @@ impl TerminalRenderer {
     }
 
     /// Draw the cursor
-    fn draw_cursor(&mut self, screen: &Screen) -> windows::core::Result<()> {
+    fn draw_cursor(
+        &mut self,
+        screen: &Screen,
+        blink_phase: BlinkPhase,
+    ) -> windows::core::Result<()> {
         // Check DECTCEM mode for cursor visibility
-        if !screen.modes.show_cursor || screen.scroll_offset > 0 {
+        if !cursor_visible(screen, blink_phase) {
             return Ok(());
         }
 

@@ -858,6 +858,10 @@ define_class!(
                                 .create_session(cterm_client::CreateSessionOpts {
                                     cols: 80,
                                     rows: 24,
+                                    cursor: cterm_client::CursorDefaults {
+                                        style: config.appearance.cursor_style.core_style(),
+                                        blink: config.appearance.cursor_blink,
+                                    },
                                     ..Default::default()
                                 })
                                 .await?;

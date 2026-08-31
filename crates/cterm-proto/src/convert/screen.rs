@@ -7,7 +7,8 @@ use cterm_core::drcs::{DrcsFont, DrcsGlyph};
 use cterm_core::grid::Row as CoreRow;
 use cterm_core::term::Terminal;
 use cterm_core::{
-    Cell, CellAttrs, Color, ColorQuery, MouseEncoding, MouseMode, Screen, TerminalImage,
+    Cell, CellAttrs, Color, ColorQuery, CursorStyle, MouseEncoding, MouseMode, Screen,
+    TerminalImage,
 };
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ pub fn attrs_to_proto(attrs: CellAttrs) -> proto::CellAttributes {
         overline: attrs.contains(CellAttrs::OVERLINE),
         wide: attrs.contains(CellAttrs::WIDE),
         wide_spacer: attrs.contains(CellAttrs::WIDE_SPACER),
+        rapid_blink: attrs.contains(CellAttrs::RAPID_BLINK),
     }
 }
 
@@ -79,6 +81,9 @@ pub fn proto_to_attrs(attrs: &proto::CellAttributes) -> CellAttrs {
     }
     if attrs.wide_spacer {
         result |= CellAttrs::WIDE_SPACER;
+    }
+    if attrs.rapid_blink {
+        result |= CellAttrs::RAPID_BLINK;
     }
     result
 }
@@ -231,12 +236,7 @@ pub fn proto_to_terminal_image(image: &proto::TerminalImage) -> Option<TerminalI
 
 /// Convert screen to proto representation
 pub fn screen_to_proto(screen: &Screen, include_scrollback: bool) -> proto::GetScreenResponse {
-    let cursor = proto::CursorPosition {
-        row: screen.cursor.row as u32,
-        col: screen.cursor.col as u32,
-        visible: screen.modes.show_cursor,
-        style: proto::CursorStyle::Block as i32,
-    };
+    let cursor = cursor_to_proto(screen);
 
     // Get visible rows
     let visible_rows: Vec<proto::Row> = (0..screen.height())
@@ -285,7 +285,28 @@ pub fn cursor_to_proto(screen: &Screen) -> proto::CursorPosition {
         row: screen.cursor.row as u32,
         col: screen.cursor.col as u32,
         visible: screen.modes.show_cursor,
-        style: proto::CursorStyle::Block as i32,
+        style: cursor_style_to_proto(screen.cursor.style) as i32,
+        style_blink_override: screen.cursor.blink.decscusr(),
+        dec_mode_12: Some(screen.cursor.blink.dec_mode_12()),
+    }
+}
+
+/// Convert a core cursor shape to its stable wire representation.
+pub fn cursor_style_to_proto(style: CursorStyle) -> proto::CursorStyle {
+    match style {
+        CursorStyle::Block => proto::CursorStyle::Block,
+        CursorStyle::Underline => proto::CursorStyle::Underline,
+        CursorStyle::Bar => proto::CursorStyle::Bar,
+    }
+}
+
+/// Decode a cursor shape while rejecting unknown future enum values.
+pub fn proto_to_cursor_style(style: i32) -> Option<CursorStyle> {
+    match proto::CursorStyle::try_from(style).ok()? {
+        proto::CursorStyle::Block => Some(CursorStyle::Block),
+        proto::CursorStyle::Underline => Some(CursorStyle::Underline),
+        proto::CursorStyle::Bar => Some(CursorStyle::Bar),
+        proto::CursorStyle::Unspecified => None,
     }
 }
 
@@ -441,6 +462,12 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
         screen.cursor.row = cursor.row as usize;
         screen.cursor.col = cursor.col as usize;
         screen.modes.show_cursor = cursor.visible;
+        let style = proto_to_cursor_style(cursor.style);
+        screen.cursor.restore_protocol_snapshot(
+            style,
+            cursor.style_blink_override,
+            cursor.dec_mode_12,
+        );
     }
 
     // Restore title
@@ -579,7 +606,8 @@ mod tests {
 
     #[test]
     fn test_attrs_roundtrip() {
-        let attrs = CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE;
+        let attrs =
+            CellAttrs::BOLD | CellAttrs::ITALIC | CellAttrs::UNDERLINE | CellAttrs::RAPID_BLINK;
         let proto = attrs_to_proto(attrs);
         let back = proto_to_attrs(&proto);
         assert_eq!(attrs, back);
@@ -590,6 +618,31 @@ mod tests {
         let cell = Cell::new('A');
         let proto = cell_to_proto(&cell);
         assert_eq!(proto.char, "A");
+    }
+
+    #[test]
+    fn cursor_snapshot_preserves_protocol_sources_and_native_defaults() {
+        let source = Terminal::new(8, 2, ScreenConfig::default());
+        let snapshot = screen_to_proto(source.screen(), false);
+        let mut restored = Terminal::new(8, 2, ScreenConfig::default());
+        restored
+            .screen_mut()
+            .configure_cursor(CursorStyle::Bar, false);
+
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(restored.screen().cursor.style, CursorStyle::Bar);
+        assert!(!restored.screen().cursor.blink.enabled());
+
+        let mut source = Terminal::new(8, 2, ScreenConfig::default());
+        source.process(b"\x1b[3 q\x1b[?12h");
+        let snapshot = screen_to_proto(source.screen(), false);
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(restored.screen().cursor.style, CursorStyle::Underline);
+        assert_eq!(restored.screen().cursor.blink.decscusr(), Some(true));
+        assert!(restored.screen().cursor.blink.dec_mode_12());
+        assert!(restored.screen().cursor.blink.enabled());
     }
 
     #[test]

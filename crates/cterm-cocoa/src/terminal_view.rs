@@ -4,8 +4,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -27,7 +28,7 @@ use cterm_core::screen::{ScreenConfig, SelectionMode};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags, Terminal};
 use cterm_ui::theme::Theme;
-use cterm_ui::{Action, KeyCode, Modifiers};
+use cterm_ui::{Action, BlinkClock, BlinkNeeds, BlinkPhase, KeyCode, Modifiers};
 
 use crate::cg_renderer::CGRenderer;
 use crate::file_transfer::PendingFileManager;
@@ -41,6 +42,13 @@ const MAX_FONT_SIZE: f64 = 72.0;
 
 fn adjusted_font_size(current: f64, delta: f64) -> f64 {
     (current + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+fn configure_terminal_cursor(terminal: &mut Terminal, config: &Config) {
+    terminal.screen_mut().configure_cursor(
+        config.appearance.cursor_style.core_style(),
+        config.appearance.cursor_blink,
+    );
 }
 
 fn replace_shortcut_bindings(shortcuts: &RefCell<ShortcutManager>, config: &ShortcutsConfig) {
@@ -149,6 +157,8 @@ fn direct_modified_key_char(
 /// Shared state between the view and PTY thread
 struct ViewState {
     needs_redraw: AtomicBool,
+    blink_phase: AtomicU8,
+    cursor_rearm: AtomicBool,
     pty_closed: AtomicBool,
     /// Set when the view is being deallocated - threads should stop
     view_invalid: AtomicBool,
@@ -168,6 +178,8 @@ impl Default for ViewState {
     fn default() -> Self {
         Self {
             needs_redraw: AtomicBool::new(false),
+            blink_phase: AtomicU8::new(BlinkPhase::default().bits()),
+            cursor_rearm: AtomicBool::new(false),
             pty_closed: AtomicBool::new(false),
             view_invalid: AtomicBool::new(false),
             title: std::sync::RwLock::new(String::new()),
@@ -337,7 +349,10 @@ define_class!(
                 // Always use full view bounds for rendering to avoid artifacts
                 // from partial dirty_rect updates after resize/fullscreen
                 let bounds: NSRect = unsafe { msg_send![self, bounds] };
-                renderer.render(&terminal, bounds);
+                let blink_phase = BlinkPhase::from_bits(
+                    self.ivars().state.blink_phase.load(Ordering::Relaxed),
+                );
+                renderer.render(&terminal, bounds, blink_phase);
 
                 // Render IME marked text if present
                 let marked_text = self.ivars().marked_text.borrow();
@@ -1637,6 +1652,7 @@ impl TerminalView {
         let mut base_palette = theme.colors.clone();
         base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        configure_terminal_cursor(&mut terminal, config);
         terminal.set_base_palette(base_palette.clone());
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -1724,6 +1740,7 @@ impl TerminalView {
         let mut base_palette = theme.colors.clone();
         base_palette.cursor = theme.cursor.color;
         let mut terminal = Terminal::new(80, 24, ScreenConfig::default());
+        configure_terminal_cursor(&mut terminal, config);
         terminal.set_base_palette(base_palette.clone());
         terminal.set_frontend_state(cterm_core::FrontendState {
             appearance: theme.appearance(),
@@ -2103,6 +2120,7 @@ impl TerminalView {
 
                                         drop(term);
                                         if content_changed {
+                                            state.cursor_rearm.store(true, Ordering::Relaxed);
                                             state.needs_redraw.store(true, Ordering::Relaxed);
                                         }
                                     }
@@ -2129,6 +2147,8 @@ impl TerminalView {
         let terminal = Arc::clone(&self.ivars().terminal);
         // Start a background thread that periodically triggers redraws on main thread
         std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut blink_clock = BlinkClock::default();
             // Wait briefly for app to initialize
             std::thread::sleep(std::time::Duration::from_millis(100));
             loop {
@@ -2141,6 +2161,22 @@ impl TerminalView {
                 }
 
                 if terminal.lock().expire_synchronized_update() {
+                    state.needs_redraw.store(true, Ordering::Relaxed);
+                }
+
+                let blink_needs = BlinkNeeds::for_screen(terminal.lock().screen());
+                if blink_clock.update(started.elapsed(), blink_needs) {
+                    state
+                        .blink_phase
+                        .store(blink_clock.phase().bits(), Ordering::Relaxed);
+                    state.needs_redraw.store(true, Ordering::Relaxed);
+                }
+                if state.cursor_rearm.swap(false, Ordering::Relaxed)
+                    && blink_clock.rearm_cursor(started.elapsed())
+                {
+                    state
+                        .blink_phase
+                        .store(blink_clock.phase().bits(), Ordering::Relaxed);
                     state.needs_redraw.store(true, Ordering::Relaxed);
                 }
 
@@ -3383,5 +3419,29 @@ mod keyboard_event_tests {
             match_configured_action(&shortcuts, KeyCode::H, Modifiers::CTRL),
             Some(Action::FocusPane(cterm_ui::PaneDirection::Left))
         );
+    }
+
+    #[test]
+    fn native_cursor_config_initializes_protocol_defaults() {
+        let mut config = Config::default();
+        config.appearance.cursor_style = cterm_app::config::CursorStyleConfig::Underline;
+        config.appearance.cursor_blink = false;
+        let mut terminal = Terminal::new(8, 2, ScreenConfig::default());
+
+        configure_terminal_cursor(&mut terminal, &config);
+
+        assert_eq!(
+            terminal.screen().cursor.style,
+            cterm_core::CursorStyle::Underline
+        );
+        assert!(!terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12h");
+        assert!(terminal.screen().cursor.blink.enabled());
+        terminal.process(b"\x1b[?12l\x1b[0 q");
+        assert_eq!(
+            terminal.screen().cursor.style,
+            cterm_core::CursorStyle::Underline
+        );
+        assert!(!terminal.screen().cursor.blink.enabled());
     }
 }

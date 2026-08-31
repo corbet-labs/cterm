@@ -31,8 +31,57 @@ impl Default for ScreenConfig {
     }
 }
 
+/// Independent sources which can request cursor blinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorBlink {
+    configured: bool,
+    dec_mode_12: bool,
+    decscusr: Option<bool>,
+}
+
+impl Default for CursorBlink {
+    fn default() -> Self {
+        Self {
+            configured: true,
+            dec_mode_12: false,
+            decscusr: None,
+        }
+    }
+}
+
+impl CursorBlink {
+    /// Effective blink state. DEC mode 12 and the style source are additive,
+    /// matching foot's independent `decset` and `deccsusr` sources.
+    pub fn enabled(self) -> bool {
+        self.dec_mode_12 || self.decscusr.unwrap_or(self.configured)
+    }
+
+    /// Blink state selected by DECSCUSR, falling back to configuration.
+    pub fn style_enabled(self) -> bool {
+        self.decscusr.unwrap_or(self.configured)
+    }
+
+    /// DEC private mode 12 state, independent from DECSCUSR.
+    pub fn dec_mode_12(self) -> bool {
+        self.dec_mode_12
+    }
+
+    /// Explicit DECSCUSR blink selection, if an application supplied one.
+    pub fn decscusr(self) -> Option<bool> {
+        self.decscusr
+    }
+
+    pub(crate) fn set_dec_mode_12(&mut self, enabled: bool) {
+        self.dec_mode_12 = enabled;
+    }
+
+    pub(crate) fn set_decscusr(&mut self, enabled: Option<bool>) {
+        self.decscusr = enabled;
+    }
+}
+
 /// Cursor position and state
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cursor {
     /// Column position (0-indexed)
     pub col: usize,
@@ -40,8 +89,67 @@ pub struct Cursor {
     pub row: usize,
     /// Cursor style
     pub style: CursorStyle,
-    /// Whether cursor should blink
-    pub blink: bool,
+    /// Independent configuration/DECSCUSR and DEC mode 12 blink sources.
+    pub blink: CursorBlink,
+    /// Configured shape restored by DECSCUSR 0 and terminal reset.
+    configured_style: CursorStyle,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            col: 0,
+            row: 0,
+            style: CursorStyle::Block,
+            blink: CursorBlink::default(),
+            configured_style: CursorStyle::Block,
+        }
+    }
+}
+
+impl Cursor {
+    /// Apply native configuration as the DECSCUSR default source.
+    pub fn configure(&mut self, style: CursorStyle, blink: bool) {
+        self.configured_style = style;
+        self.style = style;
+        self.blink.configured = blink;
+        self.blink.decscusr = None;
+    }
+
+    /// Restore configured style and blink while preserving DEC mode 12.
+    pub fn reset_style_to_config(&mut self) {
+        self.style = self.configured_style;
+        self.blink.set_decscusr(None);
+    }
+
+    /// Restore application-controlled cursor state from a remote snapshot.
+    /// An absent DECSCUSR override deliberately leaves the native configured
+    /// shape and blink source intact.
+    pub fn restore_protocol_snapshot(
+        &mut self,
+        style: Option<CursorStyle>,
+        decscusr: Option<bool>,
+        dec_mode_12: Option<bool>,
+    ) {
+        if let Some(decscusr) = decscusr {
+            if let Some(style) = style {
+                self.style = style;
+            }
+            self.blink.set_decscusr(Some(decscusr));
+        }
+        if let Some(dec_mode_12) = dec_mode_12 {
+            self.blink.set_dec_mode_12(dec_mode_12);
+        }
+    }
+
+    /// Reset protocol sources while preserving native configuration.
+    fn reset_protocol_state(&mut self) {
+        self.col = 0;
+        self.row = 0;
+        self.style = self.configured_style;
+        self.blink.dec_mode_12 = false;
+        self.blink.decscusr = None;
+    }
 }
 
 /// Cursor shape style
@@ -790,10 +898,7 @@ impl Screen {
             scrollback: VecDeque::with_capacity(config.scrollback_lines.min(1000)),
             alternate_grid: None,
             config,
-            cursor: Cursor {
-                blink: true,
-                ..Default::default()
-            },
+            cursor: Cursor::default(),
             saved_cursor: None,
             alt_saved_cursor: None,
             scroll_region: ScrollRegion {
@@ -984,6 +1089,12 @@ impl Screen {
     /// Return the frontend-owned state used by terminal protocol reports.
     pub fn frontend_state(&self) -> FrontendState {
         self.frontend_state
+    }
+
+    /// Apply the native cursor defaults used by DECSCUSR 0 and terminal reset.
+    pub fn configure_cursor(&mut self, style: CursorStyle, blink: bool) {
+        self.cursor.configure(style, blink);
+        self.dirty = true;
     }
 
     /// Update the native theme class and report a change when requested.
@@ -1970,7 +2081,12 @@ impl Screen {
                 for &param in params {
                     match param {
                         0 => {
-                            attrs.remove(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
+                            attrs.remove(
+                                CellAttrs::BOLD
+                                    | CellAttrs::BLINK
+                                    | CellAttrs::RAPID_BLINK
+                                    | CellAttrs::INVERSE,
+                            );
                             attrs.clear_underline();
                         }
                         1 => attrs.insert(CellAttrs::BOLD),
@@ -1978,11 +2094,14 @@ impl Screen {
                             attrs.clear_underline();
                             attrs.insert(CellAttrs::UNDERLINE);
                         }
-                        5 => attrs.insert(CellAttrs::BLINK),
+                        5 => {
+                            attrs.clear_blink();
+                            attrs.insert(CellAttrs::BLINK);
+                        }
                         7 => attrs.insert(CellAttrs::INVERSE),
                         22 => attrs.remove(CellAttrs::BOLD),
                         24 => attrs.clear_underline(),
-                        25 => attrs.remove(CellAttrs::BLINK),
+                        25 => attrs.clear_blink(),
                         27 => attrs.remove(CellAttrs::INVERSE),
                         _ => {}
                     }
@@ -2016,11 +2135,15 @@ impl Screen {
                     match param {
                         0 => {
                             attrs.toggle(CellAttrs::BOLD | CellAttrs::BLINK | CellAttrs::INVERSE);
+                            attrs.remove(CellAttrs::RAPID_BLINK);
                             Self::toggle_basic_underline(attrs);
                         }
                         1 => attrs.toggle(CellAttrs::BOLD),
                         4 => Self::toggle_basic_underline(attrs),
-                        5 => attrs.toggle(CellAttrs::BLINK),
+                        5 => {
+                            attrs.toggle(CellAttrs::BLINK);
+                            attrs.remove(CellAttrs::RAPID_BLINK);
+                        }
                         7 => attrs.toggle(CellAttrs::INVERSE),
                         _ => {}
                     }
@@ -2260,10 +2383,7 @@ impl Screen {
         self.grid.clear();
         self.scrollback.clear();
         self.alternate_grid = None;
-        self.cursor = Cursor {
-            blink: true,
-            ..Default::default()
-        };
+        self.cursor.reset_protocol_state();
         self.saved_cursor = None;
         self.alt_saved_cursor = None;
         self.scroll_region = ScrollRegion {
