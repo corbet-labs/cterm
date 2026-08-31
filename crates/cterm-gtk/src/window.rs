@@ -4804,10 +4804,16 @@ fn close_other_tabs_now(
 /// Sync tab bar active state with notebook
 /// Focus the active terminal in the currently visible notebook page.
 fn focus_current_terminal(notebook: &Notebook, tabs: &Rc<RefCell<Vec<TabEntry>>>) {
-    if let Some(page) = notebook.current_page() {
-        if let Some(tab) = tabs.borrow().get(page as usize) {
-            tab.terminal.widget().grab_focus();
-        }
+    let widget = notebook.current_page().and_then(|page| {
+        tabs.borrow()
+            .get(page as usize)
+            .map(|tab| tab.terminal.widget().clone())
+    });
+    if let Some(widget) = widget {
+        // `grab_focus` synchronously emits `notify::has-focus`. Drop the tab
+        // registry borrow first because that callback activates the pane and
+        // therefore needs a mutable borrow of the same registry.
+        widget.grab_focus();
     }
 }
 

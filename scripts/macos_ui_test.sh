@@ -211,15 +211,15 @@ tell application "System Events"
     tell ctermProcess
         set preferencesWindow to first window whose name is "Preferences"
         set paneTabPressed to false
-        repeat with candidate in entire contents of preferencesWindow
-            try
-                if (name of candidate as text) is "Pane Shortcuts" then
-                    perform action "AXPress" of candidate
-                    set paneTabPressed to true
-                    exit repeat
-                end if
-            end try
-        end repeat
+        try
+            set preferencesTabs to tab group 1 of preferencesWindow
+            if exists radio button "Pane Shortcuts" of preferencesTabs then
+                click radio button "Pane Shortcuts" of preferencesTabs
+            else
+                click radio button 4 of preferencesTabs
+            end if
+            set paneTabPressed to true
+        end try
         if paneTabPressed is false then error "Pane Shortcuts tab not found"
 
         delay 0.25

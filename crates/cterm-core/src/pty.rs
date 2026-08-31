@@ -1742,10 +1742,6 @@ mod tests {
         };
 
         let pty = Pty::new(&config).expect("Failed to create PTY");
-
-        // Give it time to produce output
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
         let mut reader = pty.try_clone_reader().expect("Failed to clone reader");
         let mut buf = [0u8; 1024];
         let n = reader.read(&mut buf).expect("Failed to read");
