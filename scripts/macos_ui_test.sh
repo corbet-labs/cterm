@@ -201,8 +201,7 @@ wait_for_preferences_window() {
 }
 
 apply_horizontal_pane_shortcut() {
-    local old_shortcut="$1"
-    local new_shortcut="$2"
+    local new_shortcut="$1"
 
     focus_cterm
     osascript <<EOF
@@ -226,8 +225,10 @@ tell application "System Events"
         set shortcutChanged to false
         repeat with candidate in entire contents of preferencesWindow
             try
-                if (role of candidate as text) is "AXTextField" and (value of candidate as text) is "$old_shortcut" then
-                    set value of candidate to "$new_shortcut"
+                set candidateElement to contents of candidate
+                set candidateIdentifier to (value of attribute "AXIdentifier" of candidateElement) as text
+                if candidateIdentifier is "cterm.preferences.pane.split-horizontal" then
+                    set value of candidateElement to "$new_shortcut"
                     set shortcutChanged to true
                     exit repeat
                 end if
@@ -238,8 +239,10 @@ tell application "System Events"
         set applyPressed to false
         repeat with candidate in entire contents of preferencesWindow
             try
-                if (role of candidate as text) is "AXButton" and (name of candidate as text) is "Apply" then
-                    perform action "AXPress" of candidate
+                set candidateElement to contents of candidate
+                set candidateIdentifier to (value of attribute "AXIdentifier" of candidateElement) as text
+                if candidateIdentifier is "cterm.preferences.apply" then
+                    perform action "AXPress" of candidateElement
                     set applyPressed to true
                     exit repeat
                 end if
@@ -456,7 +459,7 @@ focus_cterm
 osascript -e 'tell application "System Events" to keystroke "," using command down'
 wait_for_preferences_window
 PREFERENCES_LOG_MARK=$(cterm_log_line_count)
-apply_horizontal_pane_shortcut "Ctrl+Shift+Backslash" "Ctrl+Shift+P"
+apply_horizontal_pane_shortcut "Ctrl+Shift+P"
 wait_for_new_cterm_log \
     'Preferences saved; refreshed shortcuts for [1-9][0-9]* window\(s\) and ([2-9]|[1-9][0-9]+) terminal view\(s\)' \
     "Preferences Apply refreshed every pre-existing window and split pane" \

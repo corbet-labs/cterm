@@ -8,8 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSButton, NSPopUpButton, NSSlider, NSStackView, NSTabView, NSTabViewItem, NSTextField,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAccessibilityElementProtocol, NSButton, NSPopUpButton, NSSlider, NSStackView, NSTabView,
+    NSTabViewItem, NSTextField, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -69,6 +69,23 @@ impl PaneShortcutField {
             Self::ResizeUp => "Resize up:",
             Self::ResizeDown => "Resize down:",
             Self::ToggleZoom => "Toggle zoom:",
+        }
+    }
+
+    fn accessibility_identifier(self) -> &'static str {
+        match self {
+            Self::SplitHorizontal => "cterm.preferences.pane.split-horizontal",
+            Self::SplitVertical => "cterm.preferences.pane.split-vertical",
+            Self::Close => "cterm.preferences.pane.close",
+            Self::FocusLeft => "cterm.preferences.pane.focus-left",
+            Self::FocusRight => "cterm.preferences.pane.focus-right",
+            Self::FocusUp => "cterm.preferences.pane.focus-up",
+            Self::FocusDown => "cterm.preferences.pane.focus-down",
+            Self::ResizeLeft => "cterm.preferences.pane.resize-left",
+            Self::ResizeRight => "cterm.preferences.pane.resize-right",
+            Self::ResizeUp => "cterm.preferences.pane.resize-up",
+            Self::ResizeDown => "cterm.preferences.pane.resize-down",
+            Self::ToggleZoom => "cterm.preferences.pane.toggle-zoom",
         }
     }
 
@@ -385,6 +402,7 @@ impl PreferencesWindow {
                 mtm,
             )
         };
+        apply_btn.setAccessibilityIdentifier(Some(&NSString::from_str("cterm.preferences.apply")));
         unsafe {
             button_stack.addArrangedSubview(&apply_btn);
         }
@@ -708,6 +726,9 @@ impl PreferencesWindow {
                 shortcut.label(),
                 shortcut.value(&config.shortcuts),
             );
+            row.1.setAccessibilityIdentifier(Some(&NSString::from_str(
+                shortcut.accessibility_identifier(),
+            )));
             fields.push((shortcut, row.1.clone()));
             stack.addArrangedSubview(&row.0);
         }
