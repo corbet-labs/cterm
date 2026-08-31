@@ -132,10 +132,7 @@ define_class!(
                 _ => false, // Let the text field handle it
             }
         }
-    }
 
-    // NSTextFieldDelegate for text changes
-    unsafe impl NSTextFieldDelegate for QuickOpenOverlay {
         #[unsafe(method(controlTextDidChange:))]
         fn control_text_did_change(&self, _notification: &objc2_foundation::NSNotification) {
             self.update_filter();
@@ -147,6 +144,8 @@ define_class!(
             self.hide();
         }
     }
+
+    unsafe impl NSTextFieldDelegate for QuickOpenOverlay {}
 
     impl QuickOpenOverlay {
         #[unsafe(method(isFlipped))]
