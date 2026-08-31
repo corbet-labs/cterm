@@ -628,7 +628,9 @@ fn populate_tools_menu(menu: &NSMenu, mtm: MainThreadMarker) {
                     command.command_title()
                 )));
                 unsafe { item.setAction(Some(sel!(runPluginCommand:))) };
-                item.setRepresentedObject(Some(&NSString::from_str(command.action_id())));
+                unsafe {
+                    item.setRepresentedObject(Some(&NSString::from_str(command.action_id())));
+                }
                 plugin_menu.addItem(&item);
             }
             let plugin_item = NSMenuItem::new(mtm);
