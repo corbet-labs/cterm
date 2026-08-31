@@ -2,14 +2,117 @@
 //!
 //! Creates the application menu bar with all menu items.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ptr;
 
+use cterm_app::config::ToolShortcutEntry;
 use cterm_ui::events::Action;
 use cterm_ui::pane::{PaneDirection, SplitDirection};
 use winapi::shared::windef::HMENU;
 use winapi::um::winuser::{
-    AppendMenuW, CreateMenu, CreatePopupMenu, SetMenu, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    AppendMenuW, CreateMenu, CreatePopupMenu, DestroyMenu, DrawMenuBar, SetMenu, MF_POPUP,
+    MF_SEPARATOR, MF_STRING,
 };
+
+const TOOL_COMMAND_ID_START: u16 = 0x8000;
+const TOOL_COMMAND_ID_END: u16 = 0xefff;
+
+/// Stable command IDs and the exact configured tool snapshot shown in a menu.
+///
+/// IDs are keyed by tool content instead of list position. Reloading a reordered
+/// file therefore keeps every existing ID, removed IDs are retired for the
+/// lifetime of the registry, and a queued command from an old menu can never
+/// launch a different tool.
+#[derive(Debug, Default)]
+pub struct ToolCommandRegistry {
+    identity_ids: HashMap<Vec<u8>, u16>,
+    active: BTreeMap<u16, ToolShortcutEntry>,
+    order: Vec<u16>,
+}
+
+impl ToolCommandRegistry {
+    pub fn reload(&mut self, tools: &[ToolShortcutEntry]) {
+        let mut new_identities = tools
+            .iter()
+            .map(tool_identity)
+            .filter(|identity| !self.identity_ids.contains_key(identity))
+            .collect::<Vec<_>>();
+        new_identities.sort();
+        new_identities.dedup();
+
+        let mut used = self.identity_ids.values().copied().collect::<HashSet<_>>();
+        for identity in new_identities {
+            let Some(id) = allocate_tool_command_id(&identity, &used) else {
+                log::error!("Too many distinct tool commands for the Win32 menu ID range");
+                continue;
+            };
+            used.insert(id);
+            self.identity_ids.insert(identity, id);
+        }
+
+        self.active.clear();
+        self.order.clear();
+        for tool in tools {
+            let identity = tool_identity(tool);
+            let Some(&id) = self.identity_ids.get(&identity) else {
+                continue;
+            };
+            self.active.entry(id).or_insert_with(|| tool.clone());
+            self.order.push(id);
+        }
+    }
+
+    pub fn get(&self, id: u16) -> Option<&ToolShortcutEntry> {
+        self.active.get(&id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &ToolShortcutEntry)> {
+        self.order
+            .iter()
+            .filter_map(|id| self.active.get(id).map(|tool| (*id, tool)))
+    }
+}
+
+pub fn is_tool_command_id(id: u16) -> bool {
+    (TOOL_COMMAND_ID_START..=TOOL_COMMAND_ID_END).contains(&id)
+}
+
+fn tool_identity(tool: &ToolShortcutEntry) -> Vec<u8> {
+    let mut identity = Vec::new();
+    push_identity_field(&mut identity, tool.name.as_bytes());
+    push_identity_field(&mut identity, tool.command.as_bytes());
+    identity.extend_from_slice(&(tool.args.len() as u64).to_le_bytes());
+    for argument in &tool.args {
+        push_identity_field(&mut identity, argument.as_bytes());
+    }
+    identity
+}
+
+fn push_identity_field(identity: &mut Vec<u8>, field: &[u8]) {
+    identity.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    identity.extend_from_slice(field);
+}
+
+fn allocate_tool_command_id(identity: &[u8], used: &HashSet<u16>) -> Option<u16> {
+    let range_len = u32::from(TOOL_COMMAND_ID_END - TOOL_COMMAND_ID_START) + 1;
+    let start = (stable_hash(identity) % u64::from(range_len)) as u32;
+    (0..range_len).find_map(|offset| {
+        let relative = (start + offset) % range_len;
+        let id = TOOL_COMMAND_ID_START + relative as u16;
+        (!used.contains(&id)).then_some(id)
+    })
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a is intentionally fixed rather than relying on the standard
+    // library's implementation-dependent hashers.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 /// Menu action identifiers
 #[repr(u16)]
@@ -241,7 +344,12 @@ fn to_wide_string(s: &str) -> Vec<u16> {
 }
 
 /// Create the main menu bar
-pub fn create_menu_bar(show_debug: bool, updates_enabled: bool, managed: bool) -> HMENU {
+pub fn create_menu_bar(
+    show_debug: bool,
+    updates_enabled: bool,
+    managed: bool,
+    tool_commands: &ToolCommandRegistry,
+) -> HMENU {
     unsafe {
         let menu_bar = CreateMenu();
 
@@ -366,6 +474,14 @@ pub fn create_menu_bar(show_debug: bool, updates_enabled: bool, managed: bool) -
         append_menu_item(terminal_menu, MenuAction::ClearReset, "Clear and R&eset");
         append_popup_menu(menu_bar, terminal_menu, "&Terminal");
 
+        if !managed {
+            let tools_menu = CreatePopupMenu();
+            for (id, tool) in tool_commands.iter() {
+                append_command_item(tools_menu, id, &escape_menu_label(&tool.name));
+            }
+            append_popup_menu(menu_bar, tools_menu, "T&ools");
+        }
+
         // Tabs menu
         let tabs_menu = CreatePopupMenu();
         append_menu_item(
@@ -440,6 +556,17 @@ fn append_menu_item(menu: HMENU, action: MenuAction, text: &str) {
     }
 }
 
+fn append_command_item(menu: HMENU, command_id: u16, text: &str) {
+    let wide = to_wide_string(text);
+    unsafe {
+        AppendMenuW(menu, MF_STRING, command_id as usize, wide.as_ptr());
+    }
+}
+
+fn escape_menu_label(label: &str) -> String {
+    label.replace('&', "&&")
+}
+
 /// Append a separator to a menu
 fn append_separator(menu: HMENU) {
     unsafe {
@@ -462,129 +589,24 @@ pub fn set_window_menu(hwnd: winapi::shared::windef::HWND, menu: HMENU) {
     }
 }
 
-/// Accelerator key definition
-#[derive(Debug, Clone)]
-pub struct Accelerator {
-    pub action: MenuAction,
-    pub key: u16,
-    pub modifiers: AcceleratorModifiers,
-}
-
-bitflags::bitflags! {
-    /// Accelerator key modifiers
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct AcceleratorModifiers: u8 {
-        const CTRL = 1 << 0;
-        const SHIFT = 1 << 1;
-        const ALT = 1 << 2;
+/// Replace an attached menu and destroy whichever handle is no longer owned by
+/// the window. `SetMenu` does not destroy the previous menu itself.
+pub fn replace_window_menu(
+    hwnd: winapi::shared::windef::HWND,
+    old_menu: HMENU,
+    new_menu: HMENU,
+) -> bool {
+    unsafe {
+        if SetMenu(hwnd, new_menu) == 0 {
+            DestroyMenu(new_menu);
+            return false;
+        }
+        DrawMenuBar(hwnd);
+        if !old_menu.is_null() {
+            DestroyMenu(old_menu);
+        }
     }
-}
-
-/// Get the default accelerator table
-pub fn get_accelerators() -> Vec<Accelerator> {
-    use winapi::um::winuser::*;
-
-    vec![
-        // File menu
-        Accelerator {
-            action: MenuAction::NewTab,
-            key: 'T' as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        Accelerator {
-            action: MenuAction::NewWindow,
-            key: 'N' as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        Accelerator {
-            action: MenuAction::QuickOpen,
-            key: 'G' as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        Accelerator {
-            action: MenuAction::CloseTab,
-            key: 'W' as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        // Edit menu
-        Accelerator {
-            action: MenuAction::Copy,
-            key: 'C' as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        Accelerator {
-            action: MenuAction::Paste,
-            key: 'V' as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        Accelerator {
-            action: MenuAction::SelectAll,
-            key: 'A' as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        // Terminal menu
-        Accelerator {
-            action: MenuAction::Find,
-            key: 'F' as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        // Tabs menu
-        Accelerator {
-            action: MenuAction::PrevTab,
-            key: VK_TAB as u16,
-            modifiers: AcceleratorModifiers::CTRL | AcceleratorModifiers::SHIFT,
-        },
-        Accelerator {
-            action: MenuAction::NextTab,
-            key: VK_TAB as u16,
-            modifiers: AcceleratorModifiers::CTRL,
-        },
-        Accelerator {
-            action: MenuAction::Tab1,
-            key: '1' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab2,
-            key: '2' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab3,
-            key: '3' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab4,
-            key: '4' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab5,
-            key: '5' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab6,
-            key: '6' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab7,
-            key: '7' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab8,
-            key: '8' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-        Accelerator {
-            action: MenuAction::Tab9,
-            key: '9' as u16,
-            modifiers: AcceleratorModifiers::ALT,
-        },
-    ]
+    true
 }
 
 #[cfg(test)]
@@ -592,6 +614,22 @@ mod tests {
     use super::*;
     use cterm_ui::events::Action;
     use cterm_ui::pane::{PaneDirection, SplitDirection};
+    use std::collections::HashMap;
+
+    fn tool(name: &str, command: &str) -> ToolShortcutEntry {
+        ToolShortcutEntry {
+            name: name.to_string(),
+            command: command.to_string(),
+            args: vec!["--test".to_string()],
+        }
+    }
+
+    fn tool_ids(registry: &ToolCommandRegistry) -> HashMap<String, u16> {
+        registry
+            .iter()
+            .map(|(id, tool)| (tool.name.clone(), id))
+            .collect()
+    }
 
     #[test]
     fn test_menu_action_roundtrip() {
@@ -732,5 +770,48 @@ mod tests {
         let wide = to_wide_string("Test");
         assert_eq!(wide.len(), 5); // "Test" + null terminator
         assert_eq!(wide[4], 0); // null terminator
+    }
+
+    #[test]
+    fn tool_command_ids_survive_reordering_and_fresh_rebuilds() {
+        let alpha = tool("Alpha", "alpha.exe");
+        let beta = tool("Beta", "beta.exe");
+
+        let mut registry = ToolCommandRegistry::default();
+        registry.reload(&[alpha.clone(), beta.clone()]);
+        let original = tool_ids(&registry);
+
+        registry.reload(&[beta.clone(), alpha.clone()]);
+        assert_eq!(tool_ids(&registry), original);
+
+        let mut fresh = ToolCommandRegistry::default();
+        fresh.reload(&[beta, alpha]);
+        assert_eq!(tool_ids(&fresh), original);
+        assert!(original.values().all(|id| is_tool_command_id(*id)));
+    }
+
+    #[test]
+    fn retired_tool_ids_are_not_reused_for_different_commands() {
+        let alpha = tool("Alpha", "alpha.exe");
+        let beta = tool("Beta", "beta.exe");
+        let mut registry = ToolCommandRegistry::default();
+        registry.reload(std::slice::from_ref(&alpha));
+        let alpha_id = tool_ids(&registry)["Alpha"];
+
+        registry.reload(std::slice::from_ref(&beta));
+        let beta_id = tool_ids(&registry)["Beta"];
+
+        assert_ne!(alpha_id, beta_id);
+        assert!(registry.get(alpha_id).is_none());
+        assert_eq!(
+            registry.get(beta_id).map(|tool| tool.name.as_str()),
+            Some("Beta")
+        );
+        assert_eq!(MenuAction::from_id(beta_id), None);
+    }
+
+    #[test]
+    fn dynamic_tool_names_escape_native_menu_mnemonics() {
+        assert_eq!(escape_menu_label("Build & Run"), "Build && Run");
     }
 }

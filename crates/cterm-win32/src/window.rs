@@ -410,8 +410,8 @@ pub struct WindowState {
     enhanced_text_keys: HashSet<u16>,
     /// Visibility of the native window; only its active tab is actually visible.
     window_visibility: cterm_core::WindowVisibility,
-    #[allow(dead_code)]
     menu_handle: winapi::shared::windef::HMENU,
+    tool_commands: menu::ToolCommandRegistry,
     /// Skip close confirmation (set during relaunch)
     pub skip_close_confirm: bool,
     /// Remote host connection manager
@@ -476,11 +476,20 @@ impl WindowState {
         let mut notification_bar = NotificationBar::new(theme);
         notification_bar.set_dpi(dpi);
 
+        let mut tool_commands = menu::ToolCommandRegistry::default();
+        if !crate::get_args().managed {
+            match cterm_app::load_tool_shortcuts() {
+                Ok(tools) => tool_commands.reload(&tools),
+                Err(error) => log::error!("Failed to load configured tool commands: {error}"),
+            }
+        }
+
         // Create menu
         let menu_handle = menu::create_menu_bar(
-            false,
+            config.general.show_debug_menu,
             crate::get_args().updater_enabled(),
             crate::get_args().managed,
+            &tool_commands,
         );
         menu::set_window_menu(hwnd.0 as *mut _, menu_handle);
 
@@ -508,6 +517,7 @@ impl WindowState {
             enhanced_text_keys: HashSet::new(),
             window_visibility: cterm_core::WindowVisibility::Visible,
             menu_handle,
+            tool_commands,
             skip_close_confirm: false,
             remote_manager: cterm_client::RemoteManager::new(),
         }
@@ -2389,6 +2399,69 @@ impl WindowState {
         }
     }
 
+    fn reload_tool_commands_and_menu(&mut self) {
+        if crate::get_args().managed {
+            self.tool_commands.reload(&[]);
+        } else {
+            let tools = match cterm_app::load_tool_shortcuts() {
+                Ok(tools) => tools,
+                Err(error) => {
+                    log::error!("Failed to reload configured tool commands: {error}");
+                    return;
+                }
+            };
+            self.tool_commands.reload(&tools);
+        }
+
+        let new_menu = menu::create_menu_bar(
+            self.config.general.show_debug_menu,
+            crate::get_args().updater_enabled(),
+            crate::get_args().managed,
+            &self.tool_commands,
+        );
+        if menu::replace_window_menu(self.hwnd.0 as *mut _, self.menu_handle, new_menu) {
+            self.menu_handle = new_menu;
+        } else {
+            log::error!("Failed to replace the Win32 menu after configuration reload");
+        }
+    }
+
+    fn run_tool_command(&self, command_id: u16) -> bool {
+        let Some(tool) = self.tool_commands.get(command_id).cloned() else {
+            return false;
+        };
+        let cwd = self
+            .active_terminal()
+            .and_then(|terminal| terminal.lock().ok()?.foreground_cwd())
+            .or_else(|| self.config.general.working_directory.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        match tool.execute(&cwd) {
+            Ok(()) => {
+                log::info!(
+                    "Launched configured tool '{}' in {}",
+                    tool.name,
+                    cwd.display()
+                );
+            }
+            Err(error) => {
+                log::error!("Failed to launch configured tool '{}': {error}", tool.name);
+                crate::dialogs::show_error(
+                    self.hwnd.0 as *mut _,
+                    "Tool launch failed",
+                    &format!(
+                        "Failed to launch '{}' in {}:\n\n{}",
+                        tool.name,
+                        cwd.display(),
+                        error
+                    ),
+                );
+            }
+        }
+        true
+    }
+
     fn show_preferences(&mut self) {
         if !crate::preferences_dialog::show_preferences_dialog(self.hwnd.0 as *mut _) {
             return;
@@ -2398,6 +2471,7 @@ impl WindowState {
             Ok(config) => {
                 self.shortcuts = win32_shortcut_manager(&config.shortcuts);
                 self.config = config;
+                self.reload_tool_commands_and_menu();
                 // TODO: Apply theme and other changes without restart.
                 log::info!("Preferences saved and reloaded");
             }
@@ -2498,6 +2572,18 @@ impl WindowState {
 
     /// Handle menu command
     pub fn on_menu_command(&mut self, cmd: u16) {
+        if menu::is_tool_command_id(cmd) {
+            if crate::get_args().managed {
+                log::warn!("Ignoring tool command in managed mode");
+            } else if !self.run_tool_command(cmd) {
+                // This can happen when a WM_COMMAND queued for an old menu is
+                // delivered after a configuration reload. Retired IDs are
+                // intentionally never rebound to a different tool.
+                log::warn!("Ignoring stale or unknown tool command ID {cmd}");
+            }
+            return;
+        }
+
         if let Some(action) = MenuAction::from_id(cmd) {
             if let Some(shared_action) = action.shared_action() {
                 self.handle_action(shared_action);
