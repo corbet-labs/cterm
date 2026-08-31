@@ -16,7 +16,7 @@ use base64::engine::{DecodePaddingMode, Engine as _};
 use image::{imageops, RgbaImage};
 
 use crate::image_decode::decode_image;
-use crate::screen::{DecodedRgbaImage, Screen};
+use crate::screen::{DecodedRgbaImage, Screen, TerminalImage};
 
 const BASE64_DECODER: GeneralPurpose = GeneralPurpose::new(
     &BASE64_ALPHABET,
@@ -273,6 +273,7 @@ struct Command {
     rows: u32,
     cell_offset_x: u32,
     cell_offset_y: u32,
+    z_index: i32,
     quiet: u8,
     suppress_cursor_movement: bool,
     delete_specifier: Option<u8>,
@@ -302,6 +303,7 @@ impl Default for Command {
             rows: 0,
             cell_offset_x: 0,
             cell_offset_y: 0,
+            z_index: 0,
             quiet: 0,
             suppress_cursor_movement: false,
             delete_specifier: None,
@@ -520,7 +522,7 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
             b"X" => command.cell_offset_x = required_u32(value, echo, "invalid cell x offset")?,
             b"Y" => command.cell_offset_y = required_u32(value, echo, "invalid cell y offset")?,
             b"z" => {
-                let _ = parse_i32(value)
+                command.z_index = parse_i32(value)
                     .ok_or_else(|| echo.error(ErrorCode::Invalid, "invalid z index"))?;
             }
             b"o" if value == b"z" => command.compressed = true,
@@ -731,9 +733,11 @@ struct StoredImage {
     lru: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PlacementRecord {
-    screen_ids: Vec<u64>,
+    image_id: u32,
+    placement_id: u32,
+    z_index: i32,
     allocated_bytes: usize,
 }
 
@@ -742,8 +746,10 @@ pub(crate) struct KittyGraphics {
     interceptor: KittyApcInterceptor,
     parser: CommandParser,
     images: HashMap<u32, StoredImage>,
-    image_numbers: HashMap<u32, u32>,
-    placements: HashMap<(u32, u32), PlacementRecord>,
+    image_numbers: HashMap<u32, Vec<u32>>,
+    /// Screen image ID to protocol placement metadata. The screen ID is unique
+    /// even when the protocol placement ID is zero (anonymous and repeatable).
+    placements: HashMap<u64, PlacementRecord>,
     next_image_id: u32,
     next_lru: u64,
     total_bytes: usize,
@@ -835,15 +841,7 @@ impl KittyGraphics {
             .image_id
             .filter(|id| *id != 0)
             .unwrap_or_else(|| self.allocate_image_id());
-        let replacement_id = self
-            .images
-            .contains_key(&image_id)
-            .then_some(image_id)
-            .or_else(|| {
-                command
-                    .image_number
-                    .and_then(|number| self.image_numbers.get(&number).copied())
-            });
+        let replacement_id = self.images.contains_key(&image_id).then_some(image_id);
         self.evict_to_fit(size, replacement_id, screen);
         if self.projected_usage(size, replacement_id) > STORE_QUOTA_BYTES {
             return Err(command
@@ -865,7 +863,7 @@ impl KittyGraphics {
             },
         );
         if let Some(number) = command.image_number {
-            self.image_numbers.insert(number, image_id);
+            self.image_numbers.entry(number).or_default().push(image_id);
         }
         Ok(image_id)
     }
@@ -887,7 +885,7 @@ impl KittyGraphics {
             .or_else(|| {
                 command
                     .image_number
-                    .and_then(|number| self.image_numbers.get(&number).copied())
+                    .and_then(|number| self.image_numbers.get(&number)?.last().copied())
             })
             .or_else(|| (self.images.len() == 1).then(|| *self.images.keys().next().unwrap()))
     }
@@ -905,16 +903,20 @@ impl KittyGraphics {
             .ok_or_else(|| command.echo().error(ErrorCode::NotFound, "image not found"))?;
         let placement = prepare_placement(&stored, command, screen)?;
         let placement_id = command.placement_id.unwrap_or(0);
-        let key = (image_id, placement_id);
+        let replacement = (placement_id != 0).then(|| {
+            self.placements
+                .iter()
+                .find(|(_, placement)| {
+                    placement.image_id == image_id && placement.placement_id == placement_id
+                })
+                .map(|(screen_id, placement)| (*screen_id, placement.allocated_bytes))
+        });
         let allocated_bytes = if Arc::ptr_eq(&placement.pixels, &stored.rgba) {
             0
         } else {
             placement.pixels.len()
         };
-        let replaced_bytes = self
-            .placements
-            .get(&key)
-            .map_or(0, |placement| placement.allocated_bytes);
+        let replaced_bytes = replacement.flatten().map_or(0, |(_, bytes)| bytes);
         let projected = self
             .total_bytes
             .saturating_add(self.placement_bytes)
@@ -925,7 +927,9 @@ impl KittyGraphics {
                 .echo()
                 .error(ErrorCode::NoSpace, "placement storage quota exhausted"));
         }
-        self.remove_placement(key, screen);
+        if let Some((screen_id, _)) = replacement.flatten() {
+            self.remove_placement(screen_id, screen);
+        }
         let screen_id = screen.add_rgba_image_with_size(
             screen.cursor.col,
             screen.cursor.row,
@@ -939,9 +943,11 @@ impl KittyGraphics {
         );
         self.placement_bytes = self.placement_bytes.saturating_add(allocated_bytes);
         self.placements.insert(
-            key,
+            screen_id,
             PlacementRecord {
-                screen_ids: vec![screen_id],
+                image_id,
+                placement_id,
+                z_index: command.z_index,
                 allocated_bytes,
             },
         );
@@ -950,79 +956,117 @@ impl KittyGraphics {
             image.lru = self.next_lru;
         }
         if !command.suppress_cursor_movement {
-            advance_cursor(screen, placement.cell_width);
+            advance_cursor(screen, placement.cell_width, placement.cell_height);
         }
         Ok(())
     }
 
     fn delete(&mut self, command: &Command, screen: &mut Screen) {
+        self.sync_placements(screen);
         let specifier = command.delete_specifier.unwrap_or(b'a');
         let free_data = specifier.is_ascii_uppercase();
-        match specifier.to_ascii_lowercase() {
-            b'a' => {
-                let ids: Vec<u64> = self
-                    .placements
-                    .values()
-                    .flat_map(|placement| placement.screen_ids.iter().copied())
-                    .collect();
-                for id in ids {
-                    screen.remove_image(id);
-                }
-                self.placements.clear();
-                self.placement_bytes = 0;
-                if free_data {
-                    self.images.clear();
-                    self.image_numbers.clear();
-                    self.total_bytes = 0;
-                }
-            }
-            b'i' | b'n' => {
-                if let Some(image_id) = self.resolve_image_id(command) {
-                    self.remove_placements_for_image(image_id, screen);
-                    if free_data {
-                        self.remove_image_data(image_id, screen);
+        let lower = specifier.to_ascii_lowercase();
+        let live_top = screen.scrollback().len();
+        let target_image = matches!(lower, b'i' | b'n')
+            .then(|| self.resolve_image_id(command))
+            .flatten();
+        let screen_ids: Vec<u64> = self
+            .placements
+            .iter()
+            .filter_map(|(screen_id, placement)| {
+                let image = screen.image_by_id(*screen_id)?;
+                let matches = match lower {
+                    b'a' => {
+                        image_intersects_rect(image, 0, live_top, screen.width(), screen.height())
                     }
-                }
-            }
-            b'p' => {
-                let placement = command.placement_id.unwrap_or(0);
-                let keys: Vec<(u32, u32)> = self
-                    .placements
-                    .keys()
-                    .copied()
-                    .filter(|(_, id)| *id == placement)
-                    .collect();
-                for key in keys {
-                    self.remove_placement(key, screen);
-                    if free_data {
-                        self.remove_image_data(key.0, screen);
+                    b'i' | b'n' => {
+                        target_image == Some(placement.image_id)
+                            && command
+                                .placement_id
+                                .is_none_or(|id| id == placement.placement_id)
                     }
+                    b'c' => image_intersects_cell(
+                        image,
+                        screen.cursor.col,
+                        live_top.saturating_add(screen.cursor.row),
+                    ),
+                    b'p' | b'q' => command.source_x.checked_sub(1).is_some_and(|col| {
+                        command.source_y.checked_sub(1).is_some_and(|row| {
+                            (lower != b'q' || placement.z_index == command.z_index)
+                                && image_intersects_cell(
+                                    image,
+                                    col as usize,
+                                    live_top.saturating_add(row as usize),
+                                )
+                        })
+                    }),
+                    b'x' => command.source_x.checked_sub(1).is_some_and(|col| {
+                        image.col <= col as usize
+                            && image.col.saturating_add(image.cell_width) > col as usize
+                    }),
+                    b'y' => command.source_y.checked_sub(1).is_some_and(|row| {
+                        let line = live_top.saturating_add(row as usize);
+                        image.line <= line && image.line.saturating_add(image.cell_height) > line
+                    }),
+                    b'z' => placement.z_index == command.z_index,
+                    b'r' => {
+                        placement.image_id >= command.source_x
+                            && placement.image_id <= command.source_y
+                    }
+                    _ => false,
+                };
+                matches.then_some(*screen_id)
+            })
+            .collect();
+        let mut affected_images: Vec<u32> = screen_ids
+            .iter()
+            .filter_map(|id| self.placements.get(id).map(|placement| placement.image_id))
+            .collect();
+        if free_data {
+            if matches!(lower, b'i' | b'n') {
+                affected_images.extend(target_image);
+            } else if lower == b'r' {
+                affected_images.extend(
+                    self.images
+                        .keys()
+                        .copied()
+                        .filter(|id| *id >= command.source_x && *id <= command.source_y),
+                );
+            }
+            affected_images.sort_unstable();
+            affected_images.dedup();
+        }
+        for screen_id in screen_ids {
+            self.remove_placement(screen_id, screen);
+        }
+        if free_data {
+            for image_id in affected_images {
+                if !self.image_has_placements(image_id) {
+                    self.remove_image_data(image_id, screen);
                 }
             }
-            _ => {}
         }
     }
 
     fn remove_placements_for_image(&mut self, image_id: u32, screen: &mut Screen) {
-        let keys: Vec<(u32, u32)> = self
+        let screen_ids: Vec<u64> = self
             .placements
-            .keys()
-            .copied()
-            .filter(|(id, _)| *id == image_id)
+            .iter()
+            .filter_map(|(screen_id, placement)| {
+                (placement.image_id == image_id).then_some(*screen_id)
+            })
             .collect();
-        for key in keys {
-            self.remove_placement(key, screen);
+        for screen_id in screen_ids {
+            self.remove_placement(screen_id, screen);
         }
     }
 
-    fn remove_placement(&mut self, key: (u32, u32), screen: &mut Screen) {
-        if let Some(placement) = self.placements.remove(&key) {
+    fn remove_placement(&mut self, screen_id: u64, screen: &mut Screen) {
+        if let Some(placement) = self.placements.remove(&screen_id) {
             self.placement_bytes = self
                 .placement_bytes
                 .saturating_sub(placement.allocated_bytes);
-            for id in placement.screen_ids {
-                screen.remove_image(id);
-            }
+            screen.remove_image(screen_id);
         }
     }
 
@@ -1031,16 +1075,16 @@ impl KittyGraphics {
         if let Some(image) = self.images.remove(&image_id) {
             self.total_bytes = self.total_bytes.saturating_sub(image.rgba.len());
         }
-        self.image_numbers.retain(|_, id| *id != image_id);
+        for ids in self.image_numbers.values_mut() {
+            ids.retain(|id| *id != image_id);
+        }
+        self.image_numbers.retain(|_, ids| !ids.is_empty());
     }
 
     fn sync_placements(&mut self, screen: &Screen) {
         let mut released = 0usize;
-        self.placements.retain(|_, placement| {
-            placement
-                .screen_ids
-                .retain(|id| screen.image_by_id(*id).is_some());
-            if placement.screen_ids.is_empty() {
+        self.placements.retain(|screen_id, placement| {
+            if screen.image_by_id(*screen_id).is_none() {
                 released = released.saturating_add(placement.allocated_bytes);
                 false
             } else {
@@ -1052,14 +1096,16 @@ impl KittyGraphics {
 
     fn placement_bytes_for_image(&self, image_id: u32) -> usize {
         self.placements
-            .iter()
-            .filter(|((id, _), _)| *id == image_id)
-            .map(|(_, placement)| placement.allocated_bytes)
+            .values()
+            .filter(|placement| placement.image_id == image_id)
+            .map(|placement| placement.allocated_bytes)
             .sum()
     }
 
     fn image_has_placements(&self, image_id: u32) -> bool {
-        self.placements.keys().any(|(id, _)| *id == image_id)
+        self.placements
+            .values()
+            .any(|placement| placement.image_id == image_id)
     }
 
     fn projected_usage(&self, incoming: usize, replacement_id: Option<u32>) -> usize {
@@ -1236,14 +1282,36 @@ fn prepare_placement(
     })
 }
 
-fn advance_cursor(screen: &mut Screen, columns: usize) {
+fn image_intersects_rect(
+    image: &TerminalImage,
+    col: usize,
+    line: usize,
+    width: usize,
+    height: usize,
+) -> bool {
+    image.col < col.saturating_add(width)
+        && image.col.saturating_add(image.cell_width) > col
+        && image.line < line.saturating_add(height)
+        && image.line.saturating_add(image.cell_height) > line
+}
+
+fn image_intersects_cell(image: &TerminalImage, col: usize, line: usize) -> bool {
+    image_intersects_rect(image, col, line, 1, 1)
+}
+
+fn advance_cursor(screen: &mut Screen, columns: usize, rows: usize) {
     let width = screen.width().max(1);
-    let mut target = screen.cursor.col.saturating_add(columns);
-    while target >= width {
-        target -= width;
+    let mut lines = rows.saturating_sub(1);
+    let target = screen.cursor.col.saturating_add(columns);
+    if target >= width {
+        screen.cursor.col = 0;
+        lines = lines.saturating_add(1);
+    } else {
+        screen.cursor.col = target;
+    }
+    for _ in 0..lines {
         screen.line_feed();
     }
-    screen.cursor.col = target;
 }
 
 fn queue_success(screen: &mut Screen, command: &Command, image_id: Option<u32>, query: bool) {
@@ -1462,6 +1530,25 @@ mod tests {
     }
 
     #[test]
+    fn placement_cursor_motion_uses_the_full_rectangle_and_wrap_policy() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(6, 6, ScreenConfig::default());
+        screen.cursor.col = 1;
+        screen.cursor.row = 1;
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,c=2,r=3,i=16", &[1, 2, 3, 4]),
+        );
+        assert_eq!((screen.cursor.col, screen.cursor.row), (3, 3));
+
+        screen.cursor.col = 5;
+        screen.cursor.row = 1;
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=16,c=2,r=2\x1b\\");
+        assert_eq!((screen.cursor.col, screen.cursor.row), (0, 3));
+    }
+
+    #[test]
     fn chunked_upload_and_later_placement_preserve_identity() {
         let mut graphics = KittyGraphics::default();
         let mut screen = Screen::new(10, 5, ScreenConfig::default());
@@ -1523,6 +1610,176 @@ mod tests {
         let images = screen.images();
         assert_eq!(images.len(), 1);
         assert_ne!(images[0].id, first_screen_id);
+    }
+
+    #[test]
+    fn anonymous_placements_accumulate_while_named_placements_replace() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=40", &[1, 2, 3, 4]),
+        );
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=40,C=1\x1b\\");
+        screen.cursor.col = 2;
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=40,C=1\x1b\\");
+        assert_eq!(screen.images().len(), 2);
+        assert_eq!(graphics.placements.len(), 2);
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=40,p=7,C=1\x1b\\");
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=40,p=7,C=1\x1b\\");
+        assert_eq!(screen.images().len(), 3);
+        assert_eq!(graphics.placements.len(), 3);
+    }
+
+    #[test]
+    fn image_delete_can_target_one_named_placement_without_freeing_shared_data() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=50", &[1, 2, 3, 4]),
+        );
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=50,p=1,C=1\x1b\\");
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=50,p=2,C=1\x1b\\");
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=I,i=50,p=1\x1b\\");
+        assert_eq!(screen.images().len(), 1);
+        assert!(graphics.images.contains_key(&50));
+        assert_eq!(graphics.placements.len(), 1);
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=I,i=50,p=2\x1b\\");
+        assert!(screen.images().is_empty());
+        assert!(!graphics.images.contains_key(&50));
+    }
+
+    #[test]
+    fn image_numbers_keep_history_and_delete_only_the_newest_match() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,I=9", &[1, 2, 3, 4]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,I=9", &[5, 6, 7, 8]),
+        );
+        assert_eq!(graphics.images.len(), 2);
+        assert_eq!(graphics.image_numbers.get(&9).unwrap().len(), 2);
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,I=9,p=1,C=1\x1b\\");
+        assert_eq!(screen.images()[0].data.as_slice(), [5, 6, 7, 8]);
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=N,I=9\x1b\\");
+        assert_eq!(graphics.images.len(), 1);
+        assert_eq!(graphics.image_numbers.get(&9).unwrap().len(), 1);
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,I=9,p=2,C=1\x1b\\");
+        assert_eq!(screen.images()[0].data.as_slice(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn geometric_and_z_delete_selectors_match_only_intersecting_placements() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=60", &[1, 2, 3, 4]),
+        );
+        screen.cursor.col = 1;
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=60,p=1,z=-1,C=1\x1b\\",
+        );
+        screen.cursor.col = 4;
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=60,p=2,z=3,C=1\x1b\\",
+        );
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=d,d=q,x=2,y=1,z=-1\x1b\\",
+        );
+        assert_eq!(screen.images().len(), 1);
+        assert_eq!(graphics.placements.values().next().unwrap().z_index, 3);
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=x,x=5\x1b\\");
+        assert!(screen.images().is_empty());
+        assert!(graphics.images.contains_key(&60));
+    }
+
+    #[test]
+    fn cursor_row_and_id_range_delete_selectors_are_independent() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        screen.cursor.col = 1;
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=80,p=1,C=1", &[1, 2, 3, 4]),
+        );
+        screen.cursor.col = 4;
+        screen.cursor.row = 1;
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=81,p=1,C=1", &[5, 6, 7, 8]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=82", &[9, 10, 11, 12]),
+        );
+
+        screen.cursor.col = 1;
+        screen.cursor.row = 0;
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=c\x1b\\");
+        assert_eq!(screen.images().len(), 1);
+        assert!(graphics.images.contains_key(&80));
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=y,y=2\x1b\\");
+        assert!(screen.images().is_empty());
+        assert!(graphics.images.contains_key(&81));
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=R,x=80,y=81\x1b\\");
+        assert!(!graphics.images.contains_key(&80));
+        assert!(!graphics.images.contains_key(&81));
+        assert!(graphics.images.contains_key(&82));
+    }
+
+    #[test]
+    fn delete_all_affects_the_live_viewport_but_preserves_history_placements() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 3, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=70,C=1", &[1, 2, 3, 4]),
+        );
+        screen.cursor.row = 2;
+        screen.line_feed();
+        screen.cursor.row = 2;
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=71,C=1", &[5, 6, 7, 8]),
+        );
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=A\x1b\\");
+        let images = screen.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].line, 0);
+        assert!(graphics.images.contains_key(&70));
+        assert!(!graphics.images.contains_key(&71));
     }
 
     #[test]
