@@ -155,6 +155,133 @@ wait_for_cterm_log() {
     exit 1
 }
 
+cterm_log_line_count() {
+    if [ -f "$CTERM_LOG_FILE" ]; then
+        wc -l < "$CTERM_LOG_FILE" | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+wait_for_new_cterm_log() {
+    local pattern="$1"
+    local description="$2"
+    local after_line="$3"
+    local first_line=$((after_line + 1))
+
+    for _attempt in $(seq 1 40); do
+        if [ -f "$CTERM_LOG_FILE" ] &&
+            sed -n "${first_line},\$p" "$CTERM_LOG_FILE" | grep -Eq "$pattern"; then
+            log "$description"
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    log "ERROR: Timed out waiting for new cterm log pattern: $pattern"
+    if [ -f "$CTERM_LOG_FILE" ]; then
+        sed -n "${first_line},\$p" "$CTERM_LOG_FILE" |
+            tail -100 |
+            while IFS= read -r line; do log "  $line"; done
+    fi
+    exit 1
+}
+
+wait_for_preferences_window() {
+    for _attempt in $(seq 1 40); do
+        if osascript -e "tell application \"System Events\" to tell (first process whose unix id is $CTERM_PID) to exists window \"Preferences\"" 2>/dev/null | grep -q true; then
+            log "Preferences window opened"
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    log "ERROR: Preferences window did not open"
+    exit 1
+}
+
+apply_horizontal_pane_shortcut() {
+    local old_shortcut="$1"
+    local new_shortcut="$2"
+
+    focus_cterm
+    osascript <<EOF
+tell application "System Events"
+    set ctermProcess to first process whose unix id is $CTERM_PID
+    tell ctermProcess
+        set preferencesWindow to first window whose name is "Preferences"
+        set paneTabPressed to false
+        repeat with candidate in entire contents of preferencesWindow
+            try
+                if (name of candidate as text) is "Pane Shortcuts" then
+                    perform action "AXPress" of candidate
+                    set paneTabPressed to true
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if paneTabPressed is false then error "Pane Shortcuts tab not found"
+
+        delay 0.25
+        set shortcutChanged to false
+        repeat with candidate in entire contents of preferencesWindow
+            try
+                if (role of candidate as text) is "AXTextField" and (value of candidate as text) is "$old_shortcut" then
+                    set value of candidate to "$new_shortcut"
+                    set shortcutChanged to true
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if shortcutChanged is false then error "Horizontal pane shortcut field not found"
+
+        set applyPressed to false
+        repeat with candidate in entire contents of preferencesWindow
+            try
+                if (role of candidate as text) is "AXButton" and (name of candidate as text) is "Apply" then
+                    perform action "AXPress" of candidate
+                    set applyPressed to true
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if applyPressed is false then error "Apply button not found"
+    end tell
+end tell
+EOF
+}
+
+write_quick_open_template_fixture() {
+    local config_file=""
+
+    for _attempt in $(seq 1 40); do
+        config_file=$(find "$CTERM_TEST_HOME" -type f -name config.toml -print -quit 2>/dev/null || true)
+        if [ -n "$config_file" ]; then
+            break
+        fi
+        sleep 0.25
+    done
+    if [ -z "$config_file" ]; then
+        log "ERROR: Preferences did not create an isolated config file"
+        exit 1
+    fi
+
+    local config_directory
+    config_directory=$(dirname "$config_file")
+    printf '%s\n' \
+        '[[tabs]]' \
+        'name = "UI Test Template"' \
+        'command = "/bin/echo"' \
+        'args = ["cterm-template-ui-test"]' \
+        'color = "#336699"' \
+        'theme = "light"' \
+        'background_color = "#f0f0f0"' \
+        'keep_open = true' \
+        'unique = true' \
+        > "$config_directory/sticky_tabs.toml"
+    log "Installed isolated Quick Open template fixture"
+}
+
 log "=== cterm UI Automation Test (macOS) ==="
 log "Executable: $CTERM_PATH"
 log "Output: $OUTPUT_DIR"
@@ -174,10 +301,12 @@ fi
 # Set up environment
 export RUST_LOG=debug
 export CTERM_LOG_FILE="$OUTPUT_DIR/cterm.log"
+export CTERM_TEST_HOME="$OUTPUT_DIR/home"
+mkdir -p "$CTERM_TEST_HOME"
 
 # Start cterm in background
 log "Starting cterm..."
-"$CTERM_PATH" &
+HOME="$CTERM_TEST_HOME" "$CTERM_PATH" &
 CTERM_PID=$!
 log "Process started with PID: $CTERM_PID"
 
@@ -319,6 +448,53 @@ log "Testing pane close..."
 send_pane_shortcut 117 "ctrl+shift"
 wait_for_cterm_log 'Closed pane' "Pane close succeeded"
 take_screenshot "07_closed_pane"
+
+# Preferences must replace ShortcutManager instances already owned by every
+# open terminal view, including panes that were created before the dialog.
+log "Testing live shortcut reload through Preferences Apply..."
+focus_cterm
+osascript -e 'tell application "System Events" to keystroke "," using command down'
+wait_for_preferences_window
+PREFERENCES_LOG_MARK=$(cterm_log_line_count)
+apply_horizontal_pane_shortcut "Ctrl+Shift+Backslash" "Ctrl+Shift+P"
+wait_for_new_cterm_log \
+    'Preferences saved; refreshed shortcuts for [1-9][0-9]* window\(s\) and ([2-9]|[1-9][0-9]+) terminal view\(s\)' \
+    "Preferences Apply refreshed every pre-existing window and split pane" \
+    "$PREFERENCES_LOG_MARK"
+take_screenshot "08_preferences_applied"
+
+# Close without another save so the following assertion specifically depends
+# on Apply, then focus a pane that was inactive while Preferences was open.
+send_key "w" "cmd"
+sleep 0.5
+FOCUS_LOG_MARK=$(cterm_log_line_count)
+select_pane_menu_item "Focus Left"
+wait_for_new_cterm_log 'Focused pane .*Left' \
+    "Focused a pre-existing inactive pane after Preferences Apply" \
+    "$FOCUS_LOG_MARK"
+
+CUSTOM_SPLIT_LOG_MARK=$(cterm_log_line_count)
+send_pane_shortcut 35 "ctrl+shift"
+wait_for_new_cterm_log 'Split pane Horizontal' \
+    "Updated Ctrl+Shift+P binding split the pre-existing pane" \
+    "$CUSTOM_SPLIT_LOG_MARK"
+take_screenshot "09_reloaded_shortcut"
+
+# Quick Open reloads templates when shown, so an isolated local fixture can
+# exercise its real callback and the shared Cocoa launch plan without network
+# access, Docker, or host configuration.
+write_quick_open_template_fixture
+QUICK_OPEN_LOG_MARK=$(cterm_log_line_count)
+log "Testing template launch through Quick Open..."
+focus_cterm
+osascript -e 'tell application "System Events" to keystroke "g" using command down'
+sleep 0.5
+send_keys "UI Test Template"
+send_key "Return"
+wait_for_new_cterm_log 'Created daemon tab: UI Test Template' \
+    "Quick Open launched the isolated local template" \
+    "$QUICK_OPEN_LOG_MARK"
+take_screenshot "10_quick_open_template"
 
 # Close the window
 log "Closing window..."

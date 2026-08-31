@@ -2625,6 +2625,7 @@ mod action_dispatch_tests {
                 image: Some("alpine:latest".into()),
                 shell: Some("/bin/sh".into()),
                 docker_args: vec!["--pull=never".into()],
+                auto_remove: true,
                 ..Default::default()
             }),
             ..Default::default()
