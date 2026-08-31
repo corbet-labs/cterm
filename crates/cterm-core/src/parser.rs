@@ -1658,7 +1658,9 @@ impl ScreenPerformer<'_> {
                 }
                 2 => {
                     let points = coordinates[1..]
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .filter_map(|pair| {
                             Some((
                                 pair[0].checked_sub(1)? as usize,
@@ -1670,7 +1672,9 @@ impl ScreenPerformer<'_> {
                 }
                 4 => {
                     let rectangles = coordinates[1..]
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .filter_map(|rectangle| {
                             Some((
                                 rectangle[0].checked_sub(1)? as usize,
