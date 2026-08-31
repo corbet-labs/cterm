@@ -824,7 +824,10 @@ allow = ["cterm:new-tab"]
         let broker = PluginBroker::for_test(
             host,
             fixture.plugins_root.clone(),
-            PluginBrokerTimeout::default(),
+            // This test exercises response decoding. Windows PowerShell
+            // startup is variable under concurrent CI load, so latency policy
+            // is covered separately from the wire-format assertion.
+            PluginBrokerTimeout::new(MAX_INVOCATION_TIMEOUT).unwrap(),
         );
         let error = broker
             .invoke(
@@ -834,7 +837,10 @@ allow = ["cterm:new-tab"]
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, PluginBrokerError::Wire(_)));
+        assert!(
+            matches!(error, PluginBrokerError::Wire(_)),
+            "unexpected broker error: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -844,7 +850,9 @@ allow = ["cterm:new-tab"]
         let broker = PluginBroker::for_test(
             host,
             fixture.plugins_root.clone(),
-            PluginBrokerTimeout::default(),
+            // Keep platform process startup out of this protocol round-trip
+            // assertion; the bounded production timeout has dedicated tests.
+            PluginBrokerTimeout::new(MAX_INVOCATION_TIMEOUT).unwrap(),
         );
         let output = broker
             .invoke(
