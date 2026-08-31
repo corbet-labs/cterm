@@ -479,7 +479,14 @@ mod unix {
                 ws_xpixel: pty_size.pixel_width,
                 ws_ypixel: pty_size.pixel_height,
             };
-            libc::ioctl(slave_fd, libc::TIOCSWINSZ, &size);
+            if libc::ioctl(slave_fd, libc::TIOCSWINSZ, &size) < 0
+                || libc::ioctl(master_fd, libc::TIOCSWINSZ, &size) < 0
+            {
+                let error = io::Error::last_os_error();
+                libc::close(master_fd);
+                libc::close(slave_fd);
+                return Err(PtyError::Create(Box::new(error)));
+            }
 
             // Fork the process
             let pid = libc::fork();

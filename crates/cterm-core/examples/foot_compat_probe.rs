@@ -54,53 +54,58 @@ mod unix {
         let mut stdin = stdin.lock();
         let mut stdout = io::stdout().lock();
 
-        let cases: &[(&str, &[u8], &[u8])] = &[
-            ("device-attributes", b"\x1b[c", b"c"),
-            ("cursor", b"\x1b[2J\x1b[H\x1b[6;11H\x1b[6n", b"R"),
+        let cases: &[(&str, &[u8], &[u8], usize)] = &[
+            ("device-attributes", b"\x1b[c", b"c", 1),
+            ("cursor", b"\x1b[2J\x1b[H\x1b[6;11H\x1b[6n", b"R", 1),
             (
                 "sgr",
                 b"\x1b[1;3;4:3;38:2::1:2:3;48:5:42;58:2::4:5:6m\x1bP$qm\x1b\\",
                 b"\x1b\\",
+                1,
             ),
-            ("margins", b"\x1b[3;20r\x1bP$qr\x1b\\", b"\x1b\\"),
-            ("cursor-style", b"\x1b[5 q\x1bP$q q\x1b\\", b"\x1b\\"),
-            ("sync-mode", b"\x1b[?2026$p", b"y"),
-            ("reverse-wrap", b"\x1b[?45$p", b"y"),
-            ("terminfo-am", b"\x1bP+q616d\x1b\\", b"\x1b\\"),
+            ("margins", b"\x1b[3;20r\x1bP$qr\x1b\\", b"\x1b\\", 1),
+            ("cursor-style", b"\x1b[5 q\x1bP$q q\x1b\\", b"\x1b\\", 1),
+            ("sync-mode", b"\x1b[?2026$p", b"y", 1),
+            ("reverse-wrap", b"\x1b[?45$p", b"y", 1),
+            ("terminfo-am", b"\x1bP+q616d\x1b\\", b"\x1b\\", 1),
             (
                 "palette-stack",
                 b"\x1b]10;#112233\x1b\\\x1b[#P\x1b]10;#445566\x1b\\\x1b[#Q\x1b]10;?\x1b\\",
                 b"\x1b\\",
+                1,
             ),
-            ("palette-stack-status", b"\x1b[#P\x1b[#R\x1b[#Q", b"#Q"),
-            ("mouse-x10-mode", b"\x1b[?9$p", b"y"),
-            ("mouse-sgr-mode", b"\x1b[?1006h\x1b[?1006$p", b"y"),
+            ("palette-stack-status", b"\x1b[#P\x1b[#R\x1b[#Q", b"#Q", 1),
+            ("mouse-x10-mode", b"\x1b[?9$p", b"y", 1),
+            ("mouse-sgr-mode", b"\x1b[?1006h\x1b[?1006$p", b"y", 1),
             (
                 "mouse-urxvt-mode",
                 b"\x1b[?1015h\x1b[?1006$p\x1b[?1015$p",
                 b"y",
+                2,
             ),
             (
                 "mouse-pixel-mode",
                 b"\x1b[?1016h\x1b[?1015$p\x1b[?1016$p",
                 b"y",
+                2,
             ),
             (
                 "mouse-mode-restore",
                 b"\x1b[?1015h\x1b[?1015s\x1b[?1006h\x1b[?1015r\x1b[?1015$p",
                 b"y",
+                1,
             ),
-            ("theme", b"\x1b[?996n", b"n"),
-            ("theme-report-mode", b"\x1b[?2031h\x1b[?2031$p", b"y"),
+            ("theme", b"\x1b[?996n", b"n", 1),
+            ("theme-report-mode", b"\x1b[?2031h\x1b[?2031$p", b"y", 1),
             // Foot added visibility query 998 and mode 2033 after the 1.27.0
             // release used by this gate. cterm tests those extensions directly
             // until they are available in a released reference binary.
         ];
 
         let mut report = String::new();
-        for (name, request, terminator) in cases {
+        for (name, request, terminator, reply_count) in cases {
             eprintln!("cterm compatibility probe: starting {name}");
-            let response = exchange(&mut stdin, &mut stdout, request, terminator)?;
+            let response = exchange(&mut stdin, &mut stdout, request, terminator, *reply_count)?;
             report.push_str(name);
             report.push('=');
             for byte in response {
@@ -124,7 +129,14 @@ mod unix {
         output: &mut impl Write,
         request: &[u8],
         terminator: &[u8],
+        reply_count: usize,
     ) -> io::Result<Vec<u8>> {
+        if terminator.is_empty() || reply_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal exchange requires a terminator and at least one reply",
+            ));
+        }
         output.write_all(request)?;
         output.flush()?;
 
@@ -132,7 +144,7 @@ mod unix {
         let mut response = Vec::new();
         let mut buffer = [0_u8; 256];
         loop {
-            if response.ends_with(terminator) {
+            if reply_is_complete(&response, terminator, reply_count) {
                 return Ok(response);
             }
 
@@ -164,6 +176,34 @@ mod unix {
                 ));
             }
             response.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    fn reply_is_complete(response: &[u8], terminator: &[u8], reply_count: usize) -> bool {
+        !terminator.is_empty()
+            && response
+                .windows(terminator.len())
+                .filter(|candidate| *candidate == terminator)
+                .count()
+                >= reply_count
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::reply_is_complete;
+
+        #[test]
+        fn waits_for_every_requested_reply() {
+            let first = b"\x1b[?1015;2$y";
+            let both = b"\x1b[?1015;2$y\x1b[?1016;1$y";
+
+            assert!(!reply_is_complete(first, b"y", 2));
+            assert!(reply_is_complete(both, b"y", 2));
+        }
+
+        #[test]
+        fn rejects_empty_terminators() {
+            assert!(!reply_is_complete(b"reply", b"", 1));
         }
     }
 }
