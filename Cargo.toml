@@ -109,6 +109,7 @@ tar = "0.4"
 flate2 = "1"
 shared_memory = "0.12.4"
 nix = { version = "0.31.3", default-features = false, features = ["fs", "mman"] }
+memmap2 = "0.9.11"
 
 # gRPC
 tower = "0.4"

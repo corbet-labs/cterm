@@ -774,7 +774,7 @@ fn read_shared_memory_payload(
     // Ownership passes to the terminal as soon as open succeeds. The live
     // descriptor remains readable after unlink and closes through File RAII.
     let _ = nix::sys::mman::shm_unlink(name.as_str());
-    let mut file = std::fs::File::from(descriptor);
+    let file = std::fs::File::from(descriptor);
     let mapped_size = file
         .metadata()
         .map_err(|_| echo.error(ErrorCode::BadFile, "could not inspect shared memory"))?
@@ -792,13 +792,17 @@ fn read_shared_memory_payload(
     if length > MAX_DECODED_BYTES as u64 {
         return Err(echo.error(ErrorCode::NoSpace, "image data too large"));
     }
-    file.seek(std::io::SeekFrom::Start(start))
-        .map_err(|_| echo.error(ErrorCode::BadFile, "could not seek shared memory"))?;
-    let mut bytes = Vec::with_capacity(length as usize);
-    file.take(length)
-        .read_to_end(&mut bytes)
-        .map_err(|_| echo.error(ErrorCode::BadFile, "could not read shared memory"))?;
-    Ok(bytes)
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: the sender has finished writing before it sends the APC. This
+    // process owns a read-only descriptor and snapshots the checked byte range
+    // into Rust-owned memory before decoding or closing the mapping.
+    let mut options = memmap2::MmapOptions::new();
+    options.offset(start).len(length as usize);
+    let mapping = unsafe { options.map(&file) }
+        .map_err(|_| echo.error(ErrorCode::BadFile, "could not map shared memory"))?;
+    Ok(mapping.to_vec())
 }
 
 #[cfg(windows)]
@@ -2183,9 +2187,12 @@ mod tests {
         )
         .unwrap();
         nix::unistd::ftruncate(&descriptor, bytes.len() as i64).unwrap();
-        let mut file = std::fs::File::from(descriptor);
-        file.write_all(bytes).unwrap();
-        file.flush().unwrap();
+        let file = std::fs::File::from(descriptor);
+        // SAFETY: the test owns the descriptor and retains both the file and
+        // mapping until the terminal has copied the bytes.
+        let mut mapping = unsafe { memmap2::MmapOptions::new().map_mut(&file).unwrap() };
+        mapping.copy_from_slice(bytes);
+        mapping.flush().unwrap();
         (name, file)
     }
 

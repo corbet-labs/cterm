@@ -36,6 +36,7 @@ shared_memory.workspace = true
 
 [target.'cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))'.dependencies]
 nix.workspace = true
+memmap2.workspace = true
 
 [dev-dependencies]
 criterion = "0.8.2"
