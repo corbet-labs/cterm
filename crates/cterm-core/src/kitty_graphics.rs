@@ -2191,7 +2191,9 @@ mod tests {
         // SAFETY: the test owns the descriptor and retains both the file and
         // mapping until the terminal has copied the bytes.
         let mut mapping = unsafe { memmap2::MmapOptions::new().map_mut(&file).unwrap() };
-        mapping.copy_from_slice(bytes);
+        // Darwin exposes POSIX shared-memory objects in page-sized mappings
+        // even when ftruncate recorded a shorter logical payload.
+        mapping[..bytes.len()].copy_from_slice(bytes);
         mapping.flush().unwrap();
         (name, file)
     }
