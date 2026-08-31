@@ -49,6 +49,13 @@ enum GridPass {
     Foreground,
 }
 
+#[derive(Clone, Copy)]
+struct CellPosition {
+    row: usize,
+    col: usize,
+    absolute_line: usize,
+}
+
 impl Default for CellDimensions {
     fn default() -> Self {
         Self {
@@ -544,7 +551,17 @@ impl TerminalRenderer {
                     if cell.is_wide_spacer() {
                         continue;
                     }
-                    self.draw_cell(row, col, absolute_line, cell, screen, blink_phase, pass)?;
+                    self.draw_cell(
+                        CellPosition {
+                            row,
+                            col,
+                            absolute_line,
+                        },
+                        cell,
+                        screen,
+                        blink_phase,
+                        pass,
+                    )?;
                 }
             }
         }
@@ -555,20 +572,18 @@ impl TerminalRenderer {
     /// Draw a single cell
     fn draw_cell(
         &mut self,
-        row: usize,
-        col: usize,
-        absolute_line: usize,
+        position: CellPosition,
         cell: &Cell,
         screen: &Screen,
         blink_phase: BlinkPhase,
         pass: GridPass,
     ) -> windows::core::Result<()> {
-        let x = self.origin_x + col as f32 * self.cell_dims.width;
-        let y = self.origin_y + row as f32 * self.cell_dims.height;
+        let x = self.origin_x + position.col as f32 * self.cell_dims.width;
+        let y = self.origin_y + position.row as f32 * self.cell_dims.height;
 
         let attrs = cell.attrs;
         let foreground_visible = cell_foreground_visible(attrs, blink_phase);
-        let is_selected = screen.is_selected(absolute_line, col);
+        let is_selected = screen.is_selected(position.absolute_line, position.col);
         let (fg, bg) = self.resolve_colors(cell, screen, screen.modes.reverse_video, is_selected);
         let palette = self.resolved_palette(screen);
         let cell_width = if cell.is_wide() {
