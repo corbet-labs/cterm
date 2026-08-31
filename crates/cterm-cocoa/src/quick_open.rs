@@ -16,6 +16,7 @@ use objc2_foundation::{
     ns_string, MainThreadMarker, NSInteger, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize,
     NSString,
 };
+use objc2_quartz_core::CALayer;
 use std::cell::{Cell, RefCell};
 
 /// Height of the Quick Open overlay
@@ -750,7 +751,7 @@ impl QuickOpenOverlay {
         }
     }
 
-    fn layer(&self) -> Option<Retained<AnyObject>> {
+    fn layer(&self) -> Option<Retained<CALayer>> {
         unsafe { msg_send![self, layer] }
     }
 
