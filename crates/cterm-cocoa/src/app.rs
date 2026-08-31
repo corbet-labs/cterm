@@ -16,6 +16,7 @@ use objc2_foundation::{
 };
 
 use cterm_app::config::{load_config, Config};
+use cterm_app::{TemplateInstancePolicy, TemplateLaunchPlan};
 use cterm_ui::theme::Theme;
 
 use crate::menu;
@@ -1350,125 +1351,82 @@ impl AppDelegate {
 
     /// Open a tab from a template
     fn open_template(&self, template: &cterm_app::config::StickyTabConfig) {
+        self.open_template_with_preferred_window(template, None);
+    }
+
+    /// Open a Quick Open selection in the native tab group that requested it.
+    pub(crate) fn open_template_in_window(
+        &self,
+        template: &cterm_app::config::StickyTabConfig,
+        window: &CtermWindow,
+    ) {
+        self.open_template_with_preferred_window(template, Some(window));
+    }
+
+    fn open_template_with_preferred_window(
+        &self,
+        template: &cterm_app::config::StickyTabConfig,
+        preferred_window: Option<&CtermWindow>,
+    ) {
         if reject_managed_secondary_action("tab template") {
             return;
         }
-        let mtm = MainThreadMarker::from(self);
-
-        // If the template is unique, check if we already have a tab with this template
-        if template.unique {
-            // Look through all windows to find a matching tab
-            let windows = self.ivars().windows.borrow();
-            for window in windows.iter() {
-                // Check if this window has a tab with the template name
-                if let Some(terminal_view) = window.active_terminal() {
-                    if terminal_view.template_name().as_deref() == Some(template.name.as_str()) {
-                        // Focus this window
-                        window.makeKeyAndOrderFront(None);
-                        log::info!("Focused existing unique tab: {}", template.name);
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Prepare working directory (clone from git if needed)
-        if let Some(ref working_dir) = template.working_directory {
-            if let Err(e) =
-                cterm_app::prepare_working_directory(working_dir, template.git_remote.as_deref())
-            {
-                log::error!("Failed to prepare working directory: {}", e);
-            }
-        }
-
         let config = self.ivars().config.borrow().clone();
-        let theme = self.ivars().theme.clone();
-
-        let opts = cterm_client::CreateSessionOpts {
-            cols: 80,
-            rows: 24,
-            shell: template
-                .command
-                .clone()
-                .or_else(|| config.general.default_shell.clone()),
-            args: if template.args.is_empty() && template.command.is_none() {
-                config.general.shell_args.clone()
-            } else {
-                template.args.clone()
-            },
-            cwd: template
-                .working_directory
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
-            env: template
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            ..Default::default()
-        };
-
-        let template_name = template.name.clone();
-        let template_color = template.color.clone();
-        let template_bg_color = template.background_color.clone();
-
-        // Resolve remote connection info if template targets a remote host
-        let remote_cfg = template
-            .remote
-            .as_ref()
-            .and_then(|name| config.find_remote(name).cloned());
-
-        if let Some(ref remote_name) = template.remote {
-            if remote_cfg.is_none() {
-                log::error!(
-                    "Template '{}' references unknown remote '{}'",
-                    template.name,
-                    remote_name
-                );
+        let plan = match TemplateLaunchPlan::build(template, &config) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::error!("Cannot launch template '{}': {error}", template.name);
                 return;
             }
+        };
+        if plan.instance_policy == TemplateInstancePolicy::ReuseExisting
+            && self.focus_existing_template(&plan.template_name)
+        {
+            log::info!("Focused existing unique tab: {}", plan.template_name);
+            return;
         }
 
-        let app = NSApplication::sharedApplication(mtm);
+        let Some(window) = self.template_target_window(preferred_window) else {
+            log::error!("Cannot launch template without a tracked terminal window");
+            return;
+        };
+        if window.spawn_template_plan(plan, self.ivars().remote_manager.clone()) {
+            log::info!("Template launch requested from Cocoa");
+        }
+    }
 
-        {
-            let remote = remote_cfg.and_then(|rc| {
-                template.remote.as_ref().map(|name| {
-                    (
-                        self.ivars().remote_manager.clone(),
-                        name.clone(),
-                        rc.host.clone(),
-                        rc.ssh_compression,
-                    )
-                })
-            });
+    fn focus_existing_template(&self, template_name: &str) -> bool {
+        let windows = self.ivars().windows.borrow().clone();
+        windows
+            .iter()
+            .any(|window| window.focus_template(template_name))
+    }
 
-            if let Some(key_window) = app.keyWindow() {
-                let window_ptr = Retained::as_ptr(&key_window) as *const CtermWindow;
-                let cterm_window: &CtermWindow = unsafe { &*window_ptr };
-                cterm_window.spawn_daemon_tab(
-                    opts,
-                    Some(template_name),
-                    template_color,
-                    template_bg_color,
-                    remote,
-                    None,
-                );
-            } else {
-                // No key window — create a new standalone daemon-backed window
-                let window = CtermWindow::new_daemon(
-                    mtm,
-                    &config,
-                    &theme,
-                    opts,
-                    template_name,
-                    template_color,
-                    template_bg_color,
-                );
-                self.ivars().windows.borrow_mut().push(window.clone());
-                window.makeKeyAndOrderFront(None);
+    fn template_target_window(
+        &self,
+        preferred_window: Option<&CtermWindow>,
+    ) -> Option<Retained<CtermWindow>> {
+        let windows = self.ivars().windows.borrow();
+        if let Some(preferred_window) = preferred_window {
+            if let Some(window) = windows
+                .iter()
+                .find(|window| std::ptr::eq(&***window, preferred_window))
+            {
+                return Some(window.clone());
             }
         }
+
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        if let Some(key_window) = app.keyWindow() {
+            let key_ptr = Retained::as_ptr(&key_window);
+            if let Some(window) = windows
+                .iter()
+                .find(|window| Retained::as_ptr(window) as *const NSWindow == key_ptr)
+            {
+                return Some(window.clone());
+            }
+        }
+        windows.first().cloned()
     }
 
     /// Perform a seamless relaunch, preserving all windows and tabs

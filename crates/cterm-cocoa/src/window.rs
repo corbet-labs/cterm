@@ -19,6 +19,7 @@ use objc2_foundation::{
 use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_app::upgrade::{PaneLaunchContext, PaneUpgradeState, TabUpgradeState};
+use cterm_app::{TemplateDaemonTarget, TemplateLaunchPlan};
 use cterm_ui::{
     Action, PaneDirection, PaneId, PaneLayout, PaneLayoutError, PaneRect, SplitDirection,
     SplitPlacement, SplitRatio, SplitRequest, Theme,
@@ -66,6 +67,54 @@ fn config_with_shortcuts(config: &Config, shortcuts: &ShortcutsConfig) -> Config
     let mut config = config.clone();
     config.shortcuts = shortcuts.clone();
     config
+}
+
+fn template_theme_name_matches(requested: &str, resolved: &str) -> bool {
+    requested.eq_ignore_ascii_case(resolved)
+        || matches!(
+            (requested.to_ascii_lowercase().as_str(), resolved),
+            ("dark", "Default Dark")
+                | ("light", "Default Light")
+                | ("tokyo_night" | "tokyo-night", "Tokyo Night")
+                | ("dracula", "Dracula")
+                | ("nord", "Nord")
+        )
+}
+
+fn template_theme(config: &Config, fallback: &Theme, override_name: Option<&str>) -> Theme {
+    let Some(override_name) = override_name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return fallback.clone();
+    };
+
+    if let Some(custom) = config.appearance.custom_theme.as_ref() {
+        if override_name.eq_ignore_ascii_case("custom")
+            || override_name.eq_ignore_ascii_case(&custom.name)
+        {
+            return custom.clone();
+        }
+    }
+
+    let mut themed_config = config.clone();
+    themed_config.appearance.theme = override_name.to_string();
+    themed_config.appearance.custom_theme = None;
+    let resolved = cterm_app::config::resolve_theme(&themed_config);
+    if template_theme_name_matches(override_name, &resolved.name) {
+        resolved
+    } else {
+        log::warn!("Unknown template theme '{override_name}', using the window theme");
+        fallback.clone()
+    }
+}
+
+fn template_remote_details(plan: &TemplateLaunchPlan) -> Option<(&str, &str, bool)> {
+    match &plan.daemon {
+        TemplateDaemonTarget::Local => None,
+        TemplateDaemonTarget::Named(remote) => Some((
+            remote.name.as_str(),
+            remote.host.as_str(),
+            remote.ssh_compression,
+        )),
+    }
 }
 
 struct DaemonProcessQuery {
@@ -479,30 +528,8 @@ fn configured_template_launch_context(config: &Config, name: &str) -> Option<Pan
         .sticky_tabs
         .iter()
         .find(|template| template.name == name)?;
-    let (configured_shell, configured_args) = template.get_command_args();
-    let options = cterm_client::CreateSessionOpts {
-        shell: configured_shell.or_else(|| config.general.default_shell.clone()),
-        args: if template.docker.is_none() && template.command.is_none() {
-            config.general.shell_args.clone()
-        } else {
-            configured_args
-        },
-        env: template
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .chain(
-                config
-                    .general
-                    .env
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            )
-            .collect(),
-        term: config.general.term.clone(),
-        ssh: template.ssh.as_ref().map(|ssh| ssh.to_ssh_params()),
-        ..Default::default()
-    };
+    let plan = TemplateLaunchPlan::build(template, config).ok()?;
+    let options = plan.session_options(0, 0);
     Some(PaneLaunchContext::capture(&options))
 }
 
@@ -1619,16 +1646,87 @@ impl CtermWindow {
     /// daemon.
     pub fn spawn_daemon_tab(
         &self,
-        mut opts: cterm_client::CreateSessionOpts,
+        opts: cterm_client::CreateSessionOpts,
         template_name: Option<String>,
         color: Option<String>,
         background_color: Option<String>,
         remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
         daemon_socket: Option<std::path::PathBuf>,
     ) {
+        self.spawn_daemon_tab_with_theme(
+            opts,
+            template_name,
+            color,
+            background_color,
+            false,
+            self.ivars().theme.clone(),
+            remote,
+            daemon_socket,
+        );
+    }
+
+    /// Launch one normalized template plan into this window's native tab group.
+    pub(crate) fn spawn_template_plan(
+        &self,
+        plan: TemplateLaunchPlan,
+        remote_manager: cterm_client::RemoteManager,
+    ) -> bool {
+        if crate::app::get_args().managed {
+            log::warn!("Ignoring template launch plan in managed mode");
+            return false;
+        }
+        if let Some((directory, git_remote)) = plan.local_workspace_preparation() {
+            if let Err(error) = cterm_app::prepare_working_directory(directory, git_remote) {
+                log::error!(
+                    "Failed to prepare workspace for template '{}': {error}",
+                    plan.template_name
+                );
+                return false;
+            }
+        }
+
+        let config = self.config_with_live_shortcuts();
+        let theme = template_theme(
+            &config,
+            &self.ivars().theme,
+            plan.appearance.theme.as_deref(),
+        );
+        let opts = plan.session_options(80, 24);
+        let remote = template_remote_details(&plan).map(|(name, host, ssh_compression)| {
+            (
+                remote_manager,
+                name.to_string(),
+                host.to_string(),
+                ssh_compression,
+            )
+        });
+        self.spawn_daemon_tab_with_theme(
+            opts,
+            Some(plan.template_name),
+            plan.appearance.tab_color,
+            plan.appearance.background_color,
+            plan.keep_open,
+            theme,
+            remote,
+            None,
+        );
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_daemon_tab_with_theme(
+        &self,
+        mut opts: cterm_client::CreateSessionOpts,
+        template_name: Option<String>,
+        color: Option<String>,
+        background_color: Option<String>,
+        keep_open: bool,
+        theme: Theme,
+        remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
+        daemon_socket: Option<std::path::PathBuf>,
+    ) {
         let config = self.config_with_live_shortcuts();
         ensure_session_pixel_size(&config, &mut opts);
-        let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         opts.frontend_state.appearance = theme.appearance();
         let launch_context = PaneLaunchContext::capture(&opts);
@@ -1680,6 +1778,7 @@ impl CtermWindow {
                         if let Some(tv) = new_window.active_terminal() {
                             tv.set_pane_launch_context(launch_context);
                             tv.set_remote_name(remote_name);
+                            tv.set_keep_open(keep_open);
                             if let Some(ref name) = template_name {
                                 tv.set_current_title(title.clone());
                                 tv.set_title_locked(true);
@@ -1749,6 +1848,22 @@ impl CtermWindow {
             .into_iter()
             .filter_map(|id| panes.get(id).map(|entry| entry.terminal.clone()))
             .collect()
+    }
+
+    /// Focus the pane carrying a reusable template, if this tab owns one.
+    pub(crate) fn focus_template(&self, template_name: &str) -> bool {
+        let Some(terminal) = self
+            .terminal_views()
+            .into_iter()
+            .find(|terminal| terminal.template_name().as_deref() == Some(template_name))
+        else {
+            return false;
+        };
+        if let Some(pane_id) = self.pane_id_for_terminal(&terminal) {
+            self.focus_pane(pane_id);
+        }
+        self.makeKeyAndOrderFront(None);
+        true
     }
 
     /// Replace configured bindings for this window and every pane it owns.
@@ -2063,50 +2178,13 @@ impl CtermWindow {
             log::warn!("Ignoring tab-template request in managed mode");
             return;
         }
-        // Prepare working directory (clone from git if needed)
-        if let Some(ref working_dir) = template.working_directory {
-            if let Err(e) =
-                cterm_app::prepare_working_directory(working_dir, template.git_remote.as_deref())
-            {
-                log::error!("Failed to prepare working directory: {}", e);
-            }
-        }
-
-        let config = self.config_with_live_shortcuts();
-        let opts = cterm_client::CreateSessionOpts {
-            cols: 80,
-            rows: 24,
-            shell: template
-                .command
-                .clone()
-                .or_else(|| config.general.default_shell.clone()),
-            args: if template.args.is_empty() && template.command.is_none() {
-                config.general.shell_args.clone()
-            } else {
-                template.args.clone()
-            },
-            cwd: template
-                .working_directory
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
-            env: template
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            // SSH tabs open a native puressh connection on the daemon.
-            ssh: template.ssh.as_ref().map(|s| s.to_ssh_params()),
-            ..Default::default()
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        let Some(delegate) = app.delegate() else {
+            log::error!("Cannot launch template without the Cocoa application delegate");
+            return;
         };
-
-        self.spawn_daemon_tab(
-            opts,
-            Some(template.name.clone()),
-            template.color.clone(),
-            template.background_color.clone(),
-            None,
-            None,
-        );
+        let delegate = unsafe { &*(Retained::as_ptr(&delegate) as *const crate::app::AppDelegate) };
+        delegate.open_template_in_window(template, self);
     }
 
     /// Get the current tab color
@@ -2407,11 +2485,120 @@ mod action_dispatch_tests {
     use super::*;
 
     #[test]
+    fn template_theme_override_ignores_the_global_custom_theme() {
+        let config = Config {
+            appearance: cterm_app::config::AppearanceConfig {
+                custom_theme: Some(Theme::dark()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let resolved = template_theme(&config, &Theme::tokyo_night(), Some("Default Light"));
+        let custom = template_theme(&config, &Theme::tokyo_night(), Some("custom"));
+        let unknown = template_theme(&config, &Theme::tokyo_night(), Some("not-a-theme"));
+        let fallback = template_theme(&config, &Theme::light(), None);
+
+        assert_eq!(resolved.name, "Default Light");
+        assert_eq!(custom.name, "Default Dark");
+        assert_eq!(unknown.name, "Tokyo Night");
+        assert_eq!(fallback.name, "Default Light");
+    }
+
+    #[test]
+    fn configured_template_context_uses_native_ssh_from_shared_plan() {
+        let mut config = Config::default();
+        config.sticky_tabs.push(cterm_app::config::StickyTabConfig {
+            name: "Production".into(),
+            command: Some("ignored-for-native-ssh".into()),
+            args: vec!["ignored".into()],
+            ssh: Some(cterm_app::config::SshTabConfig {
+                host: "shell.example.com".into(),
+                port: Some(2222),
+                username: Some("deploy".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let context = configured_template_launch_context(&config, "Production").unwrap();
+
+        assert!(context.shell.is_none());
+        assert!(context.args.is_empty());
+        let ssh = context.ssh.unwrap();
+        assert_eq!(ssh.host, "shell.example.com");
+        assert_eq!(ssh.port, 2222);
+        assert_eq!(ssh.username.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn configured_template_context_keeps_shared_docker_argv() {
+        let mut config = Config::default();
+        config.sticky_tabs.push(cterm_app::config::StickyTabConfig {
+            name: "Container".into(),
+            docker: Some(cterm_app::config::DockerTabConfig {
+                mode: cterm_app::config::DockerMode::Run,
+                image: Some("alpine:latest".into()),
+                shell: Some("/bin/sh".into()),
+                docker_args: vec!["--pull=never".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let context = configured_template_launch_context(&config, "Container").unwrap();
+
+        assert_eq!(context.shell.as_deref(), Some("docker"));
+        assert_eq!(
+            context.args,
+            [
+                "run",
+                "-it",
+                "--rm",
+                "--pull=never",
+                "alpine:latest",
+                "/bin/sh"
+            ]
+        );
+        assert!(context.ssh.is_none());
+    }
+
+    #[test]
+    fn named_remote_template_keeps_daemon_intent_and_skips_local_preparation() {
+        let mut config = Config::default();
+        config.remotes.push(cterm_app::config::RemoteConfig {
+            name: "builder".into(),
+            host: "dev@build.example.com".into(),
+            ssh_compression: false,
+        });
+        let template = cterm_app::config::StickyTabConfig {
+            name: "Remote build".into(),
+            command: Some("just".into()),
+            args: vec!["test".into()],
+            working_directory: Some("/srv/project".into()),
+            remote: Some("builder".into()),
+            ..Default::default()
+        };
+
+        let plan = TemplateLaunchPlan::build(&template, &config).unwrap();
+
+        assert_eq!(
+            template_remote_details(&plan),
+            Some(("builder", "dev@build.example.com", false))
+        );
+        assert!(plan.local_workspace_preparation().is_none());
+        let options = plan.session_options(80, 24);
+        assert_eq!(options.cwd.as_deref(), Some("/srv/project"));
+    }
+
+    #[test]
     fn live_shortcuts_are_inherited_by_future_terminal_configs() {
         let config = Config::default();
         let original = config.shortcuts.new_tab.clone();
-        let mut shortcuts = ShortcutsConfig::default();
-        shortcuts.new_tab = "Ctrl+Alt+T".to_string();
+        let shortcuts = ShortcutsConfig {
+            new_tab: "Ctrl+Alt+T".to_string(),
+            ..ShortcutsConfig::default()
+        };
 
         let merged = config_with_shortcuts(&config, &shortcuts);
 
