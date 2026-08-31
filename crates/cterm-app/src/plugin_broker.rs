@@ -610,7 +610,7 @@ allow = ["cterm:new-tab"]
     }
 
     #[cfg(windows)]
-    fn scripted_host(script: impl Into<OsString>) -> HostCommand {
+    fn scripted_host(script: impl AsRef<str>) -> HostCommand {
         let system_root = std::env::var_os("SystemRoot").unwrap();
         let system_root_path = PathBuf::from(&system_root);
         let powershell = system_root_path
@@ -624,7 +624,10 @@ allow = ["cterm:new-tab"]
             "-NoProfile".into(),
             "-NonInteractive".into(),
             "-Command".into(),
-            script.into(),
+            // PowerShell joins every argument following -Command into the
+            // command text. Comment out the broker's production arguments so
+            // they remain fixture inputs rather than PowerShell syntax.
+            format!("{}; #", script.as_ref()).into(),
         ];
         host.required_environment = vec![("SystemRoot".into(), system_root)];
         host
