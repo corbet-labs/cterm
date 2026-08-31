@@ -8,8 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibilityElementProtocol, NSButton, NSPopUpButton, NSSlider, NSStackView, NSTabView,
-    NSTabViewItem, NSTextField, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAccessibility, NSButton, NSPopUpButton, NSSlider, NSStackView, NSTabView, NSTabViewItem,
+    NSTextField, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
