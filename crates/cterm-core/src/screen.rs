@@ -626,6 +626,13 @@ pub struct TerminalImage {
     pub pixel_height: usize,
 }
 
+/// Shared decoded pixels passed from a protocol adapter into screen storage.
+pub(crate) struct DecodedRgbaImage {
+    pub data: Arc<Vec<u8>>,
+    pub width: usize,
+    pub height: usize,
+}
+
 /// Sentinel column value meaning "end of row" for line selection mode.
 /// Used in `SelectionPoint::col` to indicate the selection extends to the end of the line.
 const COL_END_OF_ROW: usize = usize::MAX;
@@ -2697,7 +2704,29 @@ impl Screen {
         cell_cols: usize,
         cell_rows: usize,
         sixel_image: SixelImage,
-    ) {
+    ) -> u64 {
+        self.add_rgba_image_with_size(
+            col,
+            row,
+            cell_cols,
+            cell_rows,
+            DecodedRgbaImage {
+                data: Arc::new(sixel_image.data),
+                width: sixel_image.width,
+                height: sixel_image.height,
+            },
+        )
+    }
+
+    /// Add an already decoded RGBA image without copying shared pixel storage.
+    pub(crate) fn add_rgba_image_with_size(
+        &mut self,
+        col: usize,
+        row: usize,
+        cell_cols: usize,
+        cell_rows: usize,
+        pixels: DecodedRgbaImage,
+    ) -> u64 {
         let id = self.next_image_id;
         self.next_image_id += 1;
 
@@ -2710,9 +2739,9 @@ impl Screen {
             line: absolute_line,
             cell_width: cell_cols,
             cell_height: cell_rows,
-            data: Arc::new(sixel_image.data),
-            pixel_width: sixel_image.width,
-            pixel_height: sixel_image.height,
+            data: pixels.data,
+            pixel_width: pixels.width,
+            pixel_height: pixels.height,
         };
 
         // Clear grid cells underneath the image (xterm behavior)
@@ -2721,6 +2750,7 @@ impl Screen {
 
         self.images.insert(id, image);
         self.dirty = true;
+        id
     }
 
     /// Clear grid cells that will be covered by an image
@@ -2855,6 +2885,13 @@ impl Screen {
     /// Clear all images (called on screen clear)
     pub fn clear_images(&mut self) {
         self.images.clear();
+    }
+
+    /// Remove one image placement by its internal screen identifier.
+    pub(crate) fn remove_image(&mut self, id: u64) -> bool {
+        let removed = self.images.remove(&id).is_some();
+        self.dirty |= removed;
+        removed
     }
 
     /// Set the cell height hint (call from UI layer when font metrics are known)

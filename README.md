@@ -457,15 +457,22 @@ cterm supports DEC Sixel graphics for inline image display:
 
 ### Enhanced keyboard events
 
-cterm implements the kitty progressive keyboard protocol's disambiguation and
-event-type flags. Applications can request flags `1|2` to receive unambiguous
-press, repeat, and release events for functional keys and disambiguated modified
-keys. Main and alternate screens keep independent flag stacks.
+cterm implements all five kitty progressive keyboard flags: disambiguated keys,
+press/repeat/release events, alternate keys, all-key reporting, and associated
+text. GTK/Wayland, AppKit, and Win32 provide native layout, physical-key,
+modifier, dead-key, and IME data to the shared Rust encoder. Main and alternate
+screens keep independent flag stacks.
 
-All-key, alternate-key, and associated-text reporting are currently masked out
-when requested. Those modes require layout- and IME-accurate physical key data
-that is not available consistently across GTK, AppKit, and Win32; cterm reports
-only the flags it can honor on every backend.
+### Kitty Graphics Protocol
+
+cterm accepts bounded Kitty APC graphics commands through the same shared RGBA
+pipeline used by Sixel and iTerm2 images. The first implementation tranche
+supports direct, regular-file, and secure temporary-file transfers; raw RGB,
+RGBA, and PNG images; zlib compression; chunked uploads; support queries;
+transmit/display/place/delete actions; cropping, cell scaling, pixel offsets,
+quiet replies, storage quotas, and cursor suppression. Animation, shared-memory
+transport, Unicode placeholders, and exact z-layer compositing remain staged
+follow-up work rather than silently advertised capabilities.
 
 Test with:
 ```bash

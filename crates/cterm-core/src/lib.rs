@@ -13,6 +13,7 @@ pub mod grid;
 pub mod image_decode;
 pub mod iterm2;
 pub mod keyboard;
+mod kitty_graphics;
 pub mod mouse;
 mod osc1337;
 pub mod parser;

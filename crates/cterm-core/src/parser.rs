@@ -16,6 +16,7 @@ use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::kitty_graphics::{InterceptorResult as KittyInterceptorResult, KittyGraphics};
 use crate::osc1337::{InterceptorResult, Osc1337Interceptor};
 #[cfg(test)]
 use crate::screen::DesktopNotificationAction;
@@ -140,6 +141,8 @@ pub struct Parser {
     osc_1337: Osc1337Interceptor,
     /// In-progress chunked Kitty OSC 99 notification.
     kitty_notification: KittyNotificationBuilder,
+    /// Bounded Kitty graphics APC parser and image store.
+    kitty_graphics: KittyGraphics,
     /// Optimistically active Kitty notification identifiers for p=alive.
     active_notification_ids: HashSet<String>,
     /// Palette and resource limits shared by Sixel protocol sequences.
@@ -161,6 +164,7 @@ impl Parser {
             saved_dec_modes: HashMap::new(),
             osc_1337: Osc1337Interceptor::new(),
             kitty_notification: KittyNotificationBuilder::default(),
+            kitty_graphics: KittyGraphics::default(),
             active_notification_ids: HashSet::new(),
             sixel: SixelSessionState::default(),
         }
@@ -174,16 +178,32 @@ impl Parser {
         for &byte in bytes {
             match self.osc_1337.advance(byte) {
                 InterceptorResult::Forward(bytes) => {
-                    self.advance_vte(screen, bytes.as_slice());
+                    self.advance_after_osc1337(screen, bytes.as_slice());
                 }
                 InterceptorResult::Replay(bytes) => {
-                    if let Err(error) = bytes.replay(|chunk| self.advance_vte(screen, chunk)) {
+                    if let Err(error) =
+                        bytes.replay(|chunk| self.advance_after_osc1337(screen, chunk))
+                    {
                         log::warn!("Failed to replay OSC 1337 through VTE: {error}");
                     }
                 }
                 InterceptorResult::Swallow => {}
                 InterceptorResult::Finished(result) => {
                     self.finish_streaming_file_direct(result, screen);
+                }
+            }
+        }
+    }
+
+    fn advance_after_osc1337(&mut self, screen: &mut Screen, bytes: &[u8]) {
+        for byte in bytes {
+            match self.kitty_graphics.advance(*byte) {
+                KittyInterceptorResult::Forward(bytes) => {
+                    self.advance_vte(screen, bytes.as_slice());
+                }
+                KittyInterceptorResult::Swallow => {}
+                KittyInterceptorResult::Captured(raw) => {
+                    self.kitty_graphics.handle(&raw, screen);
                 }
             }
         }
@@ -3561,6 +3581,25 @@ mod tests {
                 b"\x1b[?2;0;320;200S".to_vec(),
                 b"\x1b[?2;0;320;200S".to_vec(),
             ]
+        );
+    }
+
+    #[test]
+    fn kitty_graphics_apc_is_captured_alongside_plain_vte_input() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"a\x1b_Ga=T,f=32,s=1,v=1,i=7,C=1;/wAA/w==\x1b\\b",
+        );
+
+        assert_eq!(screen.images().len(), 1);
+        assert_eq!(&screen.images()[0].data[..], &[255, 0, 0, 255]);
+        assert_eq!(screen.grid().row(0).unwrap().text(), "ab");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]
         );
     }
 }
