@@ -7,9 +7,9 @@ use std::collections::HashMap;
 
 use objc2::rc::Retained;
 use objc2::runtime::Sel;
-use objc2::{class, define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AllocAnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSButton, NSEvent, NSMenu, NSMenuItem, NSStackView, NSStackViewGravity,
+    NSButton, NSColor, NSEvent, NSMenu, NSMenuItem, NSStackView, NSStackViewGravity,
     NSUserInterfaceLayoutOrientation,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
@@ -109,20 +109,13 @@ impl TabBar {
         }
 
         // Enable layer backing and set background color for visibility
-        unsafe {
-            let _: () = msg_send![&*this, setWantsLayer: true];
-            let layer: *mut objc2::runtime::AnyObject = msg_send![&*this, layer];
-            if !layer.is_null() {
-                // Light gray background
-                let cg_color: *mut objc2::runtime::AnyObject = msg_send![
-                    class!(NSColor),
-                    colorWithRed: 0.9f64,
-                    green: 0.9f64,
-                    blue: 0.9f64,
-                    alpha: 1.0f64
-                ];
-                let cg_color_ref: *mut objc2::runtime::AnyObject = msg_send![cg_color, CGColor];
-                let _: () = msg_send![layer, setBackgroundColor: cg_color_ref];
+        this.setWantsLayer(true);
+        if let Some(layer) = this.layer() {
+            // Light gray background
+            unsafe {
+                let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.9, 0.9, 0.9, 1.0);
+                let cg_color = color.CGColor();
+                layer.setBackgroundColor(Some(&cg_color));
             }
         }
 
@@ -251,36 +244,33 @@ impl TabBar {
                 tab.color = color.map(|s| s.to_string());
 
                 // Apply color to button background using layer
-                unsafe {
-                    let _: () = msg_send![&*tab.button, setWantsLayer: true];
-                    let layer: *mut objc2::runtime::AnyObject = msg_send![&*tab.button, layer];
-                    if !layer.is_null() {
-                        if let Some(hex) = color {
-                            // Parse hex color (e.g., "#E95420" or "E95420")
-                            let hex = hex.trim_start_matches('#');
-                            if hex.len() == 6 {
-                                if let (Ok(r), Ok(g), Ok(b)) = (
-                                    u8::from_str_radix(&hex[0..2], 16),
-                                    u8::from_str_radix(&hex[2..4], 16),
-                                    u8::from_str_radix(&hex[4..6], 16),
-                                ) {
-                                    let ns_color: *mut objc2::runtime::AnyObject = msg_send![
-                                        class!(NSColor),
-                                        colorWithRed: (r as f64 / 255.0),
-                                        green: (g as f64 / 255.0),
-                                        blue: (b as f64 / 255.0),
-                                        alpha: 1.0f64
-                                    ];
-                                    let cg_color: *mut objc2::runtime::AnyObject =
-                                        msg_send![ns_color, CGColor];
-                                    let _: () = msg_send![layer, setBackgroundColor: cg_color];
-                                    let _: () = msg_send![layer, setCornerRadius: 4.0f64];
+                tab.button.setWantsLayer(true);
+                if let Some(layer) = tab.button.layer() {
+                    if let Some(hex) = color {
+                        // Parse hex color (e.g., "#E95420" or "E95420")
+                        let hex = hex.trim_start_matches('#');
+                        if hex.len() == 6 {
+                            if let (Ok(r), Ok(g), Ok(b)) = (
+                                u8::from_str_radix(&hex[0..2], 16),
+                                u8::from_str_radix(&hex[2..4], 16),
+                                u8::from_str_radix(&hex[4..6], 16),
+                            ) {
+                                unsafe {
+                                    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+                                        r as f64 / 255.0,
+                                        g as f64 / 255.0,
+                                        b as f64 / 255.0,
+                                        1.0,
+                                    );
+                                    let cg_color = color.CGColor();
+                                    layer.setBackgroundColor(Some(&cg_color));
+                                    layer.setCornerRadius(4.0);
                                 }
                             }
-                        } else {
-                            // Clear the background color
-                            let _: () = msg_send![layer, setBackgroundColor: std::ptr::null::<objc2::runtime::AnyObject>()];
                         }
+                    } else {
+                        // Clear the background color
+                        layer.setBackgroundColor(None);
                     }
                 }
                 break;

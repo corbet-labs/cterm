@@ -8,9 +8,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSMenu,
-    NSMenuItem, NSView, NSWindow, NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode,
-    NSWindowStyleMask, NSWindowTabbingMode,
+    NSAlertFirstButtonReturn, NSAlertStyle, NSApplication, NSAutoresizingMaskOptions, NSColor,
+    NSLayoutAttribute, NSLayoutConstraint, NSLayoutRelation, NSMenu, NSMenuItem, NSView, NSWindow,
+    NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTab,
+    NSWindowTabbingMode,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -2289,16 +2290,8 @@ impl CtermWindow {
             tv.set_tab_color_on_daemon(color.unwrap_or(""));
         }
 
-        unsafe {
-            // Get the window's tab object
-            let tab: *mut objc2::runtime::AnyObject = msg_send![self, tab];
-            if tab.is_null() {
-                log::debug!("No tab object available, stored for later");
-                return;
-            }
-
-            self.apply_tab_color_to_tab(tab, color);
-        }
+        let tab = self.tab();
+        self.apply_tab_color_to_tab(&tab, color);
     }
 
     /// Apply pending tab color if the tab is now available
@@ -2309,19 +2302,12 @@ impl CtermWindow {
             return true; // Nothing to apply
         }
 
-        unsafe {
-            let tab: *mut objc2::runtime::AnyObject = msg_send![self, tab];
-            if tab.is_null() {
-                log::debug!("Tab not available yet for pending color");
-                return false;
-            }
-
-            self.apply_tab_color_to_tab(tab, pending.as_deref());
-            // Clear pending after successful application
-            *self.ivars().pending_tab_color.borrow_mut() = None;
-            log::debug!("Applied pending tab color: {:?}", pending);
-            true
-        }
+        let tab = self.tab();
+        self.apply_tab_color_to_tab(&tab, pending.as_deref());
+        // Clear pending after successful application
+        *self.ivars().pending_tab_color.borrow_mut() = None;
+        log::debug!("Applied pending tab color: {:?}", pending);
+        true
     }
 
     /// Schedule a retry for applying tab color after a short delay
@@ -2337,11 +2323,7 @@ impl CtermWindow {
     }
 
     /// Internal: Apply color to a tab object
-    unsafe fn apply_tab_color_to_tab(
-        &self,
-        tab: *mut objc2::runtime::AnyObject,
-        color: Option<&str>,
-    ) {
+    fn apply_tab_color_to_tab(&self, tab: &NSWindowTab, color: Option<&str>) {
         if let Some(hex) = color {
             // Parse hex color
             let hex = hex.trim_start_matches('#');
@@ -2352,63 +2334,62 @@ impl CtermWindow {
                     u8::from_str_radix(&hex[4..6], 16),
                 ) {
                     // Create a small colored circle view
+                    let mtm = MainThreadMarker::from(self);
                     let frame = NSRect::new(NSPoint::ZERO, NSSize::new(12.0, 12.0));
-                    let view: *mut objc2::runtime::AnyObject =
-                        msg_send![objc2::class!(NSView), alloc];
-                    let view: *mut objc2::runtime::AnyObject =
-                        msg_send![view, initWithFrame: frame];
+                    let view = unsafe { NSView::initWithFrame(mtm.alloc(), frame) };
 
                     // Enable layer-backing and set the background color
-                    let _: () = msg_send![view, setWantsLayer: true];
-                    let layer: *mut objc2::runtime::AnyObject = msg_send![view, layer];
-                    if !layer.is_null() {
+                    view.setWantsLayer(true);
+                    if let Some(layer) = view.layer() {
                         // Create NSColor from RGB
-                        let ns_color: *mut objc2::runtime::AnyObject = msg_send![
-                            objc2::class!(NSColor),
-                            colorWithRed: (r as f64 / 255.0),
-                            green: (g as f64 / 255.0),
-                            blue: (b as f64 / 255.0),
-                            alpha: 1.0f64
-                        ];
-                        let cg_color: *mut objc2::runtime::AnyObject = msg_send![ns_color, CGColor];
-                        let _: () = msg_send![layer, setBackgroundColor: cg_color];
-                        // Make it a circle
-                        let _: () = msg_send![layer, setCornerRadius: 6.0f64];
+                        unsafe {
+                            let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+                                r as f64 / 255.0,
+                                g as f64 / 255.0,
+                                b as f64 / 255.0,
+                                1.0,
+                            );
+                            let cg_color = color.CGColor();
+                            layer.setBackgroundColor(Some(&cg_color));
+                            // Make it a circle
+                            layer.setCornerRadius(6.0);
+                        }
                     }
 
                     // Add width and height constraints (required since translatesAutoresizingMaskIntoConstraints is false)
-                    let width_constraint: *mut objc2::runtime::AnyObject = msg_send![
-                        objc2::class!(NSLayoutConstraint),
-                        constraintWithItem: view,
-                        attribute: 7i64,  // NSLayoutAttributeWidth
-                        relatedBy: 0i64,  // NSLayoutRelationEqual
-                        toItem: std::ptr::null::<objc2::runtime::AnyObject>(),
-                        attribute: 0i64,  // NSLayoutAttributeNotAnAttribute
-                        multiplier: 1.0f64,
-                        constant: 12.0f64
-                    ];
-                    let height_constraint: *mut objc2::runtime::AnyObject = msg_send![
-                        objc2::class!(NSLayoutConstraint),
-                        constraintWithItem: view,
-                        attribute: 8i64,  // NSLayoutAttributeHeight
-                        relatedBy: 0i64,  // NSLayoutRelationEqual
-                        toItem: std::ptr::null::<objc2::runtime::AnyObject>(),
-                        attribute: 0i64,  // NSLayoutAttributeNotAnAttribute
-                        multiplier: 1.0f64,
-                        constant: 12.0f64
-                    ];
-                    let _: () = msg_send![width_constraint, setActive: true];
-                    let _: () = msg_send![height_constraint, setActive: true];
+                    let width_constraint = unsafe {
+                        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            &view,
+                            NSLayoutAttribute::Width,
+                            NSLayoutRelation::Equal,
+                            None,
+                            NSLayoutAttribute::NotAnAttribute,
+                            1.0,
+                            12.0,
+                        )
+                    };
+                    let height_constraint = unsafe {
+                        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                            &view,
+                            NSLayoutAttribute::Height,
+                            NSLayoutRelation::Equal,
+                            None,
+                            NSLayoutAttribute::NotAnAttribute,
+                            1.0,
+                            12.0,
+                        )
+                    };
+                    width_constraint.setActive(true);
+                    height_constraint.setActive(true);
 
                     // Set as tab's accessory view
-                    let _: () = msg_send![tab, setAccessoryView: view];
+                    tab.setAccessoryView(Some(&view));
                     log::debug!("Set tab color to #{}", hex);
                 }
             }
         } else {
             // Clear the accessory view
-            let null_view: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
-            let _: () = msg_send![tab, setAccessoryView: null_view];
+            tab.setAccessoryView(None);
         }
     }
 

@@ -523,9 +523,9 @@ impl QuickOpenOverlay {
                 } else {
                     NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.0)
                 };
-                let cg_color: *mut std::ffi::c_void = msg_send![&*color, CGColor];
-                let _: () = msg_send![&*layer, setBackgroundColor: cg_color];
-                let _: () = msg_send![&*layer, setCornerRadius: 4.0f64];
+                let cg_color = color.CGColor();
+                layer.setBackgroundColor(Some(&cg_color));
+                layer.setCornerRadius(4.0);
             }
         }
 
@@ -635,8 +635,8 @@ impl QuickOpenOverlay {
                     } else {
                         NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.0)
                     };
-                    let cg_color: *mut std::ffi::c_void = msg_send![&*color, CGColor];
-                    let _: () = msg_send![&*layer, setBackgroundColor: cg_color];
+                    let cg_color = color.CGColor();
+                    layer.setBackgroundColor(Some(&cg_color));
                 }
             }
         }
