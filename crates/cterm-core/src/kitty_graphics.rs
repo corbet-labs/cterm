@@ -29,6 +29,7 @@ const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 10_000;
 const MAX_SHARED_MEMORY_NAME_BYTES: usize = 2 * 1024;
 const STORE_QUOTA_BYTES: usize = 320 * 1024 * 1024;
+const USAGE_HINT_TRANSIENT: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InterceptorState {
@@ -308,6 +309,7 @@ struct Command {
     quiet: u8,
     suppress_cursor_movement: bool,
     unicode_placeholder: bool,
+    usage_hints: u32,
     delete_specifier: Option<u8>,
     frame_number: u32,
     other_frame_number: u32,
@@ -348,6 +350,7 @@ impl Default for Command {
             quiet: 0,
             suppress_cursor_movement: false,
             unicode_placeholder: false,
+            usage_hints: 0,
             delete_specifier: None,
             frame_number: 0,
             other_frame_number: 0,
@@ -371,6 +374,10 @@ impl Command {
             placement_id: self.placement_id,
             quiet: self.quiet,
         }
+    }
+
+    fn is_transient(&self) -> bool {
+        self.usage_hints & USAGE_HINT_TRANSIENT != 0
     }
 }
 
@@ -667,6 +674,7 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
                     }
                 }
             }
+            b"N" => command.usage_hints = required_u32(value, echo, "invalid usage hints")?,
             _ => {}
         }
     }
@@ -962,6 +970,7 @@ fn decode_png(data: Vec<u8>, echo: EchoFields) -> Result<DecodedImage, ProtocolE
 struct AnimationFrame {
     rgba: Arc<Vec<u8>>,
     gap_ms: u32,
+    transient: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -993,6 +1002,10 @@ impl StoredImage {
             .iter()
             .map(|frame| u64::from(frame.gap_ms))
             .sum()
+    }
+
+    fn is_transient(&self) -> bool {
+        self.frames.first().is_some_and(|frame| frame.transient)
     }
 }
 
@@ -1184,7 +1197,11 @@ impl KittyGraphics {
                 rgba: Arc::clone(&rgba),
                 width: image.width,
                 height: image.height,
-                frames: vec![AnimationFrame { rgba, gap_ms: 0 }],
+                frames: vec![AnimationFrame {
+                    rgba,
+                    gap_ms: 0,
+                    transient: command.is_transient(),
+                }],
                 current_frame: 0,
                 animation_state: AnimationState::Stopped,
                 max_loops: 0,
@@ -1228,6 +1245,16 @@ impl KittyGraphics {
                 .error(ErrorCode::Invalid, "frame to edit does not exist"));
         }
         let canvas_bytes = image.rgba.len();
+        let base_transient = if let Some(index) = edit_index {
+            image.frames[index].transient
+        } else if let Some(index) = command.other_frame_number.checked_sub(1) {
+            image
+                .frames
+                .get(index as usize)
+                .is_some_and(|frame| frame.transient)
+        } else {
+            false
+        };
         if edit_index.is_none() {
             self.evict_additional_to_fit(canvas_bytes, image_id, screen);
             if self
@@ -1291,6 +1318,7 @@ impl KittyGraphics {
             image.frames[index] = AnimationFrame {
                 rgba: Arc::new(canvas),
                 gap_ms,
+                transient: base_transient || command.is_transient(),
             };
             if index == image.current_frame {
                 image.refresh_current();
@@ -1304,6 +1332,7 @@ impl KittyGraphics {
             image.frames.push(AnimationFrame {
                 rgba: Arc::new(canvas),
                 gap_ms,
+                transient: base_transient || command.is_transient(),
             });
             self.total_bytes = self.total_bytes.saturating_add(canvas_bytes);
         }
@@ -1428,6 +1457,8 @@ impl KittyGraphics {
         }
 
         let source = Arc::clone(&image.frames[source_index].rgba);
+        let transient =
+            image.frames[source_index].transient || image.frames[destination_index].transient;
         let mut destination = image.frames[destination_index].rgba.as_ref().clone();
         composite_rgba_region(
             &mut destination,
@@ -1447,6 +1478,7 @@ impl KittyGraphics {
             .get_mut(&image_id)
             .expect("resolved image exists");
         image.frames[destination_index].rgba = Arc::new(destination);
+        image.frames[destination_index].transient = transient;
         let refresh_placements = destination_index == image.current_frame;
         if refresh_placements {
             image.refresh_current();
@@ -2076,7 +2108,7 @@ impl KittyGraphics {
                 .images
                 .iter()
                 .filter(|(id, _)| Some(**id) != replacement_id && !self.image_has_placements(**id))
-                .min_by_key(|(_, image)| image.lru)
+                .min_by_key(|(_, image)| (!image.is_transient(), image.lru))
                 .map(|(id, _)| *id)
             else {
                 break;
@@ -2102,7 +2134,7 @@ impl KittyGraphics {
                 .images
                 .iter()
                 .filter(|(id, _)| **id != protected_image_id && !self.image_has_placements(**id))
-                .min_by_key(|(_, image)| image.lru)
+                .min_by_key(|(_, image)| (!image.is_transient(), image.lru))
                 .map(|(id, _)| *id)
             else {
                 break;
@@ -3102,6 +3134,63 @@ mod tests {
         let edited = &graphics.images[&72].frames[1];
         assert_eq!(edited.rgba.as_slice(), [1, 2, 3, 255, 9, 8, 7, 255]);
         assert_eq!(edited.gap_ms, 40);
+    }
+
+    #[test]
+    fn transient_usage_hints_propagate_through_frame_composition() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=76,N=2", &[1, 2, 3, 255]),
+        );
+        assert!(!graphics.images[&76].frames[0].transient);
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=f,i=76,f=32,s=1,v=1,X=1,N=1", &[4, 5, 6, 255]),
+        );
+        assert!(graphics.images[&76].frames[1].transient);
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=c,i=76,r=2,c=1,C=1\x1b\\",
+        );
+        assert!(graphics.images[&76].frames[0].transient);
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=f,i=76,c=1,f=32,s=1,v=1,X=1", &[7, 8, 9, 255]),
+        );
+        assert!(
+            graphics.images[&76].frames[2].transient,
+            "a frame based on transient data inherits the hint"
+        );
+    }
+
+    #[test]
+    fn transient_unplaced_images_are_evicted_before_older_regular_images() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=77", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=78,N=1", &[4, 5, 6, 255]),
+        );
+
+        graphics.evict_to_fit(STORE_QUOTA_BYTES - 4, None, &mut screen);
+
+        assert!(graphics.images.contains_key(&77));
+        assert!(!graphics.images.contains_key(&78));
     }
 
     #[test]
