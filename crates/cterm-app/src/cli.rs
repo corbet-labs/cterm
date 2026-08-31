@@ -7,7 +7,7 @@ use std::str::FromStr;
 
 use crate::config::Config;
 
-fn merge_environment(
+pub(crate) fn merge_environment(
     configured: impl IntoIterator<Item = (String, String)>,
     explicit: impl IntoIterator<Item = (String, String)>,
     case_insensitive: bool,

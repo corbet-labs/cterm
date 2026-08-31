@@ -17,6 +17,7 @@ pub mod quick_open;
 pub mod session;
 pub mod shortcuts;
 pub mod ssh_history;
+pub mod template_launch;
 pub mod upgrade;
 
 pub use config::{
@@ -35,6 +36,11 @@ pub use git_sync::{
 };
 pub use session::{Session, TabState, WindowState};
 pub use shortcuts::ShortcutManager;
+pub use template_launch::{
+    TemplateAppearance, TemplateDaemonTarget, TemplateInstancePolicy, TemplateLaunchPlan,
+    TemplateLaunchPlanError, TemplateLaunchTarget, TemplateNamedRemote, TemplateWorkspace,
+    TemplateWorkspaceLocation, TemplateWorkspaceSource,
+};
 pub use upgrade::{execute_upgrade, receive_upgrade, UpgradeError};
 pub use upgrade::{UpdateError, UpdateInfo, Updater, UpgradeState};
 
