@@ -252,13 +252,20 @@ pub(crate) fn parse_text_size_request(params: &[&[u8]]) -> Option<TextSizeReques
         }
         bytes.extend_from_slice(part);
     }
-    let text: String = String::from_utf8_lossy(&bytes)
+    let mut text: String = String::from_utf8_lossy(&bytes)
         .chars()
         .filter(|character| {
             let codepoint = *character as u32;
             codepoint >= 0x20 && !(0x7f..=0x9f).contains(&codepoint)
         })
         .collect();
+    if text.len() > MAX_TEXT_SIZE_PAYLOAD_BYTES {
+        let mut end = MAX_TEXT_SIZE_PAYLOAD_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
     if text.is_empty() {
         return None;
     }
@@ -350,6 +357,15 @@ mod tests {
         let request =
             parse_text_size_request(&[b"66", b"w=1", b"a\x01\xffb"]).expect("valid request");
         assert_eq!(request.text, "a\u{fffd}b");
+    }
+
+    #[test]
+    fn replacement_characters_cannot_expand_past_the_payload_bound() {
+        let invalid = vec![0xff; MAX_TEXT_SIZE_PAYLOAD_BYTES];
+        let request = parse_text_size_request(&[b"66", b"w=1", &invalid])
+            .expect("bounded invalid UTF-8 request");
+        assert!(request.text.len() <= MAX_TEXT_SIZE_PAYLOAD_BYTES);
+        assert!(std::str::from_utf8(request.text.as_bytes()).is_ok());
     }
 
     #[test]
