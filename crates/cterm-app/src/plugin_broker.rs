@@ -863,10 +863,11 @@ allow = ["cterm:new-tab"]
             "x".repeat(4096)
         ));
         #[cfg(windows)]
-        let host = responding_host(format!(
-            "$b=New-Object byte[] {}; [Console]::OpenStandardOutput().Write($b,0,$b.Length)",
-            MAX_FRAME_BYTES + 1
-        ));
+        let host = responding_host(
+            "$o=[Console]::OpenStandardOutput(); \
+             $b=[Text.Encoding]::ASCII.GetBytes('x' * 4096); \
+             for($i=0;$i -lt 257;$i++){$o.Write($b,0,$b.Length)}",
+        );
         let broker = PluginBroker::for_test(
             host,
             fixture.plugins_root.clone(),
