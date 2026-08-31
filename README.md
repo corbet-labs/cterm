@@ -49,14 +49,14 @@ A high-performance, customizable terminal emulator built in Rust. cterm uses nat
 | macOS (Intel/Apple Silicon) | AppKit/CoreGraphics | Native build, unit/integration tests, and UI automation |
 | Windows x64 | Win32/Direct2D + ConPTY | Native build, unit/integration tests, and UI automation |
 | Linux x86_64/ARM64 | GTK4 on Wayland only | Native build, unit/integration tests, and a headless-Wayland UI smoke test |
-| FreeBSD 14.4 | Experimental GTK4/Wayland source build | Native client/daemon build plus portable library and daemon-integration tests in a FreeBSD VM; compositor UI smoke and packages still pending |
+| FreeBSD 14.4 | Experimental GTK4/Wayland source build | Native client/daemon build, library and daemon-integration tests, plus a compositor-backed Wayland UI smoke test in FreeBSD VMs; packages still pending |
 | Android/iOS | Not currently supported | Distant local-terminal targets; no release or CI contract yet |
 
 The three production desktop renderers display terminal text, selections,
 cursor shapes, Sixel images, and text attributes natively. FreeBSD reuses the
-GTK4/Wayland frontend and now has a hard native compile contract, but is not a
-packaged release target yet. Linux builds do not include or test an X11
-fallback.
+GTK4/Wayland frontend and has hard native build, test, and compositor-backed UI
+contracts, but is not a packaged release target yet. Linux builds do not
+include or test an X11 fallback.
 
 ## Installation
 
@@ -178,9 +178,10 @@ Configuration files are stored in platform-specific locations:
 
 See [docs/configuration.md](docs/configuration.md) for detailed configuration options.
 
-The fail-closed command-plugin package and ABI foundation is documented in
-[docs/plugins.md](docs/plugins.md). Plugin execution and UI discovery are not
-enabled yet.
+The fail-closed command-plugin package, ABI, isolated runner, deterministic
+discovery, and machine-local grant foundation are documented in
+[docs/plugins.md](docs/plugins.md). Native permission prompts and UI command
+integration are not enabled yet.
 
 ## Keyboard Shortcuts
 

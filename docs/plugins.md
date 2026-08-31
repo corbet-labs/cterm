@@ -1,9 +1,10 @@
 # Command plugin architecture
 
 cterm's plugin work currently provides a fail-closed package and ABI
-foundation, an isolated one-shot runner, and an application-side broker. It
-does **not** yet discover or execute plugins in released UI builds. Permission
-prompts, grant-file persistence, and frontend command integration are the next
+foundation, an isolated one-shot runner, an application-side broker,
+deterministic package discovery, and bounded machine-local grant persistence.
+It does **not** yet expose or execute plugin commands in released UI builds.
+Native permission prompts and frontend command integration are the next
 implementation stage. Release packages already include the runner as a
 verified sibling executable.
 
@@ -76,10 +77,23 @@ again with a `limit + 1` bounded read. Length changes between metadata, open,
 and completed read are rejected, so sparse oversized files and concurrent
 growth cannot bypass the in-memory bounds.
 
-Grants are machine-local integrity decisions. Frontend integration will store
-them in the platform local-data directory using atomic replacement, outside
-cterm's Git-synchronized configuration. The broker accepts a validated
-in-memory grant store and never creates or expands grants itself.
+Grants are machine-local integrity decisions. They are stored as a bounded
+`plugin-grants.toml` in the platform local-data directory using a
+same-directory atomic replacement, outside cterm's Git-synchronized
+configuration. On Unix the file is mode `0600`, and the file plus its parent
+directory are synced before success is reported. Failed serialization,
+validation, or replacement does not mutate the live in-memory grant store.
+The broker accepts a validated in-memory grant store and never creates or
+expands grants itself.
+
+## Discovery
+
+The application catalog examines only direct directories below the local-data
+`plugins/` root. Directory links are rejected, a package must remain a direct
+child after canonicalization, and its directory name must exactly match its
+manifest ID. Valid commands are returned in stable plugin-ID/command-ID order.
+Malformed packages are reported individually and cannot hide valid neighbors;
+ordinary non-directory files are ignored.
 
 ## Application broker
 
