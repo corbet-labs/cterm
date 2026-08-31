@@ -13,6 +13,7 @@ components listed here. The original notices are preserved in the derived files.
 | Zellij | `e839bfffa586992364309a685b2c71f3b23c247e` | Adapted all-or-none bounded control-string interception and split/recovery test structure for streamed OSC 1337 in `cterm-core` | MIT |
 | Wasmi / `wasmi_wasi` | `c517895c2db09f660d6eae0bc4549861ab8fd88f` (`v1.1.0`) | Pinned Cargo runtime and WASIp1 adapter used only by the isolated `cterm-plugin-host`; no source copied | MIT OR Apache-2.0 (cterm distributes under the MIT option) |
 | Bytecode Alliance `wasi-common` | `3d0ec7e7c5ae4cd3f9b99d915276926d799b9a2b` (`v36.0.14`, constrained to the patched 36.x line) | Directly constrained transitive WASIp1 context and bounded virtual pipes for `cterm-plugin-host`; no source copied | Apache-2.0 WITH LLVM-exception |
+| `process-wrap` | `c8d6b1faa1dc54723e11df5f2026e61e05e93950` (`v10.0.0`) | Pinned Cargo process-group and Windows Job Object lifecycle used by the application plugin broker; no source copied | Apache-2.0 OR MIT, with identified Windows routines Apache-2.0-only |
 
 The KarpelesLab/cterm source incorporated at the fork base retains its original
 MIT grant and notice in `LICENSES/KARPELESLAB-CTERM-MIT.txt`. Subsequent cterm
@@ -21,6 +22,9 @@ contributions are provided under FSL-1.1-ALv2; see `LICENSE`.
 The selected Wasmi MIT notice is preserved in `LICENSES/WASMI-MIT.txt`.
 `wasi-common`'s Apache-2.0 license with LLVM exception is preserved in
 `LICENSES/WASI-COMMON-APACHE-2.0-WITH-LLVM-EXCEPTION.txt`.
+The `process-wrap` provenance notice and MIT option are preserved in
+`LICENSES/PROCESS-WRAP-COPYRIGHT.txt` and `LICENSES/PROCESS-WRAP-MIT.txt`; the
+full Apache-2.0 terms are also present in the `wasi-common` license file.
 
 ## Rio / Sugarloaf MIT license
 

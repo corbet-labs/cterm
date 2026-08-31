@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -425,6 +426,8 @@ pub enum PluginPackageError {
     PathEscapesBundle(PathBuf),
     #[error("plugin {kind} exceeds its {limit}-byte limit")]
     FileTooLarge { kind: &'static str, limit: usize },
+    #[error("plugin file `{0}` changed length while it was being read")]
+    FileChangedDuringRead(PathBuf),
     #[error("plugin manifest is not UTF-8: {0}")]
     ManifestEncoding(#[source] std::str::Utf8Error),
     #[error("invalid plugin manifest: {0}")]
@@ -488,12 +491,51 @@ fn read_limited(
     limit: usize,
     kind: &'static str,
 ) -> Result<Vec<u8>, PluginPackageError> {
-    let bytes = fs::read(path).map_err(|source| PluginPackageError::Io {
+    let map_io = |source| PluginPackageError::Io {
         path: path.to_path_buf(),
         source,
-    })?;
+    };
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+
+    let advertised = fs::metadata(path).map_err(map_io)?;
+    if advertised.len() > limit_u64 {
+        return Err(PluginPackageError::FileTooLarge { kind, limit });
+    }
+
+    let mut file = fs::File::open(path).map_err(map_io)?;
+    let opened = file.metadata().map_err(map_io)?;
+    if !opened.is_file() {
+        return Err(map_io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )));
+    }
+    if opened.len() > limit_u64 {
+        return Err(PluginPackageError::FileTooLarge { kind, limit });
+    }
+    if advertised.len() != opened.len() {
+        return Err(PluginPackageError::FileChangedDuringRead(
+            path.to_path_buf(),
+        ));
+    }
+
+    let capacity = usize::try_from(opened.len()).unwrap_or(limit).min(limit);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(limit_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(map_io)?;
     if bytes.len() > limit {
         return Err(PluginPackageError::FileTooLarge { kind, limit });
+    }
+
+    let final_length = file.metadata().map_err(map_io)?.len();
+    if final_length != opened.len()
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != final_length
+    {
+        return Err(PluginPackageError::FileChangedDuringRead(
+            path.to_path_buf(),
+        ));
     }
     Ok(bytes)
 }
@@ -700,6 +742,22 @@ allow = ["cterm:find-text", "cterm:new-tab"]
         assert!(matches!(
             PluginBundle::load(directory.path()),
             Err(PluginPackageError::InvalidWasmModule)
+        ));
+    }
+
+    #[test]
+    fn oversized_sparse_module_is_rejected_before_allocation() {
+        let directory = valid_bundle(VALID_MANIFEST);
+        let module = fs::File::create(directory.path().join(MODULE_FILE)).unwrap();
+        let advertised_size = u64::try_from(BundleLimits::default().module_bytes).unwrap() + 1;
+        module.set_len(advertised_size).unwrap();
+
+        assert!(matches!(
+            PluginBundle::load(directory.path()),
+            Err(PluginPackageError::FileTooLarge {
+                kind: "WebAssembly module",
+                ..
+            })
         ));
     }
 

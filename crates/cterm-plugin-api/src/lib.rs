@@ -24,3 +24,11 @@ pub use wire::{
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/cterm.plugin.v1.rs"));
 }
+
+/// Package-relative executable name used by the application broker.
+#[cfg(windows)]
+pub const PLUGIN_HOST_EXECUTABLE_NAME: &str = "cterm-plugin-host.exe";
+
+/// Package-relative executable name used by the application broker.
+#[cfg(not(windows))]
+pub const PLUGIN_HOST_EXECUTABLE_NAME: &str = "cterm-plugin-host";

@@ -14,8 +14,11 @@ is omitted for readability.
   strict manifests, content-addressed trust, exact per-action grants, and a
   bounded versioned protobuf ABI, plus a separate one-shot Wasmi/WASIp1 runner
   with digest revalidation, fuel, memory, stack, table, input, and output
-  limits. Broker grant enforcement, wall timeout, packaging, and UI discovery
-  remain a subsequent stage.
+  limits. The application-side broker adds canonical package-relative host and
+  plugin resolution, exact pre/post-execution grant enforcement, bounded
+  framed process I/O, a strict wall timeout, and Unix process-group / Windows
+  Job Object termination. Release packages include the runner; grant
+  prompts/persistence and UI discovery remain a subsequent stage.
 - Native FreeBSD builds now compile the GTK4/Wayland client and daemon and run
   their portable library and daemon-integration tests in a FreeBSD 14.4 VM.
 - Foot-compatible independent cursor blink sources and native cursor/text
@@ -29,6 +32,9 @@ is omitted for readability.
   unique and private, and failed receptions remove their temporary storage.
 
 ### Security
+- Plugin package files are size-checked before allocation, read through a
+  strict `limit + 1` bound, and rejected if their length changes during the
+  read.
 - Added a hard RustSec advisory gate, upgraded `anyhow`, `bytes`, `h2`, and
   `tar` to patched compatible releases, and removed the unused, unmaintained
   `bincode` dependency.

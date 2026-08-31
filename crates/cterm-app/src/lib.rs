@@ -13,6 +13,7 @@ pub mod file_drop;
 pub mod file_transfer;
 pub mod git_sync;
 pub mod log_capture;
+pub mod plugin_broker;
 pub mod quick_open;
 pub mod session;
 pub mod shortcuts;
@@ -34,6 +35,7 @@ pub use git_sync::{
     is_git_repo, prepare_working_directory, pull_with_conflict_resolution, GitError, InitResult,
     PullResult, SyncStatus,
 };
+pub use plugin_broker::{PluginBroker, PluginBrokerError, PluginBrokerOutput, PluginBrokerTimeout};
 pub use session::{Session, TabState, WindowState};
 pub use shortcuts::ShortcutManager;
 pub use template_launch::{

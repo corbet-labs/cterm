@@ -8,13 +8,6 @@
 mod framing;
 mod runtime;
 
+pub use cterm_plugin_api::PLUGIN_HOST_EXECUTABLE_NAME as HOST_EXECUTABLE_NAME;
 pub use framing::{read_bounded, BoundedReadError};
 pub use runtime::{invoke, InvocationLimits, InvocationOutput, RunnerError};
-
-/// Package-relative executable name reserved for the application broker.
-#[cfg(windows)]
-pub const HOST_EXECUTABLE_NAME: &str = "cterm-plugin-host.exe";
-
-/// Package-relative executable name reserved for the application broker.
-#[cfg(not(windows))]
-pub const HOST_EXECUTABLE_NAME: &str = "cterm-plugin-host";
