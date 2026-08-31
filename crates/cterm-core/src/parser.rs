@@ -20,6 +20,7 @@ use crate::keyboard::KeyboardEnhancementFlags;
 use crate::kitty_graphics::{
     GraphicsAnimationTick, InterceptorResult as KittyInterceptorResult, KittyGraphics,
 };
+use crate::multiple_cursors::{ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorShape};
 use crate::osc1337::{InterceptorResult, Osc1337Interceptor};
 #[cfg(test)]
 use crate::screen::DesktopNotificationAction;
@@ -1149,6 +1150,9 @@ impl vte::Perform for ScreenPerformer<'_> {
                     );
                 }
             }
+            // Kitty multiple-cursors protocol. The private marker and the
+            // trailing space are both presented as CSI intermediates by VTE.
+            ('q', [b'>', b' ']) => self.handle_multiple_cursors(params),
             // Query the active kitty keyboard progressive-enhancement flags.
             ('u', [b'?']) => {
                 let flags = self.screen.keyboard_enhancement_flags().bits();
@@ -1257,6 +1261,7 @@ impl vte::Perform for ScreenPerformer<'_> {
                 self.screen.modes.insert_mode = false;
                 self.screen.modes.origin_mode = false;
                 self.screen.reset_scroll_region();
+                self.screen.reset_extra_cursors();
             }
             // Set cursor style (DECSCUSR)
             ('q', [b' ']) => {
@@ -1596,6 +1601,96 @@ fn xtgettcap_capability(name: &[u8], cols: usize, lines: usize) -> Option<Xtgett
 }
 
 impl ScreenPerformer<'_> {
+    fn handle_multiple_cursors(&mut self, params: &Params) {
+        let groups = params.iter().collect::<Vec<_>>();
+        if groups.is_empty() {
+            self.screen.queue_extra_cursor_support_response();
+            return;
+        }
+
+        let Some(&command) = groups[0].first() else {
+            self.screen.queue_extra_cursor_support_response();
+            return;
+        };
+        if groups.len() == 1 {
+            match command {
+                0 => self.screen.queue_extra_cursor_support_response(),
+                100 => self.screen.queue_extra_cursor_state_response(),
+                101 => self.screen.queue_extra_cursor_color_response(),
+                _ => {}
+            }
+            return;
+        }
+
+        if matches!(command, 30 | 40) {
+            let Some(color) = groups
+                .get(1)
+                .and_then(|params| ExtraCursorColor::parse(params))
+            else {
+                return;
+            };
+            let target = if command == 30 {
+                ExtraCursorColorTarget::Text
+            } else {
+                ExtraCursorColorTarget::Cursor
+            };
+            self.screen.set_extra_cursor_color(target, color);
+            return;
+        }
+
+        let shape = if command == 0 {
+            None
+        } else {
+            let Some(shape) = ExtraCursorShape::from_protocol(command) else {
+                return;
+            };
+            Some(shape)
+        };
+
+        for coordinates in &groups[1..] {
+            let Some(&coordinate_type) = coordinates.first() else {
+                continue;
+            };
+            match coordinate_type {
+                0 => {
+                    let point = (self.screen.cursor.row, self.screen.cursor.col);
+                    self.screen.set_extra_cursor_points(shape, [point]);
+                }
+                2 => {
+                    let points = coordinates[1..]
+                        .chunks_exact(2)
+                        .filter_map(|pair| {
+                            Some((
+                                pair[0].checked_sub(1)? as usize,
+                                pair[1].checked_sub(1)? as usize,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    self.screen.set_extra_cursor_points(shape, points);
+                }
+                4 => {
+                    let rectangles = coordinates[1..]
+                        .chunks_exact(4)
+                        .filter_map(|rectangle| {
+                            Some((
+                                rectangle[0].checked_sub(1)? as usize,
+                                rectangle[1].checked_sub(1)? as usize,
+                                rectangle[2].checked_sub(1)? as usize,
+                                rectangle[3].checked_sub(1)? as usize,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    self.screen.set_extra_cursor_rectangles(
+                        shape,
+                        &rectangles,
+                        coordinates.len() == 1,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn handle_osc99(&mut self, params: &[&[u8]], bell_terminated: bool) {
         use base64::Engine as _;
 
@@ -2786,6 +2881,55 @@ mod tests {
         let bold_only = screen.get_cell(0, 2).unwrap().attrs;
         assert!(bold_only.contains(CellAttrs::BOLD));
         assert!(!bold_only.contains(CellAttrs::DIM));
+    }
+
+    #[test]
+    fn test_kitty_multiple_cursors_protocol_queries_updates_and_clears() {
+        let mut screen = Screen::new(5, 4, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[> q");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>1;2;3;29;30;40;100;101 q"]
+        );
+
+        parser.parse(
+            &mut screen,
+            b"\x1b[>29;4:2:2:3:3 q\x1b[>2;2:1:5;3:2 q\x1b[>100 q",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>100;2:2:1:5;29:2:2:2;29:2:2:3;29:2:3:2;29:2:3:3 q"]
+        );
+
+        // Incomplete point/rectangle coordinates and zero underflow are
+        // ignored. Coordinate type zero addresses the current main cursor.
+        screen.move_cursor(3, 1);
+        parser.parse(
+            &mut screen,
+            b"\x1b[>3;2:1;2:0:1;4:1:1:2 q\x1b[>3;0 q\x1b[>100 q",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>100;2:2:1:5;29:2:2:2;29:2:2:3;29:2:3:2;29:2:3:3;3:2:4:2 q"]
+        );
+
+        parser.parse(&mut screen, b"\x1b[>30;2:1:2:3 q\x1b[>40;5:13 q\x1b[>101 q");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>101;30:2:1:2:3;40:5:13 q"]
+        );
+
+        parser.parse(&mut screen, b"\x1b[!p\x1b[>100 q\x1b[>101 q");
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![b"\x1b[>100 q".to_vec(), b"\x1b[>101;30:0;40:0 q".to_vec()]
+        );
+
+        parser.parse(&mut screen, b"\x1b[>1;4 q\x1b[?1049h\x1b[>100 q");
+        assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>100 q"]);
+        assert!(!screen.has_extra_cursors());
     }
 
     #[test]

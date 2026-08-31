@@ -62,7 +62,7 @@ impl BlinkNeeds {
     /// Inspect only the visible viewport, mirroring foot's redraw scan.
     pub fn for_screen(screen: &Screen) -> Self {
         let mut needs = Self {
-            cursor: screen.modes.show_cursor
+            cursor: (screen.modes.show_cursor || screen.has_extra_cursors())
                 && screen.scroll_offset == 0
                 && screen.cursor.blink.enabled(),
             ..Self::default()

@@ -1,9 +1,10 @@
 //! gRPC TerminalService implementation
 
 use crate::convert::{
-    cell_to_proto, cursor_to_proto, event_to_proto, modes_to_proto, proto_to_cursor_style,
-    proto_to_frontend_state, proto_to_key, proto_to_modifiers, proto_to_palette, screen_to_proto,
-    screen_to_text, terminal_images_to_proto, visible_rows_to_proto,
+    cell_to_proto, cursor_to_proto, event_to_proto, extra_cursors_to_proto, modes_to_proto,
+    proto_to_cursor_style, proto_to_frontend_state, proto_to_key, proto_to_modifiers,
+    proto_to_palette, screen_to_proto, screen_to_text, terminal_images_to_proto,
+    visible_rows_to_proto,
 };
 use crate::proto::terminal_service_server::TerminalService;
 use crate::proto::*;
@@ -861,6 +862,11 @@ impl TerminalService for TerminalServiceImpl {
         } else {
             Vec::new()
         };
+        let mut cached_extra_cursors: Option<ExtraCursorsUpdate> = if incremental {
+            Some(session_ref.with_terminal(|term| extra_cursors_to_proto(term.screen())))
+        } else {
+            None
+        };
         // After a lag event, force a full screen resync
         let mut needs_full_resync = false;
 
@@ -880,6 +886,10 @@ impl TerminalService for TerminalServiceImpl {
                             cached_cursor = screen_data.cursor;
                             cached_modes = screen_data.modes.clone();
                             cached_images = screen_data.images.clone();
+                            cached_extra_cursors = Some(ExtraCursorsUpdate {
+                                cursors: screen_data.extra_cursors.clone(),
+                                colors: screen_data.extra_cursor_colors,
+                            });
                             needs_full_resync = false;
                         }
 
@@ -894,44 +904,53 @@ impl TerminalService for TerminalServiceImpl {
                         }))
                     } else {
                         // Incremental mode: diff current screen against cache
-                        let (dirty_rows, new_rows, cur_cursor, cur_modes, cur_images) = session_ref
-                            .with_terminal(|term| {
-                                let screen = term.screen();
-                                let current_rows = visible_rows_to_proto(screen);
-                                let cursor = cursor_to_proto(screen);
-                                let modes = modes_to_proto(screen);
-                                let images = terminal_images_to_proto(screen);
+                        let (
+                            dirty_rows,
+                            new_rows,
+                            cur_cursor,
+                            cur_modes,
+                            cur_images,
+                            cur_extra_cursors,
+                        ) = session_ref.with_terminal(|term| {
+                            let screen = term.screen();
+                            let current_rows = visible_rows_to_proto(screen);
+                            let cursor = cursor_to_proto(screen);
+                            let modes = modes_to_proto(screen);
+                            let images = terminal_images_to_proto(screen);
+                            let extra_cursors = extra_cursors_to_proto(screen);
 
-                                // Find rows that changed
-                                let mut dirty = Vec::new();
-                                let height = current_rows.len();
-                                let old_height = cached_rows.len();
+                            // Find rows that changed
+                            let mut dirty = Vec::new();
+                            let height = current_rows.len();
+                            let old_height = cached_rows.len();
 
-                                for i in 0..height {
-                                    let changed = if i >= old_height {
-                                        true // new row (screen grew)
-                                    } else {
-                                        current_rows[i] != cached_rows[i]
-                                    };
-                                    if changed {
-                                        dirty.push(DirtyRow {
-                                            row_index: i as u32,
-                                            cells: current_rows[i].cells.clone(),
-                                            wrapped: current_rows[i].wrapped,
-                                            shell_prompt: current_rows[i].shell_prompt,
-                                            command_start: current_rows[i].command_start,
-                                            command_end: current_rows[i].command_end,
-                                        });
-                                    }
+                            for i in 0..height {
+                                let changed = if i >= old_height {
+                                    true // new row (screen grew)
+                                } else {
+                                    current_rows[i] != cached_rows[i]
+                                };
+                                if changed {
+                                    dirty.push(DirtyRow {
+                                        row_index: i as u32,
+                                        cells: current_rows[i].cells.clone(),
+                                        wrapped: current_rows[i].wrapped,
+                                        shell_prompt: current_rows[i].shell_prompt,
+                                        command_start: current_rows[i].command_start,
+                                        command_end: current_rows[i].command_end,
+                                    });
                                 }
+                            }
 
-                                (dirty, current_rows, cursor, modes, images)
-                            });
+                            (dirty, current_rows, cursor, modes, images, extra_cursors)
+                        });
 
                         // Check cursor and modes changes
                         let cursor_changed = cached_cursor.as_ref() != Some(&cur_cursor);
                         let modes_changed = cached_modes.as_ref() != Some(&cur_modes);
                         let images_changed = cached_images != cur_images;
+                        let extra_cursors_changed =
+                            cached_extra_cursors.as_ref() != Some(&cur_extra_cursors);
 
                         // Update cache
                         cached_rows = new_rows;
@@ -940,6 +959,7 @@ impl TerminalService for TerminalServiceImpl {
                             && !cursor_changed
                             && !modes_changed
                             && !images_changed
+                            && !extra_cursors_changed
                         {
                             // Nothing actually changed (e.g. selection-only update)
                             return None;
@@ -951,6 +971,7 @@ impl TerminalService for TerminalServiceImpl {
                             cached_cursor = Some(cur_cursor);
                             cached_modes = Some(cur_modes);
                             cached_images = cur_images.clone();
+                            cached_extra_cursors = Some(cur_extra_cursors.clone());
                             let drcs_fonts = session_ref.with_terminal(|term| {
                                 cterm_proto::convert::screen::drcs_fonts_to_proto(term.screen())
                             });
@@ -969,6 +990,8 @@ impl TerminalService for TerminalServiceImpl {
                                     modes: cached_modes.clone(),
                                     drcs_fonts,
                                     images: cur_images,
+                                    extra_cursors: cur_extra_cursors.cursors,
+                                    extra_cursor_colors: cur_extra_cursors.colors,
                                 }),
                             };
                             return Some(Ok(ScreenUpdate {
@@ -999,6 +1022,12 @@ impl TerminalService for TerminalServiceImpl {
                         } else {
                             None
                         };
+                        let extra_cursors_update = if extra_cursors_changed {
+                            cached_extra_cursors = Some(cur_extra_cursors.clone());
+                            Some(cur_extra_cursors)
+                        } else {
+                            None
+                        };
 
                         Some(Ok(ScreenUpdate {
                             session_id: session_id.clone(),
@@ -1009,6 +1038,7 @@ impl TerminalService for TerminalServiceImpl {
                                     cursor: cursor_update,
                                     modes: modes_update,
                                     images: images_update,
+                                    extra_cursors: extra_cursors_update,
                                 },
                             )),
                         }))

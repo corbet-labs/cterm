@@ -457,10 +457,17 @@ message DirtyRowsUpdate {
   optional TerminalModes modes = 3;
   // Include the complete image set only when it changed.
   TerminalImages images = 4;
+  // Include the complete multiple-cursor overlay only when it changed.
+  ExtraCursorsUpdate extra_cursors = 5;
 }
 
 message TerminalImages {
   repeated TerminalImage images = 1;
+}
+
+message ExtraCursorsUpdate {
+  repeated ExtraCursor cursors = 1;
+  ExtraCursorColors colors = 2;
 }
 
 message DirtyRow {
@@ -507,6 +514,43 @@ message GetScreenResponse {
   // Inline terminal images. Image lines are absolute indexes into the
   // scrollback-plus-visible buffer represented by this snapshot.
   repeated TerminalImage images = 9;
+  // Kitty multiple-cursor viewport overlays.
+  repeated ExtraCursor extra_cursors = 10;
+  ExtraCursorColors extra_cursor_colors = 11;
+}
+
+message ExtraCursor {
+  uint32 row = 1;
+  uint32 col = 2;
+  ExtraCursorShape shape = 3;
+}
+
+enum ExtraCursorShape {
+  EXTRA_CURSOR_SHAPE_UNSPECIFIED = 0;
+  EXTRA_CURSOR_SHAPE_BLOCK = 1;
+  EXTRA_CURSOR_SHAPE_BAR = 2;
+  EXTRA_CURSOR_SHAPE_UNDERLINE = 3;
+  EXTRA_CURSOR_SHAPE_FOLLOW_MAIN = 4;
+}
+
+message ExtraCursorColors {
+  ExtraCursorColor text = 1;
+  ExtraCursorColor cursor = 2;
+}
+
+message ExtraCursorColor {
+  ExtraCursorColorKind kind = 1;
+  uint32 index = 2;
+  uint32 red = 3;
+  uint32 green = 4;
+  uint32 blue = 5;
+}
+
+enum ExtraCursorColorKind {
+  EXTRA_CURSOR_COLOR_KIND_MAIN = 0;
+  EXTRA_CURSOR_COLOR_KIND_REVERSE = 1;
+  EXTRA_CURSOR_COLOR_KIND_INDEXED = 2;
+  EXTRA_CURSOR_COLOR_KIND_RGB = 3;
 }
 
 message TerminalImage {

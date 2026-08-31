@@ -7,8 +7,8 @@ use cterm_core::drcs::{DrcsFont, DrcsGlyph};
 use cterm_core::grid::Row as CoreRow;
 use cterm_core::term::Terminal;
 use cterm_core::{
-    Cell, CellAttrs, Color, ColorQuery, CursorStyle, MouseEncoding, MouseMode, Screen,
-    TerminalImage,
+    Cell, CellAttrs, Color, ColorQuery, CursorStyle, ExtraCursor, ExtraCursorColor,
+    ExtraCursorColors, ExtraCursorShape, MouseEncoding, MouseMode, Rgb, Screen, TerminalImage,
 };
 use std::sync::Arc;
 
@@ -264,6 +264,8 @@ pub fn screen_to_proto(screen: &Screen, include_scrollback: bool) -> proto::GetS
         modes: Some(modes_to_proto(screen)),
         drcs_fonts: drcs_fonts_to_proto(screen),
         images: terminal_images_to_proto(screen),
+        extra_cursors: screen.extra_cursors().map(extra_cursor_to_proto).collect(),
+        extra_cursor_colors: Some(extra_cursor_colors_to_proto(screen.extra_cursor_colors())),
     }
 }
 
@@ -311,6 +313,107 @@ pub fn proto_to_cursor_style(style: i32) -> Option<CursorStyle> {
         proto::CursorStyle::Underline => Some(CursorStyle::Underline),
         proto::CursorStyle::Bar => Some(CursorStyle::Bar),
         proto::CursorStyle::Unspecified => None,
+    }
+}
+
+fn extra_cursor_shape_to_proto(shape: ExtraCursorShape) -> proto::ExtraCursorShape {
+    match shape {
+        ExtraCursorShape::Block => proto::ExtraCursorShape::Block,
+        ExtraCursorShape::Bar => proto::ExtraCursorShape::Bar,
+        ExtraCursorShape::Underline => proto::ExtraCursorShape::Underline,
+        ExtraCursorShape::FollowMain => proto::ExtraCursorShape::FollowMain,
+    }
+}
+
+fn proto_to_extra_cursor_shape(shape: i32) -> Option<ExtraCursorShape> {
+    match proto::ExtraCursorShape::try_from(shape).ok()? {
+        proto::ExtraCursorShape::Block => Some(ExtraCursorShape::Block),
+        proto::ExtraCursorShape::Bar => Some(ExtraCursorShape::Bar),
+        proto::ExtraCursorShape::Underline => Some(ExtraCursorShape::Underline),
+        proto::ExtraCursorShape::FollowMain => Some(ExtraCursorShape::FollowMain),
+        proto::ExtraCursorShape::Unspecified => None,
+    }
+}
+
+fn extra_cursor_to_proto(cursor: ExtraCursor) -> proto::ExtraCursor {
+    proto::ExtraCursor {
+        row: cursor.row as u32,
+        col: cursor.col as u32,
+        shape: extra_cursor_shape_to_proto(cursor.shape) as i32,
+    }
+}
+
+fn proto_to_extra_cursor(cursor: &proto::ExtraCursor) -> Option<ExtraCursor> {
+    Some(ExtraCursor {
+        row: cursor.row as usize,
+        col: cursor.col as usize,
+        shape: proto_to_extra_cursor_shape(cursor.shape)?,
+    })
+}
+
+fn extra_cursor_color_to_proto(color: ExtraCursorColor) -> proto::ExtraCursorColor {
+    let mut result = proto::ExtraCursorColor::default();
+    match color {
+        ExtraCursorColor::Main => {}
+        ExtraCursorColor::Reverse => {
+            result.kind = proto::ExtraCursorColorKind::Reverse as i32;
+        }
+        ExtraCursorColor::Color(Color::Indexed(index)) => {
+            result.kind = proto::ExtraCursorColorKind::Indexed as i32;
+            result.index = u32::from(index);
+        }
+        ExtraCursorColor::Color(Color::Rgb(rgb)) => {
+            result.kind = proto::ExtraCursorColorKind::Rgb as i32;
+            result.red = u32::from(rgb.r);
+            result.green = u32::from(rgb.g);
+            result.blue = u32::from(rgb.b);
+        }
+        ExtraCursorColor::Color(Color::Default | Color::Ansi(_)) => {}
+    }
+    result
+}
+
+fn proto_to_extra_cursor_color(color: Option<&proto::ExtraCursorColor>) -> ExtraCursorColor {
+    let Some(color) = color else {
+        return ExtraCursorColor::Main;
+    };
+    match proto::ExtraCursorColorKind::try_from(color.kind) {
+        Ok(proto::ExtraCursorColorKind::Reverse) => ExtraCursorColor::Reverse,
+        Ok(proto::ExtraCursorColorKind::Indexed) => u8::try_from(color.index)
+            .map(|index| ExtraCursorColor::Color(Color::Indexed(index)))
+            .unwrap_or_default(),
+        Ok(proto::ExtraCursorColorKind::Rgb) => {
+            let rgb = u8::try_from(color.red)
+                .ok()
+                .zip(u8::try_from(color.green).ok())
+                .zip(u8::try_from(color.blue).ok())
+                .map(|((red, green), blue)| Rgb::new(red, green, blue));
+            rgb.map(|rgb| ExtraCursorColor::Color(Color::Rgb(rgb)))
+                .unwrap_or_default()
+        }
+        _ => ExtraCursorColor::Main,
+    }
+}
+
+pub fn extra_cursor_colors_to_proto(colors: ExtraCursorColors) -> proto::ExtraCursorColors {
+    proto::ExtraCursorColors {
+        text: Some(extra_cursor_color_to_proto(colors.text)),
+        cursor: Some(extra_cursor_color_to_proto(colors.cursor)),
+    }
+}
+
+fn proto_to_extra_cursor_colors(colors: Option<&proto::ExtraCursorColors>) -> ExtraCursorColors {
+    ExtraCursorColors {
+        text: proto_to_extra_cursor_color(colors.and_then(|colors| colors.text.as_ref())),
+        cursor: proto_to_extra_cursor_color(colors.and_then(|colors| colors.cursor.as_ref())),
+    }
+}
+
+/// Convert the complete multiple-cursor overlay for incremental updates.
+pub fn extra_cursors_to_proto(screen: &Screen) -> proto::ExtraCursorsUpdate {
+    proto::ExtraCursorsUpdate {
+        cursors: screen.extra_cursors().map(extra_cursor_to_proto).collect(),
+        colors: Some(extra_cursor_colors_to_proto(screen.extra_cursor_colors())),
     }
 }
 
@@ -574,6 +677,13 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
             .iter()
             .filter_map(proto_to_terminal_image),
     );
+    screen.replace_extra_cursors(
+        screen_data
+            .extra_cursors
+            .iter()
+            .filter_map(proto_to_extra_cursor),
+        proto_to_extra_cursor_colors(screen_data.extra_cursor_colors.as_ref()),
+    );
 }
 
 fn apply_proto_cell(cell: &mut Cell, proto_cell: &proto::Cell) {
@@ -657,6 +767,32 @@ mod tests {
         assert_eq!(restored.screen().cursor.blink.decscusr(), None);
         assert!(!restored.screen().cursor.blink.dec_mode_12());
         assert!(!restored.screen().cursor.blink.enabled());
+    }
+
+    #[test]
+    fn screen_snapshot_roundtrips_and_authoritatively_clears_extra_cursors() {
+        let mut source = Terminal::new(8, 4, ScreenConfig::default());
+        source.process(b"\x1b[>1;2:1:2 q\x1b[>29;2:3:4 q\x1b[>30;2:1:2:3 q\x1b[>40;5:13 q");
+        let snapshot = screen_to_proto(source.screen(), false);
+        let mut restored = Terminal::new(8, 4, ScreenConfig::default());
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        assert_eq!(
+            restored.screen().extra_cursors().collect::<Vec<_>>(),
+            source.screen().extra_cursors().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored.screen().extra_cursor_colors(),
+            source.screen().extra_cursor_colors()
+        );
+
+        let empty = screen_to_proto(Terminal::new(8, 4, ScreenConfig::default()).screen(), false);
+        apply_screen_snapshot(&mut restored, &empty);
+        assert!(!restored.screen().has_extra_cursors());
+        assert_eq!(
+            restored.screen().extra_cursor_colors(),
+            ExtraCursorColors::default()
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use cterm_core::drcs::DrcsGlyph;
 use cterm_core::TerminalImage;
 use cterm_core::{CursorStyle, Terminal};
 use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
+use cterm_ui::cursor::{extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::theme::Theme;
 
 /// CoreGraphics renderer for terminal display
@@ -342,29 +343,36 @@ impl CGRenderer {
 
         self.render_images(screen, cterm_core::ImageLayer::AboveText);
 
-        // Draw cursor (only when visible and not scrolled back)
+        if extra_cursors_visible(screen, blink_phase) {
+            for cursor in screen.extra_cursors() {
+                let colors = resolve_extra_cursor_colors(
+                    screen,
+                    &palette,
+                    self.theme.cursor.text_color,
+                    cursor.row,
+                    cursor.col,
+                );
+                self.draw_cursor_cell(
+                    screen,
+                    cursor.row,
+                    cursor.col,
+                    cursor.shape.resolve(screen.cursor.style),
+                    &colors.cursor,
+                    &colors.text,
+                );
+            }
+        }
+
+        // Draw main cursor (only when visible and not scrolled back).
         let cursor = &screen.cursor;
         if cursor_visible(screen, blink_phase) {
-            let cursor_x = cursor.col as f64 * self.cell_width;
-            let cursor_y = cursor.row as f64 * self.cell_height;
-
-            // Check if cursor is on a wide character
-            let cursor_width = if let Some(cell) = screen.grid().get(cursor.row, cursor.col) {
-                if cell.is_wide() {
-                    self.cell_width * 2.0
-                } else {
-                    self.cell_width
-                }
-            } else {
-                self.cell_width
-            };
-
-            self.draw_cursor(
-                cursor_x,
-                cursor_y,
-                cursor_width,
+            self.draw_cursor_cell(
+                screen,
+                cursor.row,
+                cursor.col,
                 cursor.style,
                 &palette.cursor,
+                &self.theme.cursor.text_color,
             );
         }
 
@@ -737,6 +745,36 @@ impl CGRenderer {
             let color = Self::ns_color_alpha(cursor_color.r, cursor_color.g, cursor_color.b, 0.7);
             let _: () = msg_send![&*color, setFill];
             let _: () = msg_send![class!(NSBezierPath), fillRect: rect];
+        }
+    }
+
+    fn draw_cursor_cell(
+        &self,
+        screen: &cterm_core::Screen,
+        row: usize,
+        col: usize,
+        style: CursorStyle,
+        cursor_color: &Rgb,
+        text_color: &Rgb,
+    ) {
+        let x = col as f64 * self.cell_width;
+        let y = row as f64 * self.cell_height;
+        let width = screen
+            .get_cell(row, col)
+            .filter(|cell| cell.is_wide())
+            .map_or(self.cell_width, |_| self.cell_width * 2.0);
+        self.draw_cursor(x, y, width, style, cursor_color);
+
+        if style == CursorStyle::Block {
+            if let Some(cell) = screen.get_cell(row, col) {
+                if cell.text() != " "
+                    && cell.text() != "\0"
+                    && !cell.is_kitty_image_placeholder()
+                    && !cell.attrs.contains(CellAttrs::HIDDEN)
+                {
+                    self.draw_text_rgb(cell.text(), x, y, text_color, cell.attrs);
+                }
+            }
         }
     }
 

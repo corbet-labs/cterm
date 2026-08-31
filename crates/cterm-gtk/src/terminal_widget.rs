@@ -25,6 +25,7 @@ use cterm_ui::blink::{
     cell_foreground_visible, cursor_visible, BlinkClock, BlinkNeeds, BlinkPhase,
     BLINK_POLL_INTERVAL,
 };
+use cterm_ui::cursor::{extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::sprite::{Sprite, SpriteCache};
 use cterm_ui::theme::Theme;
 
@@ -2453,43 +2454,47 @@ fn draw_terminal(
         cterm_core::ImageLayer::AboveText,
     );
 
-    // Draw cursor
+    // Extra cursors ignore DECTCEM and draw beneath the main cursor when both
+    // target the same cell.
+    if extra_cursors_visible(screen, blink_phase) {
+        for cursor in screen.extra_cursors() {
+            let colors = resolve_extra_cursor_colors(
+                screen,
+                palette,
+                theme.cursor.text_color,
+                cursor.row,
+                cursor.col,
+            );
+            draw_cursor_cell(
+                cr,
+                screen,
+                &layout,
+                cursor.row,
+                cursor.col,
+                cursor.shape.resolve(screen.cursor.style),
+                colors.cursor,
+                colors.text,
+                cell_width,
+                cell_height,
+            );
+        }
+    }
+
+    // Draw main cursor.
     if cursor_visible(screen, blink_phase) {
         let cursor = &screen.cursor;
-        let x = cursor.col as f64 * cell_width;
-        let y = cursor.row as f64 * cell_height;
-
-        let (r, g, b) = palette.cursor.to_f64();
-        cr.set_source_rgb(r, g, b);
-
-        match cursor.style {
-            CursorStyle::Block => {
-                cr.rectangle(x, y, cell_width, cell_height);
-                cr.fill().ok();
-
-                // Draw character under cursor with inverted color
-                if let Some(cell) = screen.get_cell(cursor.row, cursor.col) {
-                    if cell.text() != " "
-                        && !cell.is_kitty_image_placeholder()
-                        && !cell.attrs.contains(CellAttrs::HIDDEN)
-                    {
-                        let (r, g, b) = theme.cursor.text_color.to_f64();
-                        cr.set_source_rgb(r, g, b);
-                        layout.set_text(cell.text());
-                        cr.move_to(x, y);
-                        pangocairo::functions::show_layout(cr, &layout);
-                    }
-                }
-            }
-            CursorStyle::Underline => {
-                cr.rectangle(x, y + cell_height - 2.0, cell_width, 2.0);
-                cr.fill().ok();
-            }
-            CursorStyle::Bar => {
-                cr.rectangle(x, y, 2.0, cell_height);
-                cr.fill().ok();
-            }
-        }
+        draw_cursor_cell(
+            cr,
+            screen,
+            &layout,
+            cursor.row,
+            cursor.col,
+            cursor.style,
+            palette.cursor,
+            theme.cursor.text_color,
+            cell_width,
+            cell_height,
+        );
     }
 
     // Draw IM preedit (composition) text at the cursor position
@@ -2574,6 +2579,52 @@ fn draw_terminal(
         cr.close_path();
         cr.set_source_rgba(0.5, 0.5, 0.5, opacity);
         cr.fill().ok();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_cursor_cell(
+    cr: &cairo::Context,
+    screen: &cterm_core::Screen,
+    layout: &pango::Layout,
+    row: usize,
+    col: usize,
+    style: CursorStyle,
+    cursor_color: Rgb,
+    text_color: Rgb,
+    cell_width: f64,
+    cell_height: f64,
+) {
+    let x = col as f64 * cell_width;
+    let y = row as f64 * cell_height;
+    let (red, green, blue) = cursor_color.to_f64();
+    cr.set_source_rgb(red, green, blue);
+
+    match style {
+        CursorStyle::Block => {
+            cr.rectangle(x, y, cell_width, cell_height);
+            cr.fill().ok();
+            if let Some(cell) = screen.get_cell(row, col) {
+                if cell.text() != " "
+                    && !cell.is_kitty_image_placeholder()
+                    && !cell.attrs.contains(CellAttrs::HIDDEN)
+                {
+                    let (red, green, blue) = text_color.to_f64();
+                    cr.set_source_rgb(red, green, blue);
+                    layout.set_text(cell.text());
+                    cr.move_to(x, y);
+                    pangocairo::functions::show_layout(cr, layout);
+                }
+            }
+        }
+        CursorStyle::Underline => {
+            cr.rectangle(x, y + cell_height - 2.0, cell_width, 2.0);
+            cr.fill().ok();
+        }
+        CursorStyle::Bar => {
+            cr.rectangle(x, y, 2.0, cell_height);
+            cr.fill().ok();
+        }
     }
 }
 

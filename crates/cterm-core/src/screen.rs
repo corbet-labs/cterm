@@ -8,6 +8,10 @@ use crate::color::{Color, ColorPalette, Rgb};
 use crate::drcs::{DrcsFont, DrcsGlyph};
 use crate::grid::{Grid, Row};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::multiple_cursors::{
+    ExtraCursor, ExtraCursorColor, ExtraCursorColorTarget, ExtraCursorColors, ExtraCursorShape,
+    MultipleCursors,
+};
 use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -691,6 +695,8 @@ pub struct Screen {
     config: ScreenConfig,
     /// Cursor state
     pub cursor: Cursor,
+    /// Kitty multiple-cursor viewport overlays.
+    extra_cursors: MultipleCursors,
     /// Saved cursor state (for save/restore)
     saved_cursor: Option<Cursor>,
     /// Alternate saved cursor (for alternate screen)
@@ -965,6 +971,7 @@ impl Screen {
             alternate_grid: None,
             config,
             cursor: Cursor::default(),
+            extra_cursors: MultipleCursors::default(),
             saved_cursor: None,
             alt_saved_cursor: None,
             scroll_region: ScrollRegion {
@@ -1025,6 +1032,96 @@ impl Screen {
     /// Queue a response to be sent back through the PTY
     pub fn queue_response(&mut self, response: Vec<u8>) {
         self.pending_responses.push(response);
+    }
+
+    /// Whether the Kitty multiple-cursors overlay contains any positions.
+    pub fn has_extra_cursors(&self) -> bool {
+        !self.extra_cursors.is_empty()
+    }
+
+    /// Iterate over Kitty extra cursors in stable row-major order.
+    pub fn extra_cursors(&self) -> impl Iterator<Item = ExtraCursor> + '_ {
+        self.extra_cursors.iter()
+    }
+
+    /// Shared text and cursor colors used by Kitty extra cursors.
+    pub fn extra_cursor_colors(&self) -> ExtraCursorColors {
+        self.extra_cursors.colors()
+    }
+
+    /// Replace multiple-cursor state from an authoritative daemon snapshot.
+    pub fn replace_extra_cursors(
+        &mut self,
+        cursors: impl IntoIterator<Item = ExtraCursor>,
+        colors: ExtraCursorColors,
+    ) {
+        let height = self.height();
+        let width = self.width();
+        self.extra_cursors.replace(
+            cursors
+                .into_iter()
+                .filter(|cursor| cursor.row < height && cursor.col < width),
+            colors,
+        );
+        self.dirty = true;
+    }
+
+    pub(crate) fn set_extra_cursor_points(
+        &mut self,
+        shape: Option<ExtraCursorShape>,
+        points: impl IntoIterator<Item = (usize, usize)>,
+    ) {
+        if self
+            .extra_cursors
+            .set_points(shape, points, self.height(), self.width())
+        {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn set_extra_cursor_rectangles(
+        &mut self,
+        shape: Option<ExtraCursorShape>,
+        rectangles: &[(usize, usize, usize, usize)],
+        full_screen: bool,
+    ) {
+        if self.extra_cursors.set_rectangles(
+            shape,
+            rectangles,
+            self.height(),
+            self.width(),
+            full_screen,
+        ) {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn set_extra_cursor_color(
+        &mut self,
+        target: ExtraCursorColorTarget,
+        color: ExtraCursorColor,
+    ) {
+        if self.extra_cursors.set_color(target, color) {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn reset_extra_cursors(&mut self) {
+        if self.extra_cursors.reset() {
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn queue_extra_cursor_support_response(&mut self) {
+        self.queue_response(b"\x1b[>1;2;3;29;30;40;100;101 q".to_vec());
+    }
+
+    pub(crate) fn queue_extra_cursor_state_response(&mut self) {
+        self.queue_response(self.extra_cursors.state_response());
+    }
+
+    pub(crate) fn queue_extra_cursor_color_response(&mut self) {
+        self.queue_response(self.extra_cursors.color_response());
     }
 
     /// Active kitty keyboard progressive-enhancement flags.
@@ -1572,6 +1669,8 @@ impl Screen {
             self.tab_stops[i] = i % 8 == 0;
         }
 
+        self.extra_cursors.retain_within(height, width);
+
         self.dirty = true;
     }
 
@@ -2001,6 +2100,7 @@ impl Screen {
             return;
         }
 
+        self.extra_cursors.clear_positions();
         self.modes.alternate_screen = true;
         self.alt_saved_cursor = Some(self.cursor.clone());
 
@@ -2017,6 +2117,7 @@ impl Screen {
             return;
         }
 
+        self.extra_cursors.clear_positions();
         self.modes.alternate_screen = false;
 
         if let Some(primary) = self.alternate_grid.take() {
@@ -2084,9 +2185,11 @@ impl Screen {
                 }
             }
             ClearMode::All => {
+                self.extra_cursors.clear_positions();
                 self.grid.clear();
             }
             ClearMode::Scrollback => {
+                self.extra_cursors.clear_positions();
                 self.scrollback.clear();
             }
         }
@@ -2479,6 +2582,7 @@ impl Screen {
         self.scrollback.clear();
         self.alternate_grid = None;
         self.cursor.reset_protocol_state();
+        self.extra_cursors.reset();
         self.saved_cursor = None;
         self.alt_saved_cursor = None;
         self.scroll_region = ScrollRegion {

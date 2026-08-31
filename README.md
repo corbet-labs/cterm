@@ -494,6 +494,16 @@ Kitty's independent bold/faint resets (`SGR 221`/`222`) and `CSI 22 J`
 viewport-to-scrollback operation are supported. Native Cocoa, GTK/Wayland, and
 Win32 pointer-leave hooks also emit Kitty's SGR-pixel mouse-leave report.
 
+### Kitty Multiple Cursors
+
+Kitty's multiple-cursors protocol supports block, beam, underline, and
+follow-main shapes; main-cursor, point, and rectangular coordinate forms;
+full-screen and selective clearing; capability, cursor-state, and color-state
+queries; and indexed, RGB, inherited, and reverse-video colors. Extra cursors
+share the main cursor's blink phase but remain visible independently of
+DECTCEM. GTK/Wayland, Cocoa, and Direct2D render the same overlay state, which
+also survives daemon snapshots and incremental screen updates.
+
 Test with:
 ```bash
 # Using ImageMagick

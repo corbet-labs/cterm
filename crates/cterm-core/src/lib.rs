@@ -16,6 +16,7 @@ pub mod keyboard;
 mod kitty_graphics;
 mod kitty_placeholder;
 pub mod mouse;
+mod multiple_cursors;
 mod osc1337;
 pub mod parser;
 pub mod pty;
@@ -33,6 +34,7 @@ pub use image_decode::{decode_image, DecodedImage, ImageDecodeError};
 pub use iterm2::{Iterm2Dimension, Iterm2FileParams};
 pub use keyboard::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
 pub use kitty_graphics::GraphicsAnimationTick;
+pub use multiple_cursors::{ExtraCursor, ExtraCursorColor, ExtraCursorColors, ExtraCursorShape};
 pub use parser::Parser;
 #[cfg(unix)]
 pub use pty::save_original_nofile_limit;

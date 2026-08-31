@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use cterm_core::color::{Color, Rgb};
 use cterm_core::{Cell, CellAttrs, CursorStyle, Screen};
 use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
+use cterm_ui::cursor::{extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::pane::PaneRect;
 use cterm_ui::theme::Theme;
 use windows::core::{Interface, PCWSTR};
@@ -398,6 +399,7 @@ impl TerminalRenderer {
             self.draw_images(screen, cterm_core::ImageLayer::BehindText)?;
             self.draw_grid(screen, blink_phase, GridPass::Foreground)?;
             self.draw_images(screen, cterm_core::ImageLayer::AboveText)?;
+            self.draw_extra_cursors(screen, blink_phase)?;
             if active {
                 self.draw_cursor(screen, blink_phase)?;
             }
@@ -838,15 +840,61 @@ impl TerminalRenderer {
             return Ok(());
         }
 
-        let cursor = &screen.cursor;
-
-        let x = self.origin_x + cursor.col as f32 * self.cell_dims.width;
-        let y = self.origin_y + cursor.row as f32 * self.cell_dims.height;
-
         let cursor_color = self.resolved_palette(screen).cursor;
+        self.draw_cursor_cell(
+            screen,
+            screen.cursor.row,
+            screen.cursor.col,
+            screen.cursor.style,
+            cursor_color,
+            self.theme.cursor.text_color,
+        )
+    }
+
+    fn draw_extra_cursors(
+        &mut self,
+        screen: &Screen,
+        blink_phase: BlinkPhase,
+    ) -> windows::core::Result<()> {
+        if !extra_cursors_visible(screen, blink_phase) {
+            return Ok(());
+        }
+        let palette = self.resolved_palette(screen);
+        for cursor in screen.extra_cursors() {
+            let colors = resolve_extra_cursor_colors(
+                screen,
+                &palette,
+                self.theme.cursor.text_color,
+                cursor.row,
+                cursor.col,
+            );
+            self.draw_cursor_cell(
+                screen,
+                cursor.row,
+                cursor.col,
+                cursor.shape.resolve(screen.cursor.style),
+                colors.cursor,
+                colors.text,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cursor_cell(
+        &mut self,
+        screen: &Screen,
+        row: usize,
+        col: usize,
+        style: CursorStyle,
+        cursor_color: Rgb,
+        text_color: Rgb,
+    ) -> windows::core::Result<()> {
+        let x = self.origin_x + col as f32 * self.cell_dims.width;
+        let y = self.origin_y + row as f32 * self.cell_dims.height;
         let brush = self.get_brush(cursor_color)?;
 
-        let rect = match cursor.style {
+        let rect = match style {
             CursorStyle::Block => D2D_RECT_F {
                 left: x,
                 top: y,
@@ -876,13 +924,12 @@ impl TerminalRenderer {
             base.FillRectangle(&rect, &brush);
         }
 
-        if cursor.style != CursorStyle::Block {
+        if style != CursorStyle::Block {
             return Ok(());
         }
 
         // Draw the character under a block cursor with inverted color.
-        let grid = screen.grid();
-        if let Some(cell) = grid.get(cursor.row, cursor.col) {
+        if let Some(cell) = screen.get_cell(row, col) {
             let text = cell.text();
 
             if text != " "
@@ -890,7 +937,6 @@ impl TerminalRenderer {
                 && !cell.is_kitty_image_placeholder()
                 && !cell.attrs.contains(CellAttrs::HIDDEN)
             {
-                let text_color = self.theme.cursor.text_color;
                 let text_brush = self.get_brush(text_color)?;
 
                 let text_format = self.text_format.as_ref().unwrap();
