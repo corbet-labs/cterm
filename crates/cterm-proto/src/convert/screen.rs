@@ -643,6 +643,16 @@ mod tests {
         assert_eq!(restored.screen().cursor.blink.decscusr(), Some(true));
         assert!(restored.screen().cursor.blink.dec_mode_12());
         assert!(restored.screen().cursor.blink.enabled());
+
+        // A later authoritative snapshot with no DECSCUSR selection clears
+        // the prior override and returns to this frontend's native defaults.
+        let source = Terminal::new(8, 2, ScreenConfig::default());
+        let snapshot = screen_to_proto(source.screen(), false);
+        apply_screen_snapshot(&mut restored, &snapshot);
+        assert_eq!(restored.screen().cursor.style, CursorStyle::Bar);
+        assert_eq!(restored.screen().cursor.blink.decscusr(), None);
+        assert!(!restored.screen().cursor.blink.dec_mode_12());
+        assert!(!restored.screen().cursor.blink.enabled());
     }
 
     #[test]

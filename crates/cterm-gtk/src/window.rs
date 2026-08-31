@@ -4976,12 +4976,15 @@ fn calculate_initial_cell_dimensions(config: &Config) -> CellDimensions {
             let descent = metrics.descent() as f64 / pango::SCALE as f64;
             let height = ascent + descent;
 
-            if char_width > 0.0 && height > 0.0 {
-                return CellDimensions {
-                    width: char_width,
-                    height: height * 1.1,
-                };
+            if let Some(dimensions) = CellDimensions::checked(char_width, height * 1.1) {
+                return dimensions;
             }
+            log::warn!(
+                "Ignoring invalid initial metrics for font '{}': width={}, height={}",
+                font_name,
+                char_width,
+                height
+            );
         }
     }
 
@@ -4992,17 +4995,17 @@ fn calculate_initial_cell_dimensions(config: &Config) -> CellDimensions {
     layout.set_text("M");
 
     let (width, height) = layout.pixel_size();
-    if width > 0 && height > 0 {
-        return CellDimensions {
-            width: width as f64,
-            height: height as f64 * 1.1,
-        };
+    if let Some(dimensions) = CellDimensions::checked(width as f64, height as f64 * 1.1) {
+        return dimensions;
     }
 
-    panic!(
-        "Failed to load any font or measure text. \
-         Please ensure fonts are installed (e.g., fonts-dejavu or similar)."
+    let fallback = CellDimensions::conservative_fallback(font_size);
+    log::error!(
+        "No usable initial font metrics; using conservative cell size {}x{}",
+        fallback.width,
+        fallback.height
     );
+    fallback
 }
 
 #[cfg(test)]

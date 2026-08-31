@@ -71,6 +71,11 @@ impl CursorBlink {
         self.decscusr
     }
 
+    /// Native frontend default used when DECSCUSR has no explicit override.
+    pub fn configured(self) -> bool {
+        self.configured
+    }
+
     pub(crate) fn set_dec_mode_12(&mut self, enabled: bool) {
         self.dec_mode_12 = enabled;
     }
@@ -116,6 +121,11 @@ impl Cursor {
         self.blink.decscusr = None;
     }
 
+    /// Native frontend shape restored by DECSCUSR 0 and terminal resets.
+    pub fn configured_style(&self) -> CursorStyle {
+        self.configured_style
+    }
+
     /// Restore configured style and blink while preserving DEC mode 12.
     pub fn reset_style_to_config(&mut self) {
         self.style = self.configured_style;
@@ -131,11 +141,19 @@ impl Cursor {
         decscusr: Option<bool>,
         dec_mode_12: Option<bool>,
     ) {
-        if let Some(decscusr) = decscusr {
-            if let Some(style) = style {
-                self.style = style;
+        match decscusr {
+            Some(decscusr) => {
+                if let Some(style) = style {
+                    self.style = style;
+                }
+                self.blink.set_decscusr(Some(decscusr));
             }
-            self.blink.set_decscusr(Some(decscusr));
+            None => {
+                // A snapshot is authoritative: absence means the application
+                // has no DECSCUSR override. Clear any value left by an older
+                // snapshot while retaining this frontend's native defaults.
+                self.reset_style_to_config();
+            }
         }
         if let Some(dec_mode_12) = dec_mode_12 {
             self.blink.set_dec_mode_12(dec_mode_12);
@@ -143,7 +161,7 @@ impl Cursor {
     }
 
     /// Reset protocol sources while preserving native configuration.
-    fn reset_protocol_state(&mut self) {
+    pub fn reset_protocol_state(&mut self) {
         self.col = 0;
         self.row = 0;
         self.style = self.configured_style;
@@ -1941,7 +1959,7 @@ impl Screen {
         let alt = Grid::new(self.width(), self.height());
         self.alternate_grid = Some(std::mem::replace(&mut self.grid, alt));
 
-        self.cursor = Cursor::default();
+        self.cursor.reset_protocol_state();
         self.dirty = true;
     }
 
@@ -4252,5 +4270,38 @@ mod tests {
         // Selection must stay on the same single word, just shifted up by one line.
         assert_eq!(start, SelectionPoint::new(abs_line - 1, 0));
         assert_eq!(end, SelectionPoint::new(abs_line - 1, 4));
+    }
+
+    #[test]
+    fn authoritative_cursor_snapshot_clears_stale_decscusr_override() {
+        let mut cursor = Cursor::default();
+        cursor.configure(CursorStyle::Bar, false);
+        cursor.restore_protocol_snapshot(Some(CursorStyle::Underline), Some(true), Some(true));
+        assert_eq!(cursor.style, CursorStyle::Underline);
+        assert_eq!(cursor.blink.decscusr(), Some(true));
+
+        cursor.restore_protocol_snapshot(Some(CursorStyle::Block), None, Some(false));
+        assert_eq!(cursor.style, CursorStyle::Bar);
+        assert_eq!(cursor.blink.decscusr(), None);
+        assert!(!cursor.blink.dec_mode_12());
+        assert!(!cursor.blink.enabled());
+    }
+
+    #[test]
+    fn alternate_screen_keeps_native_cursor_defaults() {
+        let mut screen = Screen::new(80, 24, ScreenConfig::default());
+        screen.configure_cursor(CursorStyle::Bar, false);
+        screen.cursor.restore_protocol_snapshot(
+            Some(CursorStyle::Underline),
+            Some(true),
+            Some(true),
+        );
+
+        screen.enter_alternate_screen();
+
+        assert_eq!(screen.cursor.configured_style(), CursorStyle::Bar);
+        assert!(!screen.cursor.blink.configured());
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert!(!screen.cursor.blink.enabled());
     }
 }

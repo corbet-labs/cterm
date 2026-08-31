@@ -35,6 +35,37 @@ pub struct CellDimensions {
     pub height: f64,
 }
 
+impl CellDimensions {
+    /// Reject Pango's missing-font sentinel metrics before they become GTK
+    /// size requests. Some headless fontconfig setups return large positive
+    /// values rather than an error when no usable face is installed.
+    pub(crate) fn checked(width: f64, height: f64) -> Option<Self> {
+        const MAX_CELL_DIMENSION: f64 = 256.0;
+
+        if width.is_finite()
+            && height.is_finite()
+            && (1.0..=MAX_CELL_DIMENSION).contains(&width)
+            && (1.0..=MAX_CELL_DIMENSION).contains(&height)
+        {
+            Some(Self { width, height })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn conservative_fallback(font_size: f64) -> Self {
+        let font_size = if font_size.is_finite() {
+            font_size.clamp(6.0, 72.0)
+        } else {
+            12.0
+        };
+        Self {
+            width: font_size * 0.75,
+            height: font_size * 1.5,
+        }
+    }
+}
+
 /// Callback type for terminal events
 type EventCallback = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 /// Callback type for title change events
@@ -254,19 +285,7 @@ impl TerminalWidget {
     /// Reset the terminal (soft reset - keeps scrollback)
     pub fn reset(&self) {
         let mut term = self.terminal.lock();
-        let screen = term.screen_mut();
-        // Soft reset: reset modes and cursor but keep scrollback
-        screen.cursor = cterm_core::screen::Cursor::default();
-        screen.style = cterm_core::cell::CellStyle::default();
-        screen.modes = cterm_core::screen::TerminalModes {
-            auto_wrap: true,
-            reverse_wrap: true,
-            modify_other_keys: 1,
-            show_cursor: true,
-            ..Default::default()
-        };
-        screen.reset_scroll_region();
-        screen.dirty = true;
+        soft_reset_screen(term.screen_mut());
         drop(term);
         self.drawing_area.queue_draw();
     }
@@ -2030,6 +2049,22 @@ impl TerminalWidget {
     }
 }
 
+/// Reset application-controlled state without discarding scrollback or the
+/// native cursor defaults supplied by this frontend.
+fn soft_reset_screen(screen: &mut cterm_core::Screen) {
+    screen.cursor.reset_protocol_state();
+    screen.style = cterm_core::cell::CellStyle::default();
+    screen.modes = cterm_core::screen::TerminalModes {
+        auto_wrap: true,
+        reverse_wrap: true,
+        modify_other_keys: 1,
+        show_cursor: true,
+        ..Default::default()
+    };
+    screen.reset_scroll_region();
+    screen.dirty = true;
+}
+
 /// Calculate cell dimensions using Pango font metrics
 fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimensions {
     // Get the default font map and create a context
@@ -2052,20 +2087,25 @@ fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimension
             let descent = metrics.descent() as f64 / pango::SCALE as f64;
             let height = ascent + descent;
 
-            // Validate that we got sensible metrics
-            if char_width > 0.0 && height > 0.0 {
+            // Validate that we got sensible metrics. In particular, reject
+            // Pango's missing-font sentinels before multiplying them into a
+            // multi-gigabyte Wayland shared-memory surface.
+            if let Some(dimensions) = CellDimensions::checked(char_width, height * 1.1) {
                 log::debug!(
                     "Using font '{}' at {}pt: cell={}x{}",
                     font_name,
                     font_size,
-                    char_width,
-                    height * 1.1
+                    dimensions.width,
+                    dimensions.height
                 );
-                return CellDimensions {
-                    width: char_width,
-                    height: height * 1.1, // Small line spacing factor
-                };
+                return dimensions;
             }
+            log::warn!(
+                "Ignoring invalid metrics for font '{}': width={}, height={}",
+                font_name,
+                char_width,
+                height
+            );
         }
     }
 
@@ -2076,23 +2116,22 @@ fn calculate_cell_dimensions(font_family: &str, font_size: f64) -> CellDimension
     layout.set_text("M");
 
     let (width, height) = layout.pixel_size();
-    if width > 0 && height > 0 {
+    if let Some(dimensions) = CellDimensions::checked(width as f64, height as f64 * 1.1) {
         log::warn!(
             "Font metrics unavailable, using layout measurement: {}x{}",
             width,
             height
         );
-        return CellDimensions {
-            width: width as f64,
-            height: height as f64 * 1.1,
-        };
+        return dimensions;
     }
 
-    // This should never happen on a functioning system with fonts installed
-    panic!(
-        "Failed to load any font or measure text. \
-         Please ensure fonts are installed (e.g., fonts-dejavu or similar)."
+    let fallback = CellDimensions::conservative_fallback(font_size);
+    log::error!(
+        "No usable font metrics; using conservative cell size {}x{}",
+        fallback.width,
+        fallback.height
     );
+    fallback
 }
 
 /// Messages from PTY reader thread
@@ -2796,6 +2835,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cell_dimensions_reject_missing_font_sentinels() {
+        assert!(CellDimensions::checked(8.0, 18.0).is_some());
+        assert!(CellDimensions::checked(f64::NAN, 18.0).is_none());
+        assert!(CellDimensions::checked(8.0, f64::INFINITY).is_none());
+        assert!(CellDimensions::checked(8.0, 192_185.0).is_none());
+        assert!(CellDimensions::checked(0.0, 18.0).is_none());
+
+        let fallback = CellDimensions::conservative_fallback(f64::NAN);
+        assert_eq!(fallback.width, 9.0);
+        assert_eq!(fallback.height, 18.0);
+    }
+
+    #[test]
     fn native_cursor_config_initializes_protocol_defaults() {
         let mut config = Config::default();
         config.appearance.cursor_style = cterm_app::config::CursorStyleConfig::Bar;
@@ -2811,5 +2863,23 @@ mod tests {
         terminal.process(b"\x1b[?12l\x1b[0 q");
         assert_eq!(terminal.screen().cursor.style, CursorStyle::Bar);
         assert!(!terminal.screen().cursor.blink.enabled());
+    }
+
+    #[test]
+    fn soft_reset_preserves_native_cursor_defaults() {
+        let mut screen = cterm_core::Screen::new(8, 2, ScreenConfig::default());
+        screen.configure_cursor(CursorStyle::Bar, false);
+        screen.cursor.restore_protocol_snapshot(
+            Some(CursorStyle::Underline),
+            Some(true),
+            Some(true),
+        );
+
+        soft_reset_screen(&mut screen);
+
+        assert_eq!(screen.cursor.style, CursorStyle::Bar);
+        assert_eq!(screen.cursor.configured_style(), CursorStyle::Bar);
+        assert!(!screen.cursor.blink.configured());
+        assert!(!screen.cursor.blink.enabled());
     }
 }

@@ -8,6 +8,20 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+fn apply_relaunch_terminal_state(
+    terminal: &mut cterm_core::Terminal,
+    cursor_style: cterm_core::CursorStyle,
+    cursor_blink: bool,
+    screen_snapshot: Option<&cterm_proto::proto::GetScreenResponse>,
+) {
+    terminal
+        .screen_mut()
+        .configure_cursor(cursor_style, cursor_blink);
+    if let Some(screen_snapshot) = screen_snapshot {
+        cterm_proto::convert::screen::apply_screen_snapshot(terminal, screen_snapshot);
+    }
+}
+
 /// Thread-safe manager for terminal sessions
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, Arc<SessionState>>>,
@@ -278,7 +292,10 @@ impl SessionManager {
         custom_title: String,
         tab_color: String,
         template_name: String,
+        cursor_style: cterm_core::CursorStyle,
+        cursor_blink: bool,
         scrollback_lines: usize,
+        screen_snapshot: Option<&cterm_proto::proto::GetScreenResponse>,
     ) -> Result<Arc<SessionState>> {
         let state = SessionState::from_raw_fd(
             id.clone(),
@@ -292,7 +309,15 @@ impl SessionManager {
             scrollback_lines,
         )?;
 
-        // Start the PTY reader task
+        // Install native defaults and the saved screen atomically before the
+        // reader can process new PTY output.
+        state.with_terminal_mut(|term| {
+            apply_relaunch_terminal_state(term, cursor_style, cursor_blink, screen_snapshot);
+        });
+
+        // The saved screen must be authoritative before the reader can consume
+        // bytes written while ctermd was exec'ing; otherwise applying it later
+        // can overwrite newly parsed output.
         let state = state.start_reader()?;
 
         self.had_sessions.store(true, Ordering::Relaxed);
@@ -428,5 +453,29 @@ mod tests {
         let manager = SessionManager::new();
         let result = manager.get_session("nonexistent");
         assert!(matches!(result, Err(HeadlessError::SessionNotFound(_))));
+    }
+
+    #[test]
+    fn relaunch_snapshot_precedes_new_output_and_keeps_cursor_defaults() {
+        let mut source =
+            cterm_core::Terminal::new(32, 2, cterm_core::screen::ScreenConfig::default());
+        source.process(b"before");
+        let snapshot = cterm_proto::convert::screen::screen_to_proto(source.screen(), true);
+
+        let mut restored =
+            cterm_core::Terminal::new(32, 2, cterm_core::screen::ScreenConfig::default());
+        apply_relaunch_terminal_state(
+            &mut restored,
+            cterm_core::CursorStyle::Bar,
+            false,
+            Some(&snapshot),
+        );
+        // Models bytes buffered in the PTY while ctermd was exec'ing. The
+        // reader starts only after the helper above has returned.
+        restored.process(b"after");
+
+        assert!(restored.screen().grid().text().contains("beforeafter"));
+        assert_eq!(restored.screen().cursor.style, cterm_core::CursorStyle::Bar);
+        assert!(!restored.screen().cursor.blink.enabled());
     }
 }

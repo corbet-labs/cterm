@@ -106,6 +106,8 @@ pub async fn run_server(
                     state.sessions.len()
                 );
                 for s in &state.sessions {
+                    let screen_snapshot =
+                        crate::relaunch::read_screen_snapshot(&state_dir, &s.session_id);
                     match unsafe {
                         session_manager.restore_session(
                             s.session_id.clone(),
@@ -116,20 +118,14 @@ pub async fn run_server(
                             s.custom_title.clone(),
                             s.tab_color.clone(),
                             s.template_name.clone(),
+                            s.cursor_style,
+                            s.cursor_blink,
                             s.scrollback_lines,
+                            screen_snapshot.as_ref(),
                         )
                     } {
-                        Ok(session) => {
-                            // Apply screen snapshot from binary file
-                            if let Some(screen_data) =
-                                crate::relaunch::read_screen_snapshot(&state_dir, &s.session_id)
-                            {
-                                session.with_terminal_mut(|term| {
-                                    cterm_proto::convert::screen::apply_screen_snapshot(
-                                        term,
-                                        &screen_data,
-                                    );
-                                });
+                        Ok(_session) => {
+                            if screen_snapshot.is_some() {
                                 log::info!("Applied screen snapshot for session {}", s.session_id);
                             }
                         }

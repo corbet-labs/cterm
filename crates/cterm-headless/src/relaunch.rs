@@ -39,6 +39,16 @@ pub struct RelaunchSessionState {
     pub template_name: String,
     /// Scrollback lines setting
     pub scrollback_lines: usize,
+    /// Native cursor defaults must survive daemon exec independently from
+    /// application-controlled DECSCUSR/mode-12 state in the screen snapshot.
+    #[serde(default)]
+    pub cursor_style: cterm_core::CursorStyle,
+    #[serde(default = "default_cursor_blink")]
+    pub cursor_blink: bool,
+}
+
+const fn default_cursor_blink() -> bool {
+    true
 }
 
 /// Full relaunch state written to state.json
@@ -80,13 +90,18 @@ pub fn collect_and_write_relaunch_state(
     let mut session_states = Vec::new();
 
     for session in &sessions {
-        let (fd, pid) = session.with_terminal(|term| {
+        let (fd, pid, cursor_style, cursor_blink) = session.with_terminal(|term| {
             // SSH-backed sessions have no file descriptor and cannot be
             // preserved across the daemon's exec; `try_raw_fd` returns None for
             // them and they are skipped below.
             let fd = term.pty().and_then(|p| p.try_raw_fd()).unwrap_or(-1);
             let pid = term.child_pid().unwrap_or(-1);
-            (fd, pid)
+            (
+                fd,
+                pid,
+                term.screen().cursor.configured_style(),
+                term.screen().cursor.blink.configured(),
+            )
         });
 
         if fd < 0 || pid < 0 {
@@ -127,6 +142,8 @@ pub fn collect_and_write_relaunch_state(
             tab_color,
             template_name,
             scrollback_lines,
+            cursor_style,
+            cursor_blink,
         });
     }
 
@@ -280,4 +297,43 @@ pub fn perform_relaunch(
     // If we get here, exec failed
     let err = std::io::Error::last_os_error();
     Err(format!("execv failed: {}", err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relaunch_cursor_defaults_roundtrip_and_remain_backward_compatible() {
+        let legacy = r#"{
+            "session_id":"legacy",
+            "master_fd":3,
+            "child_pid":4,
+            "cols":80,
+            "rows":24,
+            "custom_title":"",
+            "scrollback_lines":1000
+        }"#;
+        let restored: RelaunchSessionState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored.cursor_style, cterm_core::CursorStyle::Block);
+        assert!(restored.cursor_blink);
+
+        let state = RelaunchSessionState {
+            session_id: "configured".into(),
+            master_fd: 3,
+            child_pid: 4,
+            cols: 80,
+            rows: 24,
+            custom_title: String::new(),
+            tab_color: String::new(),
+            template_name: String::new(),
+            scrollback_lines: 1000,
+            cursor_style: cterm_core::CursorStyle::Bar,
+            cursor_blink: false,
+        };
+        let encoded = serde_json::to_string(&state).unwrap();
+        let restored: RelaunchSessionState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.cursor_style, cterm_core::CursorStyle::Bar);
+        assert!(!restored.cursor_blink);
+    }
 }

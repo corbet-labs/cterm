@@ -256,9 +256,10 @@ jobs:
               bash \
               cage \
               coreutils \
+              dbus \
+              dejavu \
               gtk4 \
-              libadwaita \
-              xwayland-run
+              libadwaita
           run: |
             OUTPUT_DIR="freebsd-ui-test-results"
             mkdir -p "$OUTPUT_DIR"
@@ -270,12 +271,15 @@ jobs:
             {
               uname -a
               freebsd-version -ku
-              pkg info bash cage gtk4 libadwaita xwayland-run
+              pkg info bash cage dbus dejavu gtk4 libadwaita
               command -v cage
-              command -v wlheadless-run
+              command -v dbus-run-session
+              fc-match monospace
             } >"$OUTPUT_DIR/environment.log" 2>&1
 
             unset DISPLAY
+            export XDG_RUNTIME_DIR="$(mktemp -d)"
+            chmod 0700 "$XDG_RUNTIME_DIR"
             export GDK_BACKEND=wayland
             export GSK_RENDERER=cairo
             export WLR_BACKENDS=headless
@@ -286,16 +290,20 @@ jobs:
             ui_status=0
             # Keep the VM action alive long enough to copy its workspace back
             # to the runner even when Cage, cterm, or a descendant wedges.
-            # GNU timeout owns the whole child process group and escalates to
-            # SIGKILL, leaving the outer job timeout as a last-resort guard.
+            # Run Cage directly so GNU timeout owns the whole compositor/client
+            # process group and can escalate to SIGKILL. wlheadless-run creates
+            # a new process group internally, which lets wedged descendants
+            # escape timeout's cleanup.
             gtimeout --signal=TERM --kill-after=10s 3m \
-              wlheadless-run -c cage -- \
-                env -u DISPLAY \
-                ./scripts/linux_ui_test.sh \
-                ./freebsd-ui-binaries/cterm \
-                "$OUTPUT_DIR" \
-                >"$OUTPUT_DIR/wlheadless.log" 2>&1 || ui_status=$?
+              dbus-run-session -- \
+                cage -- \
+                  env -u DISPLAY \
+                  ./scripts/linux_ui_test.sh \
+                  ./freebsd-ui-binaries/cterm \
+                  "$OUTPUT_DIR" \
+                  >"$OUTPUT_DIR/wlheadless.log" 2>&1 || ui_status=$?
             printf '%s\n' "$ui_status" >"$OUTPUT_DIR/exit-code"
+            rm -rf -- "$XDG_RUNTIME_DIR"
 
       - name: Upload FreeBSD UI test diagnostics
         uses: actions/upload-artifact@v7
