@@ -478,8 +478,10 @@ transport supports bounded size/offset reads and protocol-required cleanup.
 Animation frame loading, partial-frame edits, alpha/overwrite composition,
 client-driven frame selection, and terminal-driven loading/loop playback share
 one quota-aware Rust frame store and the existing native event-loop clocks.
-Unicode placeholders remain staged follow-up work rather than silently
-advertised capabilities.
+Unicode placeholders use invisible virtual placements and Kitty's complete
+297-diacritic coordinate encoding. Their aspect-preserving RGBA fragments move
+with text and scrollback, are cached per viewport, and are rendered consistently
+below text on Cocoa, GTK/Wayland, and Direct2D.
 
 Test with:
 ```bash

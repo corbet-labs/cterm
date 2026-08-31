@@ -2373,6 +2373,7 @@ fn draw_terminal(
                 if render_foreground
                     && foreground_visible
                     && cell.text() != " "
+                    && !cell.is_kitty_image_placeholder()
                     && !cell.attrs.contains(CellAttrs::HIDDEN)
                 {
                     let sprite_width = cell_width.round().max(1.0) as u32;
@@ -2452,7 +2453,10 @@ fn draw_terminal(
 
                 // Draw character under cursor with inverted color
                 if let Some(cell) = screen.get_cell(cursor.row, cursor.col) {
-                    if cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
+                    if cell.text() != " "
+                        && !cell.is_kitty_image_placeholder()
+                        && !cell.attrs.contains(CellAttrs::HIDDEN)
+                    {
                         let (r, g, b) = theme.cursor.text_color.to_f64();
                         cr.set_source_rgb(r, g, b);
                         layout.set_text(cell.text());

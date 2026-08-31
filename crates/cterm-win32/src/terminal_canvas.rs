@@ -654,6 +654,7 @@ impl TerminalRenderer {
             && foreground_visible
             && text != " "
             && text != "\0"
+            && !cell.is_kitty_image_placeholder()
             && !attrs.contains(CellAttrs::HIDDEN)
         {
             let text_format = match (
@@ -884,7 +885,11 @@ impl TerminalRenderer {
         if let Some(cell) = grid.get(cursor.row, cursor.col) {
             let text = cell.text();
 
-            if text != " " && text != "\0" && !cell.attrs.contains(CellAttrs::HIDDEN) {
+            if text != " "
+                && text != "\0"
+                && !cell.is_kitty_image_placeholder()
+                && !cell.attrs.contains(CellAttrs::HIDDEN)
+            {
                 let text_color = self.theme.cursor.text_color;
                 let text_brush = self.get_brush(text_color)?;
 

@@ -2770,11 +2770,27 @@ impl Screen {
         cell_rows: usize,
         pixels: DecodedRgbaImage,
     ) -> u64 {
-        let id = self.next_image_id;
-        self.next_image_id += 1;
-
+        if pixels.clear_cells {
+            // SIXEL follows xterm's replacement behavior. Overlay protocols
+            // such as Kitty preserve the grid for negative-z composition.
+            self.clear_cells_for_image(col, row, cell_cols, cell_rows);
+        }
         // Calculate absolute line (scrollback + visible row)
         let absolute_line = self.scrollback.len() + row;
+        self.add_rgba_image_at_absolute_line(col, absolute_line, cell_cols, cell_rows, pixels)
+    }
+
+    /// Add decoded RGBA pixels anchored to a scrollback-aware absolute line.
+    pub(crate) fn add_rgba_image_at_absolute_line(
+        &mut self,
+        col: usize,
+        absolute_line: usize,
+        cell_cols: usize,
+        cell_rows: usize,
+        pixels: DecodedRgbaImage,
+    ) -> u64 {
+        let id = self.next_image_id;
+        self.next_image_id += 1;
 
         let image = TerminalImage {
             id,
@@ -2788,12 +2804,6 @@ impl Screen {
             z_index: pixels.z_index,
             protocol_image_id: pixels.protocol_image_id,
         };
-
-        if pixels.clear_cells {
-            // SIXEL follows xterm's replacement behavior. Overlay protocols
-            // such as Kitty preserve the grid for negative-z composition.
-            self.clear_cells_for_image(col, row, cell_cols, cell_rows);
-        }
 
         self.images.insert(id, image);
         self.dirty = true;

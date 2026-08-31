@@ -16,6 +16,7 @@ use base64::engine::{DecodePaddingMode, Engine as _};
 use image::{imageops, Pixel, Rgba, RgbaImage};
 
 use crate::image_decode::decode_image;
+use crate::kitty_placeholder::{scan_cells, PlaceholderRun};
 use crate::screen::{DecodedRgbaImage, Screen, TerminalImage};
 
 const BASE64_DECODER: GeneralPurpose = GeneralPurpose::new(
@@ -215,6 +216,12 @@ enum ErrorCode {
     BadFile,
     NoData,
     NoSpace,
+    #[cfg(not(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "macos",
+        windows
+    )))]
     NotSupported,
 }
 
@@ -226,6 +233,12 @@ impl ErrorCode {
             Self::BadFile => "EBADF",
             Self::NoData => "ENODATA",
             Self::NoSpace => "ENOSPC",
+            #[cfg(not(any(
+                target_os = "freebsd",
+                target_os = "linux",
+                target_os = "macos",
+                windows
+            )))]
             Self::NotSupported => "ENOTSUPPORTED",
         }
     }
@@ -294,6 +307,7 @@ struct Command {
     z_index: i32,
     quiet: u8,
     suppress_cursor_movement: bool,
+    unicode_placeholder: bool,
     delete_specifier: Option<u8>,
     frame_number: u32,
     other_frame_number: u32,
@@ -333,6 +347,7 @@ impl Default for Command {
             z_index: 0,
             quiet: 0,
             suppress_cursor_movement: false,
+            unicode_placeholder: false,
             delete_specifier: None,
             frame_number: 0,
             other_frame_number: 0,
@@ -641,12 +656,16 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
                 command.delete_specifier = Some(value[0]);
             }
             b"d" => return Err(echo.error(ErrorCode::Invalid, "invalid delete specifier")),
-            b"U" if value == b"0" => {}
             b"U" => {
-                return Err(echo.error(
-                    ErrorCode::NotSupported,
-                    "unicode placeholders are not supported",
-                ))
+                command.unicode_placeholder = match parse_u32(value) {
+                    Some(0) => false,
+                    Some(1) => true,
+                    _ => {
+                        return Err(
+                            echo.error(ErrorCode::Invalid, "invalid unicode placeholder flag")
+                        )
+                    }
+                }
             }
             _ => {}
         }
@@ -986,6 +1005,27 @@ struct PlacementRecord {
     command: Command,
 }
 
+#[derive(Debug)]
+struct VirtualPlacementRecord {
+    id: u64,
+    image_id: u32,
+    placement_id: u32,
+    command: Command,
+}
+
+#[derive(Debug)]
+struct PlaceholderFragment {
+    screen_id: u64,
+    allocated_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlaceholderProjection {
+    absolute_line: usize,
+    run: PlaceholderRun,
+    virtual_id: u64,
+}
+
 /// Result of sampling Kitty image animations from a monotonic frontend clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GraphicsAnimationTick {
@@ -1004,6 +1044,14 @@ pub(crate) struct KittyGraphics {
     /// Screen image ID to protocol placement metadata. The screen ID is unique
     /// even when the protocol placement ID is zero (anonymous and repeatable).
     placements: HashMap<u64, PlacementRecord>,
+    /// Invisible `U=1` prototypes. Actual fragments are derived from text.
+    virtual_placements: Vec<VirtualPlacementRecord>,
+    /// Renderer images synthesized only for the current viewport.
+    placeholder_fragments: Vec<PlaceholderFragment>,
+    placeholder_projection: Vec<PlaceholderProjection>,
+    placeholder_revision: u64,
+    rendered_placeholder_revision: u64,
+    next_virtual_id: u64,
     next_image_id: u32,
     next_lru: u64,
     total_bytes: usize,
@@ -1018,6 +1066,12 @@ impl Default for KittyGraphics {
             images: HashMap::new(),
             image_numbers: HashMap::new(),
             placements: HashMap::new(),
+            virtual_placements: Vec::new(),
+            placeholder_fragments: Vec::new(),
+            placeholder_projection: Vec::new(),
+            placeholder_revision: 1,
+            rendered_placeholder_revision: 0,
+            next_virtual_id: 1,
             next_image_id: 1,
             next_lru: 1,
             total_bytes: 0,
@@ -1439,6 +1493,13 @@ impl KittyGraphics {
     }
 
     fn refresh_placements(&mut self, image_id: u32, screen: &mut Screen) {
+        if self
+            .virtual_placements
+            .iter()
+            .any(|placement| placement.image_id == image_id)
+        {
+            self.placeholder_revision = self.placeholder_revision.saturating_add(1);
+        }
         let Some(image) = self.images.get(&image_id).cloned() else {
             return;
         };
@@ -1542,6 +1603,9 @@ impl KittyGraphics {
         for image_id in &changed_images {
             self.refresh_placements(*image_id, screen);
         }
+        if !changed_images.is_empty() {
+            self.refresh_unicode_placements(screen);
+        }
         GraphicsAnimationTick {
             changed: !changed_images.is_empty(),
             next_wake_ms,
@@ -1566,6 +1630,9 @@ impl KittyGraphics {
         image_id: u32,
         screen: &mut Screen,
     ) -> Result<(), ProtocolError> {
+        if command.unicode_placeholder {
+            return self.place_virtual(command, image_id, screen);
+        }
         let stored = self
             .images
             .get(&image_id)
@@ -1635,6 +1702,164 @@ impl KittyGraphics {
         Ok(())
     }
 
+    fn place_virtual(
+        &mut self,
+        command: &Command,
+        image_id: u32,
+        screen: &mut Screen,
+    ) -> Result<(), ProtocolError> {
+        let image = self
+            .images
+            .get(&image_id)
+            .ok_or_else(|| command.echo().error(ErrorCode::NotFound, "image not found"))?;
+        virtual_grid_dimensions(image.width, image.height, command, screen)?;
+        let placement_id = command.placement_id.unwrap_or(0);
+        if placement_id != 0 {
+            self.virtual_placements.retain(|placement| {
+                placement.image_id != image_id || placement.placement_id != placement_id
+            });
+        }
+        let virtual_id = self.next_virtual_id;
+        self.next_virtual_id = self.next_virtual_id.saturating_add(1);
+        self.virtual_placements.push(VirtualPlacementRecord {
+            id: virtual_id,
+            image_id,
+            placement_id,
+            command: command.clone(),
+        });
+        self.placeholder_revision = self.placeholder_revision.saturating_add(1);
+        self.touch_image(image_id);
+        self.refresh_unicode_placements(screen);
+        Ok(())
+    }
+
+    /// Rebuild only the current viewport's real images from `U+10EEEE` cells.
+    /// The invisible protocol placements remain in `virtual_placements`.
+    pub(crate) fn refresh_unicode_placements(&mut self, screen: &mut Screen) {
+        if self.virtual_placements.is_empty() {
+            self.clear_placeholder_fragments(screen);
+            self.placeholder_projection.clear();
+            self.rendered_placeholder_revision = self.placeholder_revision;
+            return;
+        }
+
+        let mut projection = Vec::new();
+        for visible_row in 0..screen.height() {
+            let absolute_line = screen.visible_row_to_absolute_line(visible_row);
+            let decoded = scan_cells(
+                (0..screen.width())
+                    .filter_map(|col| screen.get_cell_with_scrollback(absolute_line, col)),
+            );
+            projection.extend(decoded.into_iter().filter_map(|run| {
+                let placement = self.virtual_placements.iter().find(|placement| {
+                    placement.image_id == run.image_id
+                        && (run.placement_id == 0 || placement.placement_id == run.placement_id)
+                })?;
+                Some(PlaceholderProjection {
+                    absolute_line,
+                    run,
+                    virtual_id: placement.id,
+                })
+            }));
+        }
+        let fragments_are_live = self
+            .placeholder_fragments
+            .iter()
+            .all(|fragment| screen.image_by_id(fragment.screen_id).is_some());
+        if self.placeholder_projection == projection
+            && self.rendered_placeholder_revision == self.placeholder_revision
+            && fragments_are_live
+        {
+            return;
+        }
+
+        self.clear_placeholder_fragments(screen);
+        let mut source_cache = HashMap::new();
+        let mut complete = true;
+        for projected in &projection {
+            let absolute_line = projected.absolute_line;
+            let run = projected.run;
+            let Some(virtual_placement) = self
+                .virtual_placements
+                .iter()
+                .find(|placement| placement.id == projected.virtual_id)
+            else {
+                complete = false;
+                continue;
+            };
+            let Some(image) = self.images.get(&run.image_id) else {
+                complete = false;
+                continue;
+            };
+            let source = source_cache.entry(run.image_id).or_insert_with(|| {
+                RgbaImage::from_raw(image.width, image.height, image.rgba.as_ref().clone())
+                    .expect("stored Kitty image has validated RGBA dimensions")
+            });
+            let prepared =
+                match prepare_placeholder_fragment(source, &virtual_placement.command, run, screen)
+                {
+                    Ok(Some(prepared)) => prepared,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
+            let allocated_bytes = prepared.pixels.len();
+            if self
+                .total_bytes
+                .saturating_add(self.placement_bytes)
+                .saturating_add(allocated_bytes)
+                > STORE_QUOTA_BYTES
+            {
+                complete = false;
+                continue;
+            }
+            let screen_id = screen.add_rgba_image_at_absolute_line(
+                run.screen_col,
+                absolute_line,
+                prepared.cell_width,
+                prepared.cell_height,
+                DecodedRgbaImage {
+                    data: prepared.pixels,
+                    width: prepared.pixel_width,
+                    height: prepared.pixel_height,
+                    // Kitty's real cell images sit above the cell background,
+                    // below text/cursor, independent of the prototype's z.
+                    z_index: -1,
+                    protocol_image_id: run.image_id,
+                    clear_cells: false,
+                },
+            );
+            self.placement_bytes = self.placement_bytes.saturating_add(allocated_bytes);
+            self.placeholder_fragments.push(PlaceholderFragment {
+                screen_id,
+                allocated_bytes,
+            });
+        }
+        if complete {
+            self.placeholder_projection = projection;
+            self.rendered_placeholder_revision = self.placeholder_revision;
+        } else {
+            self.placeholder_projection.clear();
+            self.rendered_placeholder_revision = 0;
+        }
+    }
+
+    pub(crate) fn refresh_unicode_placement_geometry(&mut self, screen: &mut Screen) {
+        self.placeholder_revision = self.placeholder_revision.saturating_add(1);
+        self.refresh_unicode_placements(screen);
+    }
+
+    fn clear_placeholder_fragments(&mut self, screen: &mut Screen) {
+        for fragment in self.placeholder_fragments.drain(..) {
+            self.placement_bytes = self
+                .placement_bytes
+                .saturating_sub(fragment.allocated_bytes);
+            screen.remove_image(fragment.screen_id);
+        }
+    }
+
     fn delete(&mut self, command: &Command, screen: &mut Screen) {
         self.sync_placements(screen);
         let specifier = command.delete_specifier.unwrap_or(b'a');
@@ -1644,6 +1869,23 @@ impl KittyGraphics {
         let target_image = matches!(lower, b'i' | b'n')
             .then(|| self.resolve_image_id(command))
             .flatten();
+        let removed_virtual_images: Vec<u32> = self
+            .virtual_placements
+            .iter()
+            .filter(|placement| match lower {
+                b'i' | b'n' => {
+                    target_image == Some(placement.image_id)
+                        && command
+                            .placement_id
+                            .is_none_or(|id| id == placement.placement_id)
+                }
+                b'r' => {
+                    placement.image_id >= command.source_x && placement.image_id <= command.source_y
+                }
+                _ => false,
+            })
+            .map(|placement| placement.image_id)
+            .collect();
         let screen_ids: Vec<u64> = self
             .placements
             .iter()
@@ -1696,6 +1938,7 @@ impl KittyGraphics {
             .iter()
             .filter_map(|id| self.placements.get(id).map(|placement| placement.image_id))
             .collect();
+        affected_images.extend(&removed_virtual_images);
         if free_data {
             if matches!(lower, b'i' | b'n') {
                 affected_images.extend(target_image);
@@ -1712,6 +1955,22 @@ impl KittyGraphics {
         }
         for screen_id in screen_ids {
             self.remove_placement(screen_id, screen);
+        }
+        if !removed_virtual_images.is_empty() {
+            self.virtual_placements.retain(|placement| match lower {
+                b'i' | b'n' => {
+                    target_image != Some(placement.image_id)
+                        || command
+                            .placement_id
+                            .is_some_and(|id| id != placement.placement_id)
+                }
+                b'r' => {
+                    placement.image_id < command.source_x || placement.image_id > command.source_y
+                }
+                _ => true,
+            });
+            self.placeholder_revision = self.placeholder_revision.saturating_add(1);
+            self.refresh_unicode_placements(screen);
         }
         if free_data {
             for image_id in affected_images {
@@ -1746,6 +2005,14 @@ impl KittyGraphics {
 
     fn remove_image_data(&mut self, image_id: u32, screen: &mut Screen) {
         self.remove_placements_for_image(image_id, screen);
+        let virtual_count = self.virtual_placements.len();
+        self.virtual_placements
+            .retain(|placement| placement.image_id != image_id);
+        let removed_virtual = self.virtual_placements.len() != virtual_count;
+        if removed_virtual {
+            self.placeholder_revision = self.placeholder_revision.saturating_add(1);
+            self.clear_placeholder_fragments(screen);
+        }
         if let Some(image) = self.images.remove(&image_id) {
             self.total_bytes = self.total_bytes.saturating_sub(image.allocated_bytes());
         }
@@ -1753,6 +2020,9 @@ impl KittyGraphics {
             ids.retain(|id| *id != image_id);
         }
         self.image_numbers.retain(|_, ids| !ids.is_empty());
+        if removed_virtual {
+            self.refresh_unicode_placements(screen);
+        }
     }
 
     fn sync_placements(&mut self, screen: &Screen) {
@@ -1780,6 +2050,10 @@ impl KittyGraphics {
         self.placements
             .values()
             .any(|placement| placement.image_id == image_id)
+            || self
+                .virtual_placements
+                .iter()
+                .any(|placement| placement.image_id == image_id)
     }
 
     fn projected_usage(&self, incoming: usize, replacement_id: Option<u32>) -> usize {
@@ -1844,6 +2118,146 @@ struct PreparedPlacement {
     pixel_height: usize,
     cell_width: usize,
     cell_height: usize,
+}
+
+fn virtual_grid_dimensions(
+    image_width: u32,
+    image_height: u32,
+    command: &Command,
+    screen: &Screen,
+) -> Result<(u32, u32, u32, u32), ProtocolError> {
+    let echo = command.echo();
+    let cell_width = screen.cell_width_hint().round().max(1.0) as u32;
+    let cell_height = screen.cell_height_hint().round().max(1.0) as u32;
+    let columns = if command.columns == 0 {
+        image_width.div_ceil(cell_width)
+    } else {
+        command.columns
+    }
+    .max(1);
+    let rows = if command.rows == 0 {
+        image_height.div_ceil(cell_height)
+    } else {
+        command.rows
+    }
+    .max(1);
+    let box_width = columns
+        .checked_mul(cell_width)
+        .filter(|width| *width <= MAX_DIMENSION)
+        .ok_or_else(|| echo.error(ErrorCode::NoSpace, "virtual placement is too wide"))?;
+    let box_height = rows
+        .checked_mul(cell_height)
+        .filter(|height| *height <= MAX_DIMENSION)
+        .ok_or_else(|| echo.error(ErrorCode::NoSpace, "virtual placement is too tall"))?;
+    Ok((columns, rows, box_width, box_height))
+}
+
+fn prepare_placeholder_fragment(
+    source: &RgbaImage,
+    command: &Command,
+    run: PlaceholderRun,
+    screen: &Screen,
+) -> Result<Option<PreparedPlacement>, ProtocolError> {
+    let (columns, rows, box_width, box_height) =
+        virtual_grid_dimensions(source.width(), source.height(), command, screen)?;
+    if run.image_row >= rows || run.image_col >= columns {
+        return Ok(None);
+    }
+    let run_columns = u32::try_from(run.columns)
+        .unwrap_or(u32::MAX)
+        .min(columns - run.image_col);
+    if run_columns == 0 {
+        return Ok(None);
+    }
+    let cell_width = screen.cell_width_hint().round().max(1.0) as u32;
+    let cell_height = screen.cell_height_hint().round().max(1.0) as u32;
+    let scale = (f64::from(box_width) / f64::from(source.width()))
+        .min(f64::from(box_height) / f64::from(source.height()));
+    let scaled_width = (f64::from(source.width()) * scale)
+        .round()
+        .clamp(1.0, f64::from(box_width)) as u32;
+    let scaled_height = (f64::from(source.height()) * scale)
+        .round()
+        .clamp(1.0, f64::from(box_height)) as u32;
+    let image_left = (box_width - scaled_width) / 2;
+    let image_top = (box_height - scaled_height) / 2;
+    let run_left = run.image_col * cell_width;
+    let run_top = run.image_row * cell_height;
+    let run_width = run_columns * cell_width;
+    let run_bottom = run_top + cell_height;
+    let intersection_left = run_left.max(image_left);
+    let intersection_top = run_top.max(image_top);
+    let intersection_right = (run_left + run_width).min(image_left + scaled_width);
+    let intersection_bottom = run_bottom.min(image_top + scaled_height);
+    if intersection_left >= intersection_right || intersection_top >= intersection_bottom {
+        return Ok(None);
+    }
+
+    let source_left = u32::try_from(
+        (u64::from(intersection_left - image_left) * u64::from(source.width()))
+            / u64::from(scaled_width),
+    )
+    .unwrap_or(0);
+    let source_top = u32::try_from(
+        (u64::from(intersection_top - image_top) * u64::from(source.height()))
+            / u64::from(scaled_height),
+    )
+    .unwrap_or(0);
+    let source_right = u32::try_from(
+        (u64::from(intersection_right - image_left) * u64::from(source.width()))
+            .div_ceil(u64::from(scaled_width)),
+    )
+    .unwrap_or(source.width())
+    .min(source.width());
+    let source_bottom = u32::try_from(
+        (u64::from(intersection_bottom - image_top) * u64::from(source.height()))
+            .div_ceil(u64::from(scaled_height)),
+    )
+    .unwrap_or(source.height())
+    .min(source.height());
+    if source_left >= source_right || source_top >= source_bottom {
+        return Ok(None);
+    }
+    let cropped = imageops::crop_imm(
+        source,
+        source_left,
+        source_top,
+        source_right - source_left,
+        source_bottom - source_top,
+    )
+    .to_image();
+    let intersection_width = intersection_right - intersection_left;
+    let intersection_height = intersection_bottom - intersection_top;
+    let resized = imageops::resize(
+        &cropped,
+        intersection_width,
+        intersection_height,
+        imageops::FilterType::Triangle,
+    );
+    let byte_count = u64::from(run_width)
+        .checked_mul(u64::from(cell_height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes <= MAX_DECODED_BYTES as u64)
+        .ok_or_else(|| {
+            command
+                .echo()
+                .error(ErrorCode::NoSpace, "placeholder run is too large")
+        })?;
+    let mut fragment = RgbaImage::from_raw(run_width, cell_height, vec![0; byte_count as usize])
+        .expect("validated placeholder dimensions");
+    imageops::overlay(
+        &mut fragment,
+        &resized,
+        i64::from(intersection_left - run_left),
+        i64::from(intersection_top - run_top),
+    );
+    Ok(Some(PreparedPlacement {
+        pixels: Arc::new(fragment.into_raw()),
+        pixel_width: run_width as usize,
+        pixel_height: cell_height as usize,
+        cell_width: run_columns as usize,
+        cell_height: 1,
+    }))
 }
 
 fn normalize_frame_gap(gap: i32) -> u32 {
@@ -2263,6 +2677,153 @@ mod tests {
             screen.take_pending_responses(),
             vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]
         );
+    }
+
+    #[test]
+    fn unicode_placeholders_are_invisible_prototypes_that_follow_text_cells() {
+        use crate::cell::KITTY_IMAGE_PLACEHOLDER;
+        use crate::color::Color;
+
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(4, 3, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        let pixels = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=2,v=2,i=1,p=9,U=1,c=2,r=2", &pixels),
+        );
+        assert!(screen.images().is_empty(), "the U=1 prototype is invisible");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (0, 0));
+
+        for row in 0..2 {
+            for col in 0..2 {
+                let cell = screen.grid_mut().get_mut(row, col).unwrap();
+                let coordinate = ['\u{0305}', '\u{030D}'];
+                cell.set_text(&format!(
+                    "{KITTY_IMAGE_PLACEHOLDER}{}{}",
+                    coordinate[row], coordinate[col],
+                ));
+                cell.fg = Color::Indexed(1);
+                cell.underline_color = Some(Color::Indexed(9));
+            }
+        }
+        graphics.refresh_unicode_placements(&mut screen);
+        let images = screen.images();
+        assert_eq!(images.len(), 2, "each fused text row becomes one fragment");
+        assert!(images.iter().all(|image| image.z_index == -1));
+        assert_eq!(images[0].cell_width, 2);
+        assert_eq!(images[0].data.as_slice(), &pixels[..8]);
+        assert_eq!(images[1].data.as_slice(), &pixels[8..]);
+        let stable_ids: Vec<u64> = images.iter().map(|image| image.id).collect();
+        graphics.refresh_unicode_placements(&mut screen);
+        assert_eq!(
+            screen
+                .images()
+                .iter()
+                .map(|image| image.id)
+                .collect::<Vec<_>>(),
+            stable_ids,
+            "unchanged viewport projections reuse their RGBA fragments"
+        );
+
+        // Location-based deletion cannot touch virtual placements or the real
+        // images derived from their text cells.
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=a\x1b\\");
+        assert_eq!(screen.images().len(), 2);
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=i,i=1,p=9\x1b\\");
+        assert!(screen.images().is_empty());
+        assert!(graphics.virtual_placements.is_empty());
+        assert!(graphics.images.contains_key(&1));
+    }
+
+    #[test]
+    fn unicode_placeholders_preserve_aspect_ratio_and_center_transparent_padding() {
+        let mut screen = Screen::new(4, 3, ScreenConfig::default());
+        screen.set_cell_width_hint(2.0);
+        screen.set_cell_height_hint(2.0);
+        let source = RgbaImage::from_raw(
+            4,
+            2,
+            [[255, 0, 0, 255].repeat(4), [0, 0, 255, 255].repeat(4)].concat(),
+        )
+        .unwrap();
+        let command = Command {
+            columns: 2,
+            rows: 2,
+            ..Command::default()
+        };
+        let top = prepare_placeholder_fragment(
+            &source,
+            &command,
+            PlaceholderRun {
+                image_id: 1,
+                placement_id: 0,
+                image_row: 0,
+                image_col: 0,
+                screen_col: 0,
+                columns: 2,
+            },
+            &screen,
+        )
+        .unwrap()
+        .unwrap();
+        let bottom = prepare_placeholder_fragment(
+            &source,
+            &command,
+            PlaceholderRun {
+                image_id: 1,
+                placement_id: 0,
+                image_row: 1,
+                image_col: 0,
+                screen_col: 0,
+                columns: 2,
+            },
+            &screen,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!((top.pixel_width, top.pixel_height), (4, 2));
+        assert_eq!(&top.pixels[..16], &[0; 16]);
+        assert_eq!(&top.pixels[16..], &[255, 0, 0, 255].repeat(4));
+        assert_eq!(&bottom.pixels[..16], &[0, 0, 255, 255].repeat(4));
+        assert_eq!(&bottom.pixels[16..], &[0; 16]);
+    }
+
+    #[test]
+    fn unicode_placeholder_fragments_follow_client_selected_animation_frames() {
+        use crate::cell::KITTY_IMAGE_PLACEHOLDER;
+        use crate::color::Color;
+
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(2, 2, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=5,U=1,c=1,r=1", &[255, 0, 0, 255]),
+        );
+        let cell = screen.grid_mut().get_mut(0, 0).unwrap();
+        cell.set_text(&format!("{KITTY_IMAGE_PLACEHOLDER}\u{0305}\u{0305}"));
+        cell.fg = Color::Indexed(5);
+        graphics.refresh_unicode_placements(&mut screen);
+        assert_eq!(screen.images()[0].data.as_slice(), &[255, 0, 0, 255]);
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=f,i=5,f=32,s=1,v=1,X=1", &[0, 0, 255, 255]),
+        );
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=a,i=5,c=2\x1b\\");
+        graphics.refresh_unicode_placements(&mut screen);
+
+        assert_eq!(screen.images().len(), 1);
+        assert_eq!(screen.images()[0].data.as_slice(), &[0, 0, 255, 255]);
     }
 
     #[test]

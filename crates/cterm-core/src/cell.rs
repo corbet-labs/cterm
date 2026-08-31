@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::sync::Arc;
 
+/// Kitty's private-use scalar for image placements that move with text.
+pub const KITTY_IMAGE_PLACEHOLDER: char = '\u{10EEEE}';
+
 /// Maximum UTF-8 payload retained in one terminal cell.
 ///
 /// Real-world extended grapheme clusters are generally small. Bounding the
@@ -155,6 +158,11 @@ impl Cell {
     /// Return the first scalar value, primarily for character classification.
     pub fn first_char(&self) -> char {
         self.text.chars().next().unwrap_or(' ')
+    }
+
+    /// Whether this cell carries Kitty's Unicode image-placeholder scalar.
+    pub fn is_kitty_image_placeholder(&self) -> bool {
+        self.first_char() == KITTY_IMAGE_PLACEHOLDER
     }
 
     /// Return the cell content when it consists of exactly one scalar value.

@@ -391,6 +391,7 @@ impl Terminal {
         self.screen.resize(cols, rows);
         self.screen.set_cell_width_hint(size.cell_width());
         self.screen.set_cell_height_hint(size.cell_height());
+        self.parser.refresh_graphics_viewport(&mut self.screen);
         if let Some(ref pty) = self.pty {
             let _ = pty.resize_with_size(size);
         }
@@ -479,26 +480,37 @@ impl Terminal {
     pub fn scroll_viewport_up(&mut self, lines: usize) {
         let max_offset = self.screen.scrollback().len();
         self.screen.scroll_offset = (self.screen.scroll_offset + lines).min(max_offset);
+        self.parser.refresh_graphics_viewport(&mut self.screen);
     }
 
     /// Scroll viewport down (towards bottom)
     pub fn scroll_viewport_down(&mut self, lines: usize) {
         self.screen.scroll_offset = self.screen.scroll_offset.saturating_sub(lines);
+        self.parser.refresh_graphics_viewport(&mut self.screen);
     }
 
     /// Reset viewport to bottom
     pub fn scroll_viewport_to_bottom(&mut self) {
         self.screen.scroll_offset = 0;
+        self.parser.refresh_graphics_viewport(&mut self.screen);
     }
 
     /// Scroll to the closest shell prompt above the viewport.
     pub fn scroll_to_previous_prompt(&mut self) -> bool {
-        self.screen.scroll_to_previous_prompt()
+        let changed = self.screen.scroll_to_previous_prompt();
+        if changed {
+            self.parser.refresh_graphics_viewport(&mut self.screen);
+        }
+        changed
     }
 
     /// Scroll to the closest shell prompt below the viewport.
     pub fn scroll_to_next_prompt(&mut self) -> bool {
-        self.screen.scroll_to_next_prompt()
+        let changed = self.screen.scroll_to_next_prompt();
+        if changed {
+            self.parser.refresh_graphics_viewport(&mut self.screen);
+        }
+        changed
     }
 
     /// Return the output delimited by the latest OSC 133 C/D pair.
@@ -519,6 +531,7 @@ impl Terminal {
     /// Scroll to show a specific line from find results
     pub fn scroll_to_line(&mut self, line_idx: usize) {
         self.screen.scroll_offset = self.screen.line_to_scroll_offset(line_idx);
+        self.parser.refresh_graphics_viewport(&mut self.screen);
     }
 
     /// Handle keyboard input and generate appropriate escape sequences

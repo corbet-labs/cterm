@@ -279,6 +279,7 @@ impl CGRenderer {
                             && foreground_visible
                             && cell.text() != " "
                             && cell.text() != "\0"
+                            && !cell.is_kitty_image_placeholder()
                             && !cell.attrs.contains(CellAttrs::HIDDEN)
                         {
                             // DRCS is defined for individual character positions,

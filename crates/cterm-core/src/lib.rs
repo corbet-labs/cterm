@@ -14,6 +14,7 @@ pub mod image_decode;
 pub mod iterm2;
 pub mod keyboard;
 mod kitty_graphics;
+mod kitty_placeholder;
 pub mod mouse;
 mod osc1337;
 pub mod parser;

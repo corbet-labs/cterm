@@ -350,7 +350,7 @@ define_class!(
             {
                 let mut terminal = self.ivars().terminal.lock();
                 if terminal.screen().scroll_offset != 0 {
-                    terminal.screen_mut().scroll_offset = 0;
+                    terminal.scroll_viewport_to_bottom();
                     drop(terminal);
                     self.set_needs_display();
                 }

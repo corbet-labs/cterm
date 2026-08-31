@@ -196,6 +196,13 @@ impl Parser {
                 }
             }
         }
+        self.kitty_graphics.refresh_unicode_placements(screen);
+    }
+
+    /// Re-project Kitty Unicode placeholders after viewport or geometry changes.
+    pub(crate) fn refresh_graphics_viewport(&mut self, screen: &mut Screen) {
+        self.kitty_graphics
+            .refresh_unicode_placement_geometry(screen);
     }
 
     /// Sample terminal-driven Kitty animations from a monotonic clock.
@@ -3614,5 +3621,28 @@ mod tests {
             screen.take_pending_responses(),
             vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]
         );
+    }
+
+    #[test]
+    fn kitty_unicode_placeholder_is_combined_and_projected_after_parse() {
+        use crate::cell::KITTY_IMAGE_PLACEHOLDER;
+
+        let mut screen = make_screen();
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        let mut parser = Parser::new();
+        let input = format!(
+            "\x1b_Ga=T,f=32,s=1,v=1,i=1,U=1,c=1,r=1,C=1;/wAA/w==\x1b\\\x1b[38;5;1m{KITTY_IMAGE_PLACEHOLDER}\u{0305}\u{0305}"
+        );
+
+        parser.parse(&mut screen, input.as_bytes());
+
+        let cell = screen.get_cell(0, 0).unwrap();
+        assert!(cell.is_kitty_image_placeholder());
+        assert_eq!(cell.text().chars().count(), 3);
+        let images = screen.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].z_index, -1);
+        assert_eq!(images[0].data.as_slice(), &[255, 0, 0, 255]);
     }
 }
