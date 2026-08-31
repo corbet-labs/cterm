@@ -13,7 +13,9 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, HBRUSH, PAINTSTRUCT,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -350,6 +352,8 @@ pub struct WindowState {
     /// Last reported pointer position, used to coalesce cell-based motion while
     /// retaining every pixel transition in mode 1016.
     last_reported_mouse_position: Option<MousePosition>,
+    /// Whether Win32 is currently armed to send `WM_MOUSELEAVE`.
+    tracking_mouse_leave: bool,
     pane_divider_drag: Option<PaneDivider>,
     /// Key releases paired with key-down events consumed by application
     /// shortcuts must not leak into enhanced keyboard reporting.
@@ -473,6 +477,7 @@ impl WindowState {
             mouse_report_button: None,
             last_mouse_pos: (0.0, 0.0),
             last_reported_mouse_position: None,
+            tracking_mouse_leave: false,
             pane_divider_drag: None,
             suppressed_key_releases: HashSet::new(),
             reported_keys: HashMap::new(),
@@ -3912,6 +3917,43 @@ impl WindowState {
         }
     }
 
+    fn track_mouse_leave(&mut self) {
+        if self.tracking_mouse_leave {
+            return;
+        }
+        let mut tracking = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: self.hwnd,
+            dwHoverTime: 0,
+        };
+        if unsafe { TrackMouseEvent(&mut tracking) }.is_ok() {
+            self.tracking_mouse_leave = true;
+        }
+    }
+
+    fn on_mouse_leave(&mut self) {
+        self.tracking_mouse_leave = false;
+        let Some(position) = self.last_reported_mouse_position.take() else {
+            return;
+        };
+        let Some(terminal) = self.active_terminal() else {
+            return;
+        };
+        let mut term = terminal.lock().unwrap();
+        let mode = term.screen().modes.mouse_mode;
+        let encoding = term.screen().modes.mouse_encoding;
+        if let Some(sequence) = encode_mouse_event(
+            mode,
+            encoding,
+            ReportMouseEvent::Leave,
+            position,
+            current_mouse_modifiers(),
+        ) {
+            let _ = term.write(&sequence);
+        }
+    }
+
     /// Handle right-click for context menu
     pub fn on_right_click(&mut self, x: f32, y: f32) {
         // Check if click is in tab bar area
@@ -5277,7 +5319,13 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         WM_MOUSEMOVE => {
             let x = (lparam.0 & 0xFFFF) as i16 as f32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+            state.track_mouse_leave();
             state.on_mouse_move(x, y);
+            LRESULT(0)
+        }
+
+        WM_MOUSELEAVE => {
+            state.on_mouse_leave();
             LRESULT(0)
         }
 

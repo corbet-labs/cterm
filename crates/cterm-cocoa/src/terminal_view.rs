@@ -842,7 +842,8 @@ define_class!(
 
             // Create new tracking area covering the entire view
             let mtm = MainThreadMarker::from(self);
-            let options = NSTrackingAreaOptions::MouseMoved
+            let options = NSTrackingAreaOptions::MouseEnteredAndExited
+                | NSTrackingAreaOptions::MouseMoved
                 | NSTrackingAreaOptions::ActiveInKeyWindow
                 | NSTrackingAreaOptions::InVisibleRect;
 
@@ -907,6 +908,13 @@ define_class!(
                 let cursor: Retained<AnyObject> = msg_send![class!(NSCursor), IBeamCursor];
                 let _: () = msg_send![&*cursor, set];
             }
+        }
+
+        /// Report Kitty's SGR-pixel leave event to mouse-tracking applications.
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, event: &NSEvent) {
+            self.report_mouse_event(event, MouseEvent::Leave);
+            self.ivars().last_mouse_position.set(None);
         }
 
         /// Copy selection to clipboard (Command+C)

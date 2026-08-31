@@ -24,6 +24,8 @@ pub enum MouseEvent {
     Release(MouseButton),
     /// Motion with the held button, or `None` for hover motion.
     Motion(Option<MouseButton>),
+    /// Pointer left the native terminal view (Kitty SGR-pixel extension).
+    Leave,
 }
 
 /// Cell and pixel coordinates for one pointer event.
@@ -69,6 +71,24 @@ pub fn encode_mouse_event(
         MouseEvent::Press(button) => (Some(button), false, false),
         MouseEvent::Release(button) => (Some(button), true, false),
         MouseEvent::Motion(button) => (button, false, true),
+        MouseEvent::Leave => {
+            if mode == MouseMode::None || encoding != MouseEncoding::SgrPixels {
+                return None;
+            }
+            let mut code = 1 << 8 | 1 << 5;
+            if modifiers.shift {
+                code |= 4;
+            }
+            if modifiers.alt {
+                code |= 8;
+            }
+            if modifiers.ctrl {
+                code |= 16;
+            }
+            let x = i64::from(position.pixel_x.max(0)) + 1;
+            let y = i64::from(position.pixel_y.max(0)) + 1;
+            return Some(format!("\x1b[<{code};{x};{y}M").into_bytes());
+        }
     };
 
     // Check if this event type should be reported based on mode
@@ -338,6 +358,40 @@ mod tests {
                 MouseMode::X10,
                 MouseEncoding::Normal,
                 MouseEvent::Release(MouseButton::Left),
+                POS,
+                MouseModifiers::default(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn kitty_mouse_leave_is_reported_only_for_sgr_pixels() {
+        assert_eq!(
+            encode_mouse_event(
+                MouseMode::AnyEvent,
+                MouseEncoding::SgrPixels,
+                MouseEvent::Leave,
+                POS,
+                MouseModifiers::default(),
+            ),
+            Some(b"\x1b[<288;88;47M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse_event(
+                MouseMode::AnyEvent,
+                MouseEncoding::Sgr,
+                MouseEvent::Leave,
+                POS,
+                MouseModifiers::default(),
+            ),
+            None
+        );
+        assert_eq!(
+            encode_mouse_event(
+                MouseMode::None,
+                MouseEncoding::SgrPixels,
+                MouseEvent::Leave,
                 POS,
                 MouseModifiers::default(),
             ),

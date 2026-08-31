@@ -488,6 +488,12 @@ follow normal, virtual, or relative parents through named-placement updates;
 the bounded graph rejects missing parents, self-reference, cycles, and chains
 beyond 32 ancestors, and cascades parent lifetimes as required by Kitty.
 
+### Kitty miscellaneous extensions
+
+Kitty's independent bold/faint resets (`SGR 221`/`222`) and `CSI 22 J`
+viewport-to-scrollback operation are supported. Native Cocoa, GTK/Wayland, and
+Win32 pointer-leave hooks also emit Kitty's SGR-pixel mouse-leave report.
+
 Test with:
 ```bash
 # Using ImageMagick

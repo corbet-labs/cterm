@@ -2093,6 +2093,35 @@ impl Screen {
         self.dirty = true;
     }
 
+    /// Move the populated viewport into history, then leave a cleared screen.
+    ///
+    /// Kitty's `CSI 22 J` extension only moves rows from the primary screen
+    /// when the scrolling margins cover the full viewport. Trailing empty rows
+    /// are not added to history and the cursor remains in place.
+    pub(crate) fn move_viewport_to_scrollback(&mut self) {
+        let height = self.height();
+        let full_viewport = !self.modes.alternate_screen
+            && self.scroll_region.top == 0
+            && self.scroll_region.bottom == height;
+        if full_viewport {
+            let populated_rows = (0..height)
+                .rfind(|&row| self.grid.row(row).is_some_and(|row| !row.is_all_empty()))
+                .map_or(0, |row| row + 1);
+            if populated_rows > 0 {
+                let saved_region = self.scroll_region;
+                self.scroll_region = ScrollRegion {
+                    top: 0,
+                    bottom: height,
+                };
+                self.scroll_up(populated_rows);
+                self.scroll_region = saved_region;
+            }
+        }
+        let visible_top = self.scrollback.len();
+        self.images.retain(|_, image| image.line < visible_top);
+        self.clear(ClearMode::All);
+    }
+
     /// Clear line (or parts of it)
     pub fn clear_line(&mut self, mode: LineClearMode) {
         let cursor_row = self.cursor.row;

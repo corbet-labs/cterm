@@ -1297,6 +1297,22 @@ impl TerminalWidget {
             }
         });
 
+        let terminal_leave = Arc::clone(&terminal);
+        let last_position_leave = Rc::clone(&last_position);
+        motion_controller.connect_leave(move |controller| {
+            let state = controller
+                .current_event()
+                .map(|event| event.modifier_state())
+                .unwrap_or_else(gdk::ModifierType::empty);
+            let mut term = terminal_leave.lock();
+            report_mouse(
+                &mut term,
+                MouseEvent::Leave,
+                *last_position_leave.borrow(),
+                gtk_state_to_mouse_mods(state),
+            );
+        });
+
         self.drawing_area.add_controller(motion_controller);
 
         // Scroll handling

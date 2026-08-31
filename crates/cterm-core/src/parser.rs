@@ -838,6 +838,7 @@ impl vte::Perform for ScreenPerformer<'_> {
                     1 => self.screen.clear(ClearMode::Above),
                     2 => self.screen.clear(ClearMode::All),
                     3 => self.screen.clear(ClearMode::Scrollback),
+                    22 => self.screen.move_viewport_to_scrollback(),
                     _ => {}
                 }
             }
@@ -2036,6 +2037,9 @@ impl ScreenPerformer<'_> {
                     self.screen.style.attrs.remove(CellAttrs::BOLD);
                     self.screen.style.attrs.remove(CellAttrs::DIM);
                 }
+                // Kitty extensions: reset bold and faint independently.
+                [221] => self.screen.style.attrs.remove(CellAttrs::BOLD),
+                [222] => self.screen.style.attrs.remove(CellAttrs::DIM),
                 // Not italic
                 [23] => self.screen.style.attrs.remove(CellAttrs::ITALIC),
                 // Not underlined
@@ -2767,6 +2771,24 @@ mod tests {
     }
 
     #[test]
+    fn test_kitty_sgr_resets_bold_and_faint_independently() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b[1;2mA\x1b[221mB\x1b[1;222mC");
+
+        let both = screen.get_cell(0, 0).unwrap().attrs;
+        assert!(both.contains(CellAttrs::BOLD));
+        assert!(both.contains(CellAttrs::DIM));
+        let faint_only = screen.get_cell(0, 1).unwrap().attrs;
+        assert!(!faint_only.contains(CellAttrs::BOLD));
+        assert!(faint_only.contains(CellAttrs::DIM));
+        let bold_only = screen.get_cell(0, 2).unwrap().attrs;
+        assert!(bold_only.contains(CellAttrs::BOLD));
+        assert!(!bold_only.contains(CellAttrs::DIM));
+    }
+
+    #[test]
     fn test_cursor_blink_sources_match_foot() {
         let mut screen = make_screen();
         screen.configure_cursor(CursorStyle::Bar, false);
@@ -3155,6 +3177,48 @@ mod tests {
         for col in 0..5 {
             assert_eq!(screen.get_cell(0, col).unwrap().text(), " ");
         }
+    }
+
+    #[test]
+    fn test_kitty_ed_22_moves_content_into_scrollback() {
+        let mut screen = Screen::new(
+            5,
+            3,
+            ScreenConfig {
+                scrollback_lines: 10,
+            },
+        );
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"one\r\ntwo");
+        screen.add_image(
+            4,
+            0,
+            SixelImage {
+                data: vec![1, 2, 3, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+        screen.add_image(
+            4,
+            2,
+            SixelImage {
+                data: vec![1, 2, 3, 255],
+                width: 1,
+                height: 1,
+            },
+        );
+        let cursor = (screen.cursor.row, screen.cursor.col);
+
+        parser.parse(&mut screen, b"\x1b[22J");
+
+        assert_eq!(cursor, (screen.cursor.row, screen.cursor.col));
+        assert_eq!(screen.scrollback().len(), 2);
+        assert_eq!(screen.scrollback()[0].text(), "one");
+        assert_eq!(screen.scrollback()[1].text(), "two");
+        assert_eq!(screen.images().len(), 1);
+        assert_eq!(screen.images()[0].line, 0);
+        assert!((0..screen.height()).all(|row| screen.grid().row(row).unwrap().is_all_empty()));
     }
 
     #[test]
