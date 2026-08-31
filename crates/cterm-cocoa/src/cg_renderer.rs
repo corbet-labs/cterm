@@ -15,7 +15,7 @@ use cterm_core::drcs::DrcsGlyph;
 use cterm_core::TerminalImage;
 use cterm_core::{CursorStyle, Terminal};
 use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
-use cterm_ui::cursor::{extra_cursors_visible, resolve_extra_cursor_colors};
+use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::theme::Theme;
 
 /// CoreGraphics renderer for terminal display
@@ -189,7 +189,7 @@ impl CGRenderer {
                 for col in 0..cols {
                     if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
                         // Skip wide char spacers - background handled by the wide cell
-                        if cell.is_wide_spacer() {
+                        if cell.is_wide_spacer() || cell.is_multicell_spacer() {
                             continue;
                         }
 
@@ -198,7 +198,12 @@ impl CGRenderer {
                         let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
 
                         // Check if cell is selected
-                        let is_selected = screen.is_selected(absolute_line, col);
+                        let span_columns = cell
+                            .multicell
+                            .as_ref()
+                            .map_or(1, |multicell| usize::from(multicell.columns));
+                        let is_selected = (col..col.saturating_add(span_columns).min(cols))
+                            .any(|column| screen.is_selected(absolute_line, column));
 
                         // XOR selection with INVERSE attribute to determine if colors should be inverted
                         let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
@@ -259,7 +264,9 @@ impl CGRenderer {
                             };
 
                         // Use double width for wide characters
-                        let char_width = if cell.is_wide() {
+                        let char_width = if let Some(multicell) = cell.multicell.as_ref() {
+                            self.cell_width * f64::from(multicell.columns)
+                        } else if cell.is_wide() {
                             self.cell_width * 2.0
                         } else {
                             self.cell_width
@@ -757,16 +764,14 @@ impl CGRenderer {
         cursor_color: &Rgb,
         text_color: &Rgb,
     ) {
-        let x = col as f64 * self.cell_width;
-        let y = row as f64 * self.cell_height;
-        let width = screen
-            .get_cell(row, col)
-            .filter(|cell| cell.is_wide())
-            .map_or(self.cell_width, |_| self.cell_width * 2.0);
+        let footprint = cursor_footprint(screen, row, col);
+        let x = footprint.col as f64 * self.cell_width;
+        let y = footprint.row as f64 * self.cell_height;
+        let width = footprint.columns as f64 * self.cell_width;
         self.draw_cursor(x, y, width, style, cursor_color);
 
         if style == CursorStyle::Block {
-            if let Some(cell) = screen.get_cell(row, col) {
+            if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
                 if cell.text() != " "
                     && cell.text() != "\0"
                     && !cell.is_kitty_image_placeholder()

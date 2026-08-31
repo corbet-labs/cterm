@@ -8,7 +8,8 @@ use cterm_core::grid::Row as CoreRow;
 use cterm_core::term::Terminal;
 use cterm_core::{
     Cell, CellAttrs, Color, ColorQuery, CursorStyle, ExtraCursor, ExtraCursorColor,
-    ExtraCursorColors, ExtraCursorShape, MouseEncoding, MouseMode, Rgb, Screen, TerminalImage,
+    ExtraCursorColors, ExtraCursorShape, MouseEncoding, MouseMode, Multicell, Rgb, Screen,
+    TerminalImage, TextSizeAlignment,
 };
 use std::sync::Arc;
 
@@ -100,7 +101,71 @@ pub fn cell_to_proto(cell: &Cell) -> proto::Cell {
             id: h.id.clone(),
             uri: h.uri.clone(),
         }),
+        multicell: cell.multicell.as_ref().map(multicell_to_proto),
     }
+}
+
+fn text_size_alignment_to_proto(alignment: TextSizeAlignment) -> proto::TextSizeAlignment {
+    match alignment {
+        TextSizeAlignment::Start => proto::TextSizeAlignment::Start,
+        TextSizeAlignment::End => proto::TextSizeAlignment::End,
+        TextSizeAlignment::Center => proto::TextSizeAlignment::Center,
+    }
+}
+
+fn proto_to_text_size_alignment(alignment: i32) -> TextSizeAlignment {
+    match proto::TextSizeAlignment::try_from(alignment) {
+        Ok(proto::TextSizeAlignment::End) => TextSizeAlignment::End,
+        Ok(proto::TextSizeAlignment::Center) => TextSizeAlignment::Center,
+        _ => TextSizeAlignment::Start,
+    }
+}
+
+fn multicell_to_proto(multicell: &Multicell) -> proto::Multicell {
+    let (fractional_numerator, fractional_denominator) = multicell
+        .fractional_scale
+        .map_or((None, None), |(numerator, denominator)| {
+            (Some(u32::from(numerator)), Some(u32::from(denominator)))
+        });
+    proto::Multicell {
+        text: multicell.text().to_owned(),
+        columns: u32::from(multicell.columns),
+        rows: u32::from(multicell.rows),
+        column_offset: u32::from(multicell.column_offset),
+        row_offset: u32::from(multicell.row_offset),
+        scale: u32::from(multicell.scale),
+        fractional_numerator,
+        fractional_denominator,
+        vertical_alignment: text_size_alignment_to_proto(multicell.vertical_alignment) as i32,
+        horizontal_alignment: text_size_alignment_to_proto(multicell.horizontal_alignment) as i32,
+        natural_width: multicell.natural_width,
+    }
+}
+
+fn proto_to_multicell(multicell: &proto::Multicell) -> Option<Multicell> {
+    let fractional_scale = match (
+        multicell.fractional_numerator,
+        multicell.fractional_denominator,
+    ) {
+        (Some(numerator), Some(denominator)) => Some((
+            u8::try_from(numerator).ok()?,
+            u8::try_from(denominator).ok()?,
+        )),
+        (None, None) => None,
+        _ => return None,
+    };
+    Multicell::from_parts(
+        multicell.text.clone(),
+        u8::try_from(multicell.columns).ok()?,
+        u8::try_from(multicell.rows).ok()?,
+        u8::try_from(multicell.column_offset).ok()?,
+        u8::try_from(multicell.row_offset).ok()?,
+        u8::try_from(multicell.scale).ok()?,
+        fractional_scale,
+        proto_to_text_size_alignment(multicell.vertical_alignment),
+        proto_to_text_size_alignment(multicell.horizontal_alignment),
+        multicell.natural_width,
+    )
 }
 
 /// Convert a bare cell slice to a protocol row.
@@ -687,7 +752,17 @@ pub fn apply_screen_snapshot(terminal: &mut Terminal, screen_data: &proto::GetSc
 }
 
 fn apply_proto_cell(cell: &mut Cell, proto_cell: &proto::Cell) {
-    cell.set_text(&proto_cell.char);
+    cell.multicell = proto_cell.multicell.as_ref().and_then(proto_to_multicell);
+    if cell.multicell.as_ref().is_some_and(Multicell::is_anchor) {
+        let text = cell
+            .multicell
+            .as_ref()
+            .map(|multicell| multicell.text().to_owned())
+            .unwrap_or_default();
+        cell.set_text_size_payload(&text);
+    } else {
+        cell.set_text(&proto_cell.char);
+    }
     cell.fg = proto_cell
         .fg
         .as_ref()
@@ -732,6 +807,23 @@ mod tests {
         let cell = Cell::new('A');
         let proto = cell_to_proto(&cell);
         assert_eq!(proto.char, "A");
+    }
+
+    #[test]
+    fn text_width_span_roundtrips_through_screen_snapshot() {
+        let mut source = Terminal::new(8, 2, ScreenConfig::default());
+        source.process(b"\x1b]66;w=3;ab;c\x07");
+        let snapshot = screen_to_proto(source.screen(), false);
+        let mut restored = Terminal::new(8, 2, ScreenConfig::default());
+
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        for col in 0..3 {
+            let source_cell = source.screen().get_cell(0, col).unwrap();
+            let restored_cell = restored.screen().get_cell(0, col).unwrap();
+            assert_eq!(restored_cell, source_cell);
+            assert_eq!(restored_cell.multicell.as_ref().unwrap().text(), "ab;c");
+        }
     }
 
     #[test]

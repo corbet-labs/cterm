@@ -504,6 +504,16 @@ share the main cursor's blink phase but remain visible independently of
 DECTCEM. GTK/Wayland, Cocoa, and Direct2D render the same overlay state, which
 also survives daemon snapshots and incremental screen updates.
 
+### Kitty Text Sizing
+
+The width-control part of Kitty OSC 66 is supported. Fixed-width payloads and
+natural-width grapheme chunks occupy an atomic cell span across overwriting,
+ICH, DCH, ECH, selection, resize/reflow, scrollback, daemon snapshots, and
+incremental screen updates. GTK/Wayland, Cocoa, and Direct2D render the same
+span and expand a cursor placed anywhere inside it. Integer and fractional font
+scaling are not yet advertised; Kitty's CPR probe therefore distinguishes this
+honest width-only implementation from full text scaling.
+
 Test with:
 ```bash
 # Using ImageMagick

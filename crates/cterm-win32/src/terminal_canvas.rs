@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use cterm_core::color::{Color, Rgb};
 use cterm_core::{Cell, CellAttrs, CursorStyle, Screen};
 use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
-use cterm_ui::cursor::{extra_cursors_visible, resolve_extra_cursor_colors};
+use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::pane::PaneRect;
 use cterm_ui::theme::Theme;
 use windows::core::{Interface, PCWSTR};
@@ -550,7 +550,7 @@ impl TerminalRenderer {
 
             for col in 0..cols {
                 if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
-                    if cell.is_wide_spacer() {
+                    if cell.is_wide_spacer() || cell.is_multicell_spacer() {
                         continue;
                     }
                     self.draw_cell(
@@ -585,10 +585,21 @@ impl TerminalRenderer {
 
         let attrs = cell.attrs;
         let foreground_visible = cell_foreground_visible(attrs, blink_phase);
-        let is_selected = screen.is_selected(position.absolute_line, position.col);
+        let span_columns = cell
+            .multicell
+            .as_ref()
+            .map_or(1, |multicell| usize::from(multicell.columns));
+        let is_selected = (position.col
+            ..position
+                .col
+                .saturating_add(span_columns)
+                .min(screen.width()))
+            .any(|col| screen.is_selected(position.absolute_line, col));
         let (fg, bg) = self.resolve_colors(cell, screen, screen.modes.reverse_video, is_selected);
         let palette = self.resolved_palette(screen);
-        let cell_width = if cell.is_wide() {
+        let cell_width = if let Some(multicell) = cell.multicell.as_ref() {
+            self.cell_dims.width * f32::from(multicell.columns)
+        } else if cell.is_wide() {
             self.cell_dims.width * 2.0
         } else {
             self.cell_dims.width
@@ -890,28 +901,31 @@ impl TerminalRenderer {
         cursor_color: Rgb,
         text_color: Rgb,
     ) -> windows::core::Result<()> {
-        let x = self.origin_x + col as f32 * self.cell_dims.width;
-        let y = self.origin_y + row as f32 * self.cell_dims.height;
+        let footprint = cursor_footprint(screen, row, col);
+        let x = self.origin_x + footprint.col as f32 * self.cell_dims.width;
+        let y = self.origin_y + footprint.row as f32 * self.cell_dims.height;
+        let width = footprint.columns as f32 * self.cell_dims.width;
+        let height = footprint.rows as f32 * self.cell_dims.height;
         let brush = self.get_brush(cursor_color)?;
 
         let rect = match style {
             CursorStyle::Block => D2D_RECT_F {
                 left: x,
                 top: y,
-                right: x + self.cell_dims.width,
-                bottom: y + self.cell_dims.height,
+                right: x + width,
+                bottom: y + height,
             },
             CursorStyle::Underline => D2D_RECT_F {
                 left: x,
-                top: y + self.cell_dims.height - 2.0,
-                right: x + self.cell_dims.width,
-                bottom: y + self.cell_dims.height,
+                top: y + height - 2.0,
+                right: x + width,
+                bottom: y + height,
             },
             CursorStyle::Bar => D2D_RECT_F {
                 left: x,
                 top: y,
                 right: x + 2.0,
-                bottom: y + self.cell_dims.height,
+                bottom: y + height,
             },
         };
 
@@ -929,7 +943,7 @@ impl TerminalRenderer {
         }
 
         // Draw the character under a block cursor with inverted color.
-        if let Some(cell) = screen.get_cell(row, col) {
+        if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
             let text = cell.text();
 
             if text != " "
@@ -943,12 +957,8 @@ impl TerminalRenderer {
                 let utf16: Vec<u16> = text.encode_utf16().collect();
 
                 let layout: IDWriteTextLayout = unsafe {
-                    self.dwrite_factory.CreateTextLayout(
-                        &utf16,
-                        text_format,
-                        self.cell_dims.width * 2.0,
-                        self.cell_dims.height,
-                    )?
+                    self.dwrite_factory
+                        .CreateTextLayout(&utf16, text_format, width, height)?
                 };
 
                 let origin = D2D_POINT_2F { x, y };

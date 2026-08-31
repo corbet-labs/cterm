@@ -13,6 +13,44 @@ pub struct ResolvedExtraCursorColors {
     pub text: Rgb,
 }
 
+/// Cell block covered by a cursor positioned anywhere inside OSC 66 text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorFootprint {
+    pub row: usize,
+    pub col: usize,
+    pub rows: usize,
+    pub columns: usize,
+}
+
+pub fn cursor_footprint(screen: &Screen, row: usize, col: usize) -> CursorFootprint {
+    let Some(cell) = screen.get_cell(row, col) else {
+        return CursorFootprint {
+            row,
+            col,
+            rows: 1,
+            columns: 1,
+        };
+    };
+    cell.multicell.as_ref().map_or_else(
+        || CursorFootprint {
+            row,
+            col: if cell.is_wide_spacer() {
+                col.saturating_sub(1)
+            } else {
+                col
+            },
+            rows: 1,
+            columns: usize::from(cell.is_wide() || cell.is_wide_spacer()) + 1,
+        },
+        |multicell| CursorFootprint {
+            row: row.saturating_sub(usize::from(multicell.row_offset)),
+            col: col.saturating_sub(usize::from(multicell.column_offset)),
+            rows: usize::from(multicell.rows),
+            columns: usize::from(multicell.columns),
+        },
+    )
+}
+
 /// Extra cursors ignore DECTCEM but share the main cursor's blink phase.
 pub fn extra_cursors_visible(screen: &Screen, phase: BlinkPhase) -> bool {
     screen.has_extra_cursors()
@@ -95,6 +133,23 @@ mod tests {
         assert_eq!(
             screen.extra_cursors().next().unwrap().shape,
             ExtraCursorShape::Block
+        );
+    }
+
+    #[test]
+    fn cursor_covers_an_entire_text_width_span() {
+        let mut screen = Screen::new(5, 1, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b]66;w=3;x\x07");
+
+        assert_eq!(
+            cursor_footprint(&screen, 0, 2),
+            CursorFootprint {
+                row: 0,
+                col: 0,
+                rows: 1,
+                columns: 3,
+            }
         );
     }
 }

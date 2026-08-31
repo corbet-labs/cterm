@@ -25,6 +25,7 @@ pub mod sixel;
 pub mod ssh;
 pub mod streaming_file;
 pub mod term;
+mod text_sizing;
 
 pub use cell::{Cell, CellAttrs};
 pub use color::{AnsiColor, Color, ColorPalette, Rgb};
@@ -54,3 +55,4 @@ pub use ssh::{
 pub use ssh::{SshChannelOpener, SshChannelReader, SshChannelWriter, SshTunnel};
 pub use streaming_file::{StreamingFileData, StreamingFileReceiver, StreamingFileResult};
 pub use term::{Terminal, WriteFn};
+pub use text_sizing::{Multicell, TextSizeAlignment};

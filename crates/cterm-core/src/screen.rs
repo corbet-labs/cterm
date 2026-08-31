@@ -14,11 +14,13 @@ use crate::multiple_cursors::{
 };
 use crate::sixel::SixelImage;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+mod text_sizing;
 
 /// Configuration for the screen
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -849,7 +851,7 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
                 rows[row_index]
                     .iter()
                     .take(used)
-                    .filter(|cell| !cell.is_wide_spacer())
+                    .filter(|cell| !cell.is_wide_spacer() && !cell.is_multicell_spacer())
                     .cloned(),
             );
         }
@@ -861,11 +863,20 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
         let mut boundaries = vec![(first_row_index, 0)];
 
         for mut cell in cells {
-            let cell_width = if cell.is_wide() && new_width > 1 {
-                2
-            } else {
-                1
-            };
+            let cell_width = cell.multicell.as_ref().map_or_else(
+                || {
+                    if cell.is_wide() && new_width > 1 {
+                        2
+                    } else {
+                        1
+                    }
+                },
+                |multicell| usize::from(multicell.columns),
+            );
+            if cell_width > new_width {
+                boundaries.extend((0..cell_width).map(|_| (output.len(), col)));
+                continue;
+            }
 
             if col > 0 && col + cell_width > new_width || col == new_width {
                 output.push(row);
@@ -880,7 +891,17 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
             cell.attrs.remove(CellAttrs::WIDE_SPACER);
             row[col] = cell.clone();
 
-            if cell_width == 2 {
+            if let Some(multicell) = cell.multicell.clone() {
+                for offset in 1..cell_width {
+                    let mut spacer = cell.clone();
+                    spacer.set_char(' ');
+                    if let Some(metadata) = spacer.multicell.as_mut() {
+                        debug_assert!(metadata.same_span(&multicell));
+                        metadata.column_offset = offset as u8;
+                    }
+                    row[col + offset] = spacer;
+                }
+            } else if cell_width == 2 {
                 let mut spacer = cell;
                 spacer.set_char(' ');
                 spacer.attrs.remove(CellAttrs::WIDE);
@@ -1800,6 +1821,10 @@ impl Screen {
     pub fn put_char(&mut self, c: char) {
         let c = self.map_active_charset_char(c);
 
+        if self.try_extend_previous_multicell(c) {
+            return;
+        }
+
         if self.try_extend_previous_grapheme(c) {
             return;
         }
@@ -1831,7 +1856,10 @@ impl Screen {
         // Clear selection if writing to a selected row
         self.clear_selection_if_row_selected(self.cursor.row);
 
-        self.clear_wide_cell_at(self.cursor.row, self.cursor.col);
+        for col in self.cursor.col..self.cursor.col.saturating_add(width) {
+            self.clear_multicell_span_at(self.cursor.row, col);
+            self.clear_wide_cell_at(self.cursor.row, col);
+        }
 
         // Write the character
         if let Some(cell) = self.grid.get_mut(self.cursor.row, self.cursor.col) {
@@ -1963,6 +1991,7 @@ impl Screen {
                 }
             }
         }
+        self.repair_multicell_spans_in_row(cursor_row);
     }
 
     /// Move cursor to start of line
@@ -2157,6 +2186,7 @@ impl Screen {
 
         match mode {
             ClearMode::Below => {
+                self.clear_multicells_intersecting_row_range(cursor_row, cursor_col, width);
                 // Clear from cursor to end of line
                 if let Some(row) = self.grid.row_mut(cursor_row) {
                     for col in cursor_col..width {
@@ -2178,6 +2208,11 @@ impl Screen {
                     }
                 }
                 // Clear from start of line to cursor
+                self.clear_multicells_intersecting_row_range(
+                    cursor_row,
+                    0,
+                    cursor_col.saturating_add(1),
+                );
                 if let Some(row) = self.grid.row_mut(cursor_row) {
                     for col in 0..=cursor_col.min(width.saturating_sub(1)) {
                         row[col].reset();
@@ -2240,6 +2275,7 @@ impl Screen {
             LineClearMode::All => (0, width),
         };
 
+        self.clear_multicells_intersecting_row_range(cursor_row, start, end);
         if let Some(row) = self.grid.row_mut(cursor_row) {
             if matches!(mode, LineClearMode::All) {
                 row.clear();
@@ -2538,6 +2574,35 @@ impl Screen {
 
             // Clear the rightmost cells
             for col in width.saturating_sub(count)..width {
+                row[col].reset();
+            }
+        }
+        self.repair_multicell_spans_in_row(cursor_row);
+        self.dirty = true;
+    }
+
+    /// Insert blank cells at the cursor for CSI ICH.
+    pub(crate) fn insert_chars(&mut self, count: usize) {
+        let count = count.min(self.width().saturating_sub(self.cursor.col));
+        if count == 0 {
+            return;
+        }
+        self.clear_selection_if_row_selected(self.cursor.row);
+        self.insert_cells(count);
+        self.dirty = true;
+    }
+
+    /// Erase cells at the cursor for CSI ECH, expanding through OSC 66 spans.
+    pub(crate) fn erase_chars(&mut self, count: usize) {
+        let count = count.min(self.width().saturating_sub(self.cursor.col));
+        if count == 0 {
+            return;
+        }
+        self.clear_selection_if_row_selected(self.cursor.row);
+        let end = self.cursor.col + count;
+        self.clear_multicells_intersecting_row_range(self.cursor.row, self.cursor.col, end);
+        if let Some(row) = self.grid.row_mut(self.cursor.row) {
+            for col in self.cursor.col..end {
                 row[col].reset();
             }
         }
@@ -3611,9 +3676,18 @@ impl Screen {
                 (sc, ec)
             };
 
-            // Extract characters from this row
+            // Extract characters from this row. Selecting any occupied cell
+            // includes an OSC 66 span once, rather than exposing its spacers.
+            let mut emitted_multicells = HashSet::new();
             for col in start_col..=end_col {
                 if let Some(cell) = row.get(col) {
+                    if let Some(multicell) = cell.multicell.as_ref() {
+                        let anchor = col.saturating_sub(usize::from(multicell.column_offset));
+                        if emitted_multicells.insert(anchor) {
+                            result.push_str(multicell.text());
+                        }
+                        continue;
+                    }
                     // Skip wide character spacers
                     if !cell.attrs.contains(crate::cell::CellAttrs::WIDE_SPACER) {
                         result.push_str(cell.text());
@@ -3718,8 +3792,18 @@ impl Screen {
                 (sc, ec)
             };
 
+            let mut emitted_multicells = HashSet::new();
             for col in start_col..=end_col {
-                if let Some(cell) = row.get(col) {
+                if let Some(selected_cell) = row.get(col) {
+                    let cell = if let Some(multicell) = selected_cell.multicell.as_ref() {
+                        let anchor = col.saturating_sub(usize::from(multicell.column_offset));
+                        if !emitted_multicells.insert(anchor) {
+                            continue;
+                        }
+                        row.get(anchor).unwrap_or(selected_cell)
+                    } else {
+                        selected_cell
+                    };
                     // Skip wide character spacers
                     if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
                         continue;

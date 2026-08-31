@@ -25,7 +25,7 @@ use cterm_ui::blink::{
     cell_foreground_visible, cursor_visible, BlinkClock, BlinkNeeds, BlinkPhase,
     BLINK_POLL_INTERVAL,
 };
-use cterm_ui::cursor::{extra_cursors_visible, resolve_extra_cursor_colors};
+use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::sprite::{Sprite, SpriteCache};
 use cterm_ui::theme::Theme;
 
@@ -2323,18 +2323,25 @@ fn draw_terminal(
                 let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
 
                 // Skip wide char spacers
-                if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
+                if cell.attrs.contains(CellAttrs::WIDE_SPACER) || cell.is_multicell_spacer() {
                     continue;
                 }
 
                 // Check if this cell is selected
-                let is_selected = screen.is_selected(absolute_line, col_idx);
+                let span_columns = cell
+                    .multicell
+                    .as_ref()
+                    .map_or(1, |multicell| usize::from(multicell.columns));
+                let is_selected = (col_idx..col_idx.saturating_add(span_columns).min(cols))
+                    .any(|col| screen.is_selected(absolute_line, col));
 
                 // Determine if cell has INVERSE attribute (XOR with selection)
                 let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
                     ^ is_selected
                     ^ screen.modes.reverse_video;
-                let char_width = if cell.attrs.contains(CellAttrs::WIDE) {
+                let char_width = if let Some(multicell) = cell.multicell.as_ref() {
+                    cell_width * f64::from(multicell.columns)
+                } else if cell.attrs.contains(CellAttrs::WIDE) {
                     cell_width * 2.0
                 } else {
                     cell_width
@@ -2419,12 +2426,14 @@ fn draw_terminal(
 
                         layout.set_attributes(Some(&attrs));
                         layout.set_text(cell.text());
+                        layout.set_width((char_width * f64::from(pango::SCALE)) as i32);
 
                         cr.move_to(x, y);
                         pangocairo::functions::show_layout(cr, &layout);
 
                         // Reset attributes
                         layout.set_attributes(None::<&pango::AttrList>);
+                        layout.set_width(-1);
                     }
                 }
 
@@ -2595,16 +2604,19 @@ fn draw_cursor_cell(
     cell_width: f64,
     cell_height: f64,
 ) {
-    let x = col as f64 * cell_width;
-    let y = row as f64 * cell_height;
+    let footprint = cursor_footprint(screen, row, col);
+    let x = footprint.col as f64 * cell_width;
+    let y = footprint.row as f64 * cell_height;
+    let width = footprint.columns as f64 * cell_width;
+    let height = footprint.rows as f64 * cell_height;
     let (red, green, blue) = cursor_color.to_f64();
     cr.set_source_rgb(red, green, blue);
 
     match style {
         CursorStyle::Block => {
-            cr.rectangle(x, y, cell_width, cell_height);
+            cr.rectangle(x, y, width, height);
             cr.fill().ok();
-            if let Some(cell) = screen.get_cell(row, col) {
+            if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
                 if cell.text() != " "
                     && !cell.is_kitty_image_placeholder()
                     && !cell.attrs.contains(CellAttrs::HIDDEN)
@@ -2612,17 +2624,19 @@ fn draw_cursor_cell(
                     let (red, green, blue) = text_color.to_f64();
                     cr.set_source_rgb(red, green, blue);
                     layout.set_text(cell.text());
+                    layout.set_width((width * f64::from(pango::SCALE)) as i32);
                     cr.move_to(x, y);
                     pangocairo::functions::show_layout(cr, layout);
+                    layout.set_width(-1);
                 }
             }
         }
         CursorStyle::Underline => {
-            cr.rectangle(x, y + cell_height - 2.0, cell_width, 2.0);
+            cr.rectangle(x, y + height - 2.0, width, 2.0);
             cr.fill().ok();
         }
         CursorStyle::Bar => {
-            cr.rectangle(x, y, 2.0, cell_height);
+            cr.rectangle(x, y, 2.0, height);
             cr.fill().ok();
         }
     }

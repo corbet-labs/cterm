@@ -32,6 +32,7 @@ use crate::sixel::{
     SixelDecoder, SixelDecoderConfig, SixelImage, DEFAULT_SIXEL_MAX_BYTES, MAX_SIXEL_COLORS,
     MAX_SIXEL_DIMENSION,
 };
+use crate::text_sizing::parse_text_size_request;
 
 /// DCS (Device Control String) state for handling multi-byte sequences
 enum DcsState {
@@ -661,6 +662,13 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Kitty desktop notifications, including chunking and capability,
             // close, and liveness requests.
             99 => self.handle_osc99(params, bell_terminated),
+            // Kitty text sizing. The core advertises width support through
+            // cursor movement; integer scaling is enabled in a later stage.
+            66 => {
+                if let Some(request) = parse_text_size_request(params) {
+                    self.screen.put_text_size(request);
+                }
+            }
             // Set/query 256-color palette entries.
             4 => {
                 for pair in params[1..].as_chunks::<2>().0 {
@@ -884,15 +892,7 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Erase Characters (ECH)
             ('X', []) => {
                 let n = first_param(&params_vec, 1);
-                let cursor_row = self.screen.cursor.row;
-                let cursor_col = self.screen.cursor.col;
-                let width = self.screen.width();
-                let count = n.min(width.saturating_sub(cursor_col));
-                if let Some(row) = self.screen.grid_mut().row_mut(cursor_row) {
-                    for i in 0..count {
-                        row[cursor_col + i].reset();
-                    }
-                }
+                self.screen.erase_chars(n);
             }
             // Repeat the preceding graphic character (REP). Bound the repeat
             // count to one screen, matching foot's denial-of-service guard.
@@ -913,19 +913,7 @@ impl vte::Perform for ScreenPerformer<'_> {
             // Insert Characters (ICH)
             ('@', []) => {
                 let n = first_param(&params_vec, 1);
-                let cursor_row = self.screen.cursor.row;
-                let col = self.screen.cursor.col;
-                let width = self.screen.width();
-                if let Some(row) = self.screen.grid_mut().row_mut(cursor_row) {
-                    // Shift characters right
-                    for i in (col + n..width).rev() {
-                        row[i] = row[i - n].clone();
-                    }
-                    // Clear inserted positions
-                    for i in col..col + n.min(width.saturating_sub(col)) {
-                        row[i].reset();
-                    }
-                }
+                self.screen.insert_chars(n);
             }
             // Vertical Line Position Absolute (VPA)
             ('d', []) => {
@@ -2934,6 +2922,100 @@ mod tests {
         parser.parse(&mut screen, b"\x1b[>1;4 q\x1b[?1049h\x1b[>100 q");
         assert_eq!(screen.take_pending_responses(), vec![b"\x1b[>100 q"]);
         assert!(!screen.has_extra_cursors());
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_width_protocol_and_overwrite() {
+        let mut screen = Screen::new(8, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]66;w=3;ab;c\x07");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (0, 3));
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "ab;c");
+        for col in 0..3 {
+            let multicell = screen
+                .get_cell(0, col)
+                .and_then(|cell| cell.multicell.as_ref())
+                .expect("OSC 66 metadata");
+            assert_eq!(multicell.columns, 3);
+            assert_eq!(usize::from(multicell.column_offset), col);
+            assert_eq!(multicell.text(), "ab;c");
+        }
+
+        screen.start_selection(0, 2, crate::screen::SelectionMode::Char);
+        assert_eq!(screen.get_selected_text().as_deref(), Some("ab;c"));
+        screen.clear_selection();
+
+        // Writing over any cell in a one-row span clears the entire span.
+        screen.move_cursor(0, 1);
+        parser.parse(&mut screen, b"X");
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), " ");
+        assert_eq!(screen.get_cell(0, 1).unwrap().text(), "X");
+        assert_eq!(screen.get_cell(0, 2).unwrap().text(), " ");
+        assert!(screen
+            .grid()
+            .row(0)
+            .unwrap()
+            .iter()
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_width_editing_and_reflow_are_atomic() {
+        let mut screen = Screen::new(6, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"a\x1b]66;w=3;B\x07c");
+        screen.move_cursor(0, 2);
+        parser.parse(&mut screen, b"\x1b[X");
+        assert_eq!(screen.grid().row(0).unwrap().text(), "a   c");
+
+        screen.move_cursor(0, 1);
+        parser.parse(&mut screen, b"\x1b]66;w=3;B\x07");
+        screen.resize(4, 3);
+        let row = screen.grid().row(0).unwrap();
+        assert_eq!(row[1].text(), "B");
+        assert_eq!(row[1].multicell.as_ref().unwrap().columns, 3);
+        assert!(row[2].is_multicell_spacer());
+        assert!(row[3].is_multicell_spacer());
+
+        screen.move_cursor(0, 2);
+        parser.parse(&mut screen, b"\x1b[@");
+        assert!(screen
+            .grid()
+            .row(0)
+            .unwrap()
+            .iter()
+            .all(|cell| cell.multicell.is_none()));
+
+        let mut screen = Screen::new(6, 2, ScreenConfig::default());
+        parser.parse(&mut screen, b"a\x1b]66;w=3;B\x07c\x1b[1;3H\x1b[P");
+        assert_eq!(screen.grid().row(0).unwrap().text(), "a  c");
+        assert!(screen
+            .grid()
+            .row(0)
+            .unwrap()
+            .iter()
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_capability_is_honestly_width_only() {
+        let mut screen = Screen::new(8, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\r\x1b[6n\x1b]66;w=2; \x07\x1b[6n\x1b]66;s=2; \x07\x1b[6n",
+        );
+        assert_eq!(
+            screen.take_pending_responses(),
+            vec![
+                b"\x1b[1;1R".to_vec(),
+                b"\x1b[1;3R".to_vec(),
+                b"\x1b[1;4R".to_vec(),
+            ]
+        );
     }
 
     #[test]

@@ -105,7 +105,7 @@ impl Row {
     pub fn write_text_to(&self, buf: &mut String) {
         buf.clear();
         for cell in &self.cells {
-            if !cell.is_wide_spacer() {
+            if !cell.is_wide_spacer() && !cell.is_multicell_spacer() {
                 buf.push_str(cell.text());
             }
         }

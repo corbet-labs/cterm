@@ -613,6 +613,27 @@ message Cell {
   CellAttributes attrs = 4;
   optional Color underline_color = 5;
   optional Hyperlink hyperlink = 6;
+  optional Multicell multicell = 7;
+}
+
+message Multicell {
+  string text = 1;
+  uint32 columns = 2;
+  uint32 rows = 3;
+  uint32 column_offset = 4;
+  uint32 row_offset = 5;
+  uint32 scale = 6;
+  optional uint32 fractional_numerator = 7;
+  optional uint32 fractional_denominator = 8;
+  TextSizeAlignment vertical_alignment = 9;
+  TextSizeAlignment horizontal_alignment = 10;
+  bool natural_width = 11;
+}
+
+enum TextSizeAlignment {
+  TEXT_SIZE_ALIGNMENT_START = 0;
+  TEXT_SIZE_ALIGNMENT_END = 1;
+  TEXT_SIZE_ALIGNMENT_CENTER = 2;
 }
 
 message Color {

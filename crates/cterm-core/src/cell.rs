@@ -4,6 +4,7 @@
 //! extended grapheme cluster, colors, and attributes.
 
 use crate::color::Color;
+use crate::text_sizing::{Multicell, MAX_TEXT_SIZE_PAYLOAD_BYTES};
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -126,6 +127,8 @@ pub struct Cell {
     pub attrs: CellAttrs,
     /// Hyperlink if present (shared via Arc for efficiency)
     pub hyperlink: Option<Arc<Hyperlink>>,
+    /// Kitty OSC 66 layout metadata for a fixed-width or scaled text block.
+    pub multicell: Option<Multicell>,
 }
 
 impl Default for Cell {
@@ -137,6 +140,7 @@ impl Default for Cell {
             underline_color: None,
             attrs: CellAttrs::empty(),
             hyperlink: None,
+            multicell: None,
         }
     }
 }
@@ -191,6 +195,15 @@ impl Cell {
         self.text = SmolStr::new(&text[..end]);
     }
 
+    /// Store a pre-bounded OSC 66 payload in the anchor cell.
+    pub fn set_text_size_payload(&mut self, text: &str) {
+        let mut end = text.len().min(MAX_TEXT_SIZE_PAYLOAD_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text = SmolStr::new(&text[..end]);
+    }
+
     /// Append a scalar value while enforcing the per-cell memory bound.
     pub(crate) fn append_char(&mut self, c: char) -> bool {
         if self.text.len() + c.len_utf8() > MAX_GRAPHEME_BYTES {
@@ -216,6 +229,7 @@ impl Cell {
             && self.bg == Color::Default
             && self.attrs.is_empty()
             && self.hyperlink.is_none()
+            && self.multicell.is_none()
     }
 
     /// Check if this cell is a wide character
@@ -226,6 +240,13 @@ impl Cell {
     /// Check if this cell is a spacer for a wide character
     pub fn is_wide_spacer(&self) -> bool {
         self.attrs.contains(CellAttrs::WIDE_SPACER)
+    }
+
+    /// Whether this is a non-anchor cell occupied by Kitty OSC 66 text.
+    pub fn is_multicell_spacer(&self) -> bool {
+        self.multicell
+            .as_ref()
+            .is_some_and(|multicell| !multicell.is_anchor())
     }
 
     /// Reset cell to empty state
@@ -272,6 +293,7 @@ impl CellStyle {
             underline_color: self.underline_color,
             attrs: self.attrs,
             hyperlink: self.hyperlink.clone(),
+            multicell: None,
         }
     }
 
