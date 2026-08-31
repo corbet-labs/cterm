@@ -117,6 +117,52 @@ fn template_remote_details(plan: &TemplateLaunchPlan) -> Option<(&str, &str, boo
     }
 }
 
+struct TemplateSpawnRequest {
+    options: cterm_client::CreateSessionOpts,
+    template_name: String,
+    tab_color: Option<String>,
+    background_color: Option<String>,
+    keep_open: bool,
+    theme: Theme,
+    remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
+}
+
+fn prepare_template_spawn(
+    plan: TemplateLaunchPlan,
+    config: &Config,
+    fallback_theme: &Theme,
+    remote_manager: cterm_client::RemoteManager,
+) -> Result<TemplateSpawnRequest, String> {
+    if let Some((directory, git_remote)) = plan.local_workspace_preparation() {
+        cterm_app::prepare_working_directory(directory, git_remote).map_err(|error| {
+            format!(
+                "failed to prepare workspace for template '{}': {error}",
+                plan.template_name
+            )
+        })?;
+    }
+
+    let theme = template_theme(config, fallback_theme, plan.appearance.theme.as_deref());
+    let options = plan.session_options(80, 24);
+    let remote = template_remote_details(&plan).map(|(name, host, ssh_compression)| {
+        (
+            remote_manager,
+            name.to_string(),
+            host.to_string(),
+            ssh_compression,
+        )
+    });
+    Ok(TemplateSpawnRequest {
+        options,
+        template_name: plan.template_name,
+        tab_color: plan.appearance.tab_color,
+        background_color: plan.appearance.background_color,
+        keep_open: plan.keep_open,
+        theme,
+        remote,
+    })
+}
+
 struct DaemonProcessQuery {
     session_id: String,
     daemon_socket: Option<std::path::PathBuf>,
@@ -1653,7 +1699,10 @@ impl CtermWindow {
         remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
         daemon_socket: Option<std::path::PathBuf>,
     ) {
-        self.spawn_daemon_tab_with_theme(
+        Self::spawn_daemon_window_with_theme(
+            MainThreadMarker::from(self),
+            Some(self),
+            self.config_with_live_shortcuts(),
             opts,
             template_name,
             color,
@@ -1675,47 +1724,71 @@ impl CtermWindow {
             log::warn!("Ignoring template launch plan in managed mode");
             return false;
         }
-        if let Some((directory, git_remote)) = plan.local_workspace_preparation() {
-            if let Err(error) = cterm_app::prepare_working_directory(directory, git_remote) {
-                log::error!(
-                    "Failed to prepare workspace for template '{}': {error}",
-                    plan.template_name
-                );
+        let config = self.config_with_live_shortcuts();
+        let request =
+            match prepare_template_spawn(plan, &config, &self.ivars().theme, remote_manager) {
+                Ok(request) => request,
+                Err(error) => {
+                    log::error!("{error}");
+                    return false;
+                }
+            };
+        Self::spawn_daemon_window_with_theme(
+            MainThreadMarker::from(self),
+            Some(self),
+            config,
+            request.options,
+            Some(request.template_name),
+            request.tab_color,
+            request.background_color,
+            request.keep_open,
+            request.theme,
+            request.remote,
+            None,
+        );
+        true
+    }
+
+    /// Launch a normalized template plan as a new standalone native window.
+    pub(crate) fn spawn_template_plan_in_new_window(
+        mtm: MainThreadMarker,
+        config: &Config,
+        fallback_theme: &Theme,
+        plan: TemplateLaunchPlan,
+        remote_manager: cterm_client::RemoteManager,
+    ) -> bool {
+        if crate::app::get_args().managed {
+            log::warn!("Ignoring standalone template launch plan in managed mode");
+            return false;
+        }
+        let request = match prepare_template_spawn(plan, config, fallback_theme, remote_manager) {
+            Ok(request) => request,
+            Err(error) => {
+                log::error!("{error}");
                 return false;
             }
-        }
-
-        let config = self.config_with_live_shortcuts();
-        let theme = template_theme(
-            &config,
-            &self.ivars().theme,
-            plan.appearance.theme.as_deref(),
-        );
-        let opts = plan.session_options(80, 24);
-        let remote = template_remote_details(&plan).map(|(name, host, ssh_compression)| {
-            (
-                remote_manager,
-                name.to_string(),
-                host.to_string(),
-                ssh_compression,
-            )
-        });
-        self.spawn_daemon_tab_with_theme(
-            opts,
-            Some(plan.template_name),
-            plan.appearance.tab_color,
-            plan.appearance.background_color,
-            plan.keep_open,
-            theme,
-            remote,
+        };
+        Self::spawn_daemon_window_with_theme(
+            mtm,
+            None,
+            config.clone(),
+            request.options,
+            Some(request.template_name),
+            request.tab_color,
+            request.background_color,
+            request.keep_open,
+            request.theme,
+            request.remote,
             None,
         );
         true
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn spawn_daemon_tab_with_theme(
-        &self,
+    fn spawn_daemon_window_with_theme(
+        mtm: MainThreadMarker,
+        tab_owner: Option<&Self>,
+        config: Config,
         mut opts: cterm_client::CreateSessionOpts,
         template_name: Option<String>,
         color: Option<String>,
@@ -1725,17 +1798,19 @@ impl CtermWindow {
         remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
         daemon_socket: Option<std::path::PathBuf>,
     ) {
-        let config = self.config_with_live_shortcuts();
         ensure_session_pixel_size(&config, &mut opts);
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
         opts.frontend_state.appearance = theme.appearance();
         let launch_context = PaneLaunchContext::capture(&opts);
         let remote_name = remote.as_ref().map(|(_, name, _, _)| name.clone());
-        let window = unsafe {
-            Retained::retain(self as *const _ as *mut CtermWindow)
-                .expect("a live tab owner can be retained")
-        };
-        let window = dispatch2::MainThreadBound::new(window, MainThreadMarker::from(self));
+        let tab_owner = tab_owner.map(|tab_owner| {
+            let tab_owner = unsafe {
+                Retained::retain(tab_owner as *const _ as *mut CtermWindow)
+                    .expect("a live tab owner can be retained")
+            };
+            dispatch2::MainThreadBound::new(tab_owner, mtm)
+        });
+        let joins_tab_group = tab_owner.is_some();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1761,8 +1836,11 @@ impl CtermWindow {
                 Ok(session) => {
                     dispatch2::Queue::main().exec_async(move || {
                         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-                        let window = window.into_inner(mtm);
-                        if window.ivars().closed.get() {
+                        let tab_owner = tab_owner.map(|owner| owner.into_inner(mtm));
+                        if tab_owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.ivars().closed.get())
+                        {
                             destroy_unattached_session(session);
                             return;
                         }
@@ -1796,17 +1874,23 @@ impl CtermWindow {
                                 unsafe { msg_send![&*delegate, registerWindow: &*new_window] };
                         }
 
-                        window.addTabbedWindow_ordered(
-                            &new_window,
-                            objc2_app_kit::NSWindowOrderingMode::Above,
-                        );
+                        if let Some(owner) = tab_owner.as_ref() {
+                            owner.addTabbedWindow_ordered(
+                                &new_window,
+                                objc2_app_kit::NSWindowOrderingMode::Above,
+                            );
+                        }
                         new_window.makeKeyAndOrderFront(None);
 
                         if let Some(ref c) = color {
                             new_window.set_tab_color(Some(c));
                         }
 
-                        log::info!("Created daemon tab: {}", title);
+                        if joins_tab_group {
+                            log::info!("Created daemon tab: {title}");
+                        } else {
+                            log::info!("Created standalone daemon window: {title}");
+                        }
                     });
                 }
                 Err(e) => {
@@ -2576,19 +2660,36 @@ mod action_dispatch_tests {
             command: Some("just".into()),
             args: vec!["test".into()],
             working_directory: Some("/srv/project".into()),
+            color: Some("#123456".into()),
+            theme: Some("light".into()),
+            background_color: Some("#abcdef".into()),
+            keep_open: true,
             remote: Some("builder".into()),
             ..Default::default()
         };
 
         let plan = TemplateLaunchPlan::build(&template, &config).unwrap();
-
-        assert_eq!(
-            template_remote_details(&plan),
-            Some(("builder", "dev@build.example.com", false))
-        );
         assert!(plan.local_workspace_preparation().is_none());
-        let options = plan.session_options(80, 24);
-        assert_eq!(options.cwd.as_deref(), Some("/srv/project"));
+        let request = prepare_template_spawn(
+            plan,
+            &config,
+            &Theme::tokyo_night(),
+            cterm_client::RemoteManager::new(),
+        )
+        .unwrap();
+
+        assert_eq!(request.template_name, "Remote build");
+        assert_eq!(request.options.shell.as_deref(), Some("just"));
+        assert_eq!(request.options.args, ["test"]);
+        assert_eq!(request.options.cwd.as_deref(), Some("/srv/project"));
+        assert_eq!(request.tab_color.as_deref(), Some("#123456"));
+        assert_eq!(request.background_color.as_deref(), Some("#abcdef"));
+        assert!(request.keep_open);
+        assert_eq!(request.theme.name, "Default Light");
+        let (_, remote_name, remote_host, ssh_compression) = request.remote.unwrap();
+        assert_eq!(remote_name, "builder");
+        assert_eq!(remote_host, "dev@build.example.com");
+        assert!(!ssh_compression);
     }
 
     #[test]

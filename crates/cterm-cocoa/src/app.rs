@@ -1386,11 +1386,18 @@ impl AppDelegate {
             return;
         }
 
-        let Some(window) = self.template_target_window(preferred_window) else {
-            log::error!("Cannot launch template without a tracked terminal window");
-            return;
+        let launched = if let Some(window) = self.template_target_window(preferred_window) {
+            window.spawn_template_plan(plan, self.ivars().remote_manager.clone())
+        } else {
+            CtermWindow::spawn_template_plan_in_new_window(
+                MainThreadMarker::from(self),
+                &config,
+                &self.ivars().theme,
+                plan,
+                self.ivars().remote_manager.clone(),
+            )
         };
-        if window.spawn_template_plan(plan, self.ivars().remote_manager.clone()) {
+        if launched {
             log::info!("Template launch requested from Cocoa");
         }
     }
