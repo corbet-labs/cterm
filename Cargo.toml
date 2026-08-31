@@ -29,6 +29,7 @@ members = [
     "crates/cterm-app",
     "crates/cterm-proto",
     "crates/cterm-client",
+    "crates/cterm-plugin-api",
     "crates/cterm-gtk",
     "crates/cterm-cocoa",
     "crates/cterm-win32",
@@ -136,6 +137,7 @@ cterm-ui = { path = "crates/cterm-ui" }
 cterm-app = { path = "crates/cterm-app" }
 cterm-proto = { path = "crates/cterm-proto" }
 cterm-client = { path = "crates/cterm-client" }
+cterm-plugin-api = { path = "crates/cterm-plugin-api" }
 cterm-headless = { path = "crates/cterm-headless" }
 
 [profile.release]

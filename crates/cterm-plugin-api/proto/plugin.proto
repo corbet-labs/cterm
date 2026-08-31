@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package cterm.plugin.v1;
+
+// ABI v1 is deliberately a single command request and response. The runner
+// creates a fresh WASI store for every invocation.
+message PluginRequest {
+  uint32 abi_major = 1;
+  uint32 abi_minor = 2;
+  string command_id = 3;
+}
+
+message PluginResponse {
+  uint32 abi_major = 1;
+  uint32 abi_minor = 2;
+  repeated ActionInvocation actions = 3;
+  repeated string diagnostics = 4;
+}
+
+message ActionInvocation {
+  string id = 1;
+
+  oneof parameter {
+    uint32 tab = 10;
+    SplitDirection split_direction = 11;
+    PaneDirection pane_direction = 12;
+  }
+}
+
+enum SplitDirection {
+  SPLIT_DIRECTION_UNSPECIFIED = 0;
+  SPLIT_DIRECTION_HORIZONTAL = 1;
+  SPLIT_DIRECTION_VERTICAL = 2;
+}
+
+enum PaneDirection {
+  PANE_DIRECTION_UNSPECIFIED = 0;
+  PANE_DIRECTION_LEFT = 1;
+  PANE_DIRECTION_RIGHT = 2;
+  PANE_DIRECTION_UP = 3;
+  PANE_DIRECTION_DOWN = 4;
+}

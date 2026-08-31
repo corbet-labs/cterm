@@ -9,6 +9,20 @@ is omitted for readability.
 
 ## [Unreleased]
 
+### Added
+- A fail-closed command-plugin foundation with fixed WebAssembly packages,
+  strict manifests, content-addressed trust, exact per-action grants, and a
+  bounded versioned protobuf ABI. Plugin execution and UI discovery remain a
+  subsequent stage.
+- Native FreeBSD builds now compile the GTK4/Wayland client and daemon and run
+  their portable library and daemon-integration tests in a FreeBSD 14.4 VM.
+
+### Fixed
+- Streamed OSC 1337 interception now replays incomplete, cancelled, and
+  oversized sequences atomically instead of leaving the VTE parser inside a
+  partial control string. Large replay and decoded-transfer spill files are
+  unique and private, and failed receptions remove their temporary storage.
+
 ## [0.0.20] - 2026-08-31
 
 ### Added
