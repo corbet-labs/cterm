@@ -443,7 +443,9 @@ fn state_after_escaped_osc_replay(byte: u8) -> State {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_replay_file, InterceptorResult, Osc1337Interceptor};
+    #[cfg(unix)]
+    use super::create_replay_file;
+    use super::{InterceptorResult, Osc1337Interceptor};
 
     #[derive(Debug, Default, PartialEq, Eq)]
     struct RecordingPerformer {
