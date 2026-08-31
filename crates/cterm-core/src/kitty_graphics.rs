@@ -687,7 +687,7 @@ fn decode_raw(
     data.truncate(expected as usize);
     let rgba = if command.format == Format::Rgb24 {
         let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-        for pixel in data.chunks_exact(3) {
+        for pixel in data.as_chunks::<3>().0 {
             rgba.extend_from_slice(pixel);
             rgba.push(255);
         }
