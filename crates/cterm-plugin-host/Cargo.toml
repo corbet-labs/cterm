@@ -1,0 +1,22 @@
+[package]
+name = "cterm-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated one-shot Wasm command-plugin runner for cterm"
+
+[[bin]]
+name = "cterm-plugin-host"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+cterm-plugin-api.workspace = true
+thiserror.workspace = true
+wasi-common = { version = "36.0.6", default-features = false, features = ["sync"] }
+wasmi = { version = "=1.1.0", default-features = false, features = ["std"] }
+wasmi_wasi = { version = "=1.1.0", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+wat = "=1.239.0"

@@ -11,10 +11,16 @@ components listed here. The original notices are preserved in the derived files.
 | Alacritty VTE | `89c12df969145ffb5084d1122627d7292c2c638f` (`vte` 0.13.1) | Adapted tested SGR parameter grouping and extended-color validation in `cterm-core` | MIT |
 | foot | `765ca4070bb6f095fc58c030f2154ed03857701d` (1.27.0) | Behavioral reference and adapted DEC rectangular-editing, xterm palette-stack, Sixel aspect/palette/resource-management, and theme/visibility-reporting semantics, validation and tests in `cterm-core` | MIT |
 | Zellij | `e839bfffa586992364309a685b2c71f3b23c247e` | Adapted all-or-none bounded control-string interception and split/recovery test structure for streamed OSC 1337 in `cterm-core` | MIT |
+| Wasmi / `wasmi_wasi` | `c517895c2db09f660d6eae0bc4549861ab8fd88f` (`v1.1.0`) | Pinned Cargo runtime and WASIp1 adapter used only by the isolated `cterm-plugin-host`; no source copied | MIT OR Apache-2.0 (cterm distributes under the MIT option) |
+| Bytecode Alliance `wasi-common` | `3d0ec7e7c5ae4cd3f9b99d915276926d799b9a2b` (`v36.0.14`, constrained to the patched 36.x line) | Directly constrained transitive WASIp1 context and bounded virtual pipes for `cterm-plugin-host`; no source copied | Apache-2.0 WITH LLVM-exception |
 
 The KarpelesLab/cterm source incorporated at the fork base retains its original
 MIT grant and notice in `LICENSES/KARPELESLAB-CTERM-MIT.txt`. Subsequent cterm
 contributions are provided under FSL-1.1-ALv2; see `LICENSE`.
+
+The selected Wasmi MIT notice is preserved in `LICENSES/WASMI-MIT.txt`.
+`wasi-common`'s Apache-2.0 license with LLVM exception is preserved in
+`LICENSES/WASI-COMMON-APACHE-2.0-WITH-LLVM-EXCEPTION.txt`.
 
 ## Rio / Sugarloaf MIT license
 

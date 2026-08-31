@@ -30,6 +30,7 @@ members = [
     "crates/cterm-proto",
     "crates/cterm-client",
     "crates/cterm-plugin-api",
+    "crates/cterm-plugin-host",
     "crates/cterm-gtk",
     "crates/cterm-cocoa",
     "crates/cterm-win32",
@@ -94,7 +95,6 @@ hmac = "0.12"
 getrandom = "0.3"
 zeroize = { version = "1", features = ["derive"] }
 semver = "1"
-bincode = "1"
 libc = "0.2"
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
@@ -138,6 +138,7 @@ cterm-app = { path = "crates/cterm-app" }
 cterm-proto = { path = "crates/cterm-proto" }
 cterm-client = { path = "crates/cterm-client" }
 cterm-plugin-api = { path = "crates/cterm-plugin-api" }
+cterm-plugin-host = { path = "crates/cterm-plugin-host" }
 cterm-headless = { path = "crates/cterm-headless" }
 
 [profile.release]
