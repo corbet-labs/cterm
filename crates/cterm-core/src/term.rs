@@ -289,9 +289,9 @@ impl Terminal {
 
     fn expire_synchronized_update_at(&mut self, now: Instant) -> bool {
         if !self.screen.modes.application_sync_updates
-            || !self
+            || self
                 .synchronized_update_deadline
-                .is_some_and(|deadline| now >= deadline)
+                .is_none_or(|deadline| now < deadline)
         {
             return false;
         }
