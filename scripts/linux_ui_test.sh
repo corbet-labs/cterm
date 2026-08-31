@@ -5,6 +5,7 @@ set -euo pipefail
 
 CTERM_PATH="${1:-target/debug/cterm}"
 OUTPUT_DIR="${2:-test_output}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd -P)"
@@ -136,6 +137,31 @@ export CTERM_WAYLAND_TEMPLATE_CI_WORKSPACE="$TEMPLATE_WORKSPACE"
 
 log "Prepared isolated Quick Open template fixture"
 
+export XDG_DATA_HOME="$OUTPUT_DIR/xdg-data"
+PLUGIN_DIR="$XDG_DATA_HOME/cterm/plugins/org.example.ui"
+PLUGIN_GRANT="$XDG_DATA_HOME/cterm/plugin-grants.toml"
+mkdir -p "$PLUGIN_DIR"
+cat >"$PLUGIN_DIR/cterm-plugin.toml" <<'EOF'
+manifest_version = 1
+id = "org.example.ui"
+name = "UI Test Plugin"
+version = "1.0.0"
+abi = "1.0"
+
+[[commands]]
+id = "new-tab"
+title = "Open Test Tab"
+
+[capabilities.invoke-actions]
+allow = ["cterm:new-tab"]
+EOF
+base64 -d \
+    <"$SCRIPT_DIR/../crates/cterm-plugin-host/tests/fixtures/ui_new_tab.wasm.base64" \
+    >"$PLUGIN_DIR/plugin.wasm"
+export CTERM_WAYLAND_PLUGIN_CI_ACTION_ID="plugin:org.example.ui/new-tab"
+
+log "Prepared isolated native plugin fixture"
+
 log "Starting cterm..."
 "$CTERM_PATH" >"$OUTPUT_DIR/cterm.stdout.log" 2>"$OUTPUT_DIR/cterm.stderr.log" &
 CTERM_PID=$!
@@ -192,6 +218,8 @@ required_markers=(
     "CTERM_TEMPLATE_CI INGRESS_OK source=quick-open"
     "CTERM_TEMPLATE_CI LAUNCH_OK argv=visible cwd=prepared keep_open=true color=#2a7fff"
     "CTERM_TEMPLATE_CI UNIQUE_OK tabs=2 session=reused"
+    "CTERM_PLUGIN_CI PROMPT_OK backend=wayland"
+    "CTERM_PLUGIN_CI EXECUTION_OK action=cterm:new-tab"
     "CTERM_PANE_CI COMPLETE"
 )
 for marker in "${required_markers[@]}"; do
@@ -201,6 +229,11 @@ for marker in "${required_markers[@]}"; do
         exit 1
     fi
 done
+
+if [ ! -s "$PLUGIN_GRANT" ] || ! grep -Fq 'plugin = "org.example.ui"' "$PLUGIN_GRANT"; then
+    log "ERROR: accepted native plugin prompt did not persist its exact local grant"
+    exit 1
+fi
 
 if grep -Eqi 'panic|Gdk-CRITICAL|Gtk-ERROR|segmentation fault|CTERM_PANE_CI FAIL' \
     "$OUTPUT_DIR/cterm.stderr.log" "$OUTPUT_DIR/cterm.log" 2>/dev/null; then

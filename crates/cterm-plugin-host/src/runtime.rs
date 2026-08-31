@@ -300,6 +300,7 @@ pub enum RunnerError {
 mod tests {
     use std::fs;
 
+    use base64::Engine as _;
     use cterm_plugin_api::{encode_request_frame, PluginBundle, ABI_MAJOR, ABI_MINOR};
     use wasmi::TrapCode;
 
@@ -313,6 +314,8 @@ mod tests {
     const TRAP: &str = include_str!("../tests/fixtures/trap.wat");
     const UNSUPPORTED_IMPORT: &str = include_str!("../tests/fixtures/unsupported_import.wat");
     const EMPTY_AMBIENT_STATE: &str = include_str!("../tests/fixtures/empty_ambient_state.wat");
+    const UI_NEW_TAB_WAT: &str = include_str!("../tests/fixtures/ui_new_tab.wat");
+    const UI_NEW_TAB_BASE64: &str = include_str!("../tests/fixtures/ui_new_tab.wasm.base64");
 
     struct TestBundle {
         _directory: tempfile::TempDir,
@@ -420,6 +423,17 @@ allow = [{allow}]
             assert_eq!(output.response().actions[0].id, "cterm:new-tab");
             assert!(output.stderr().is_empty());
         }
+    }
+
+    #[test]
+    fn ui_fixture_binary_matches_its_reviewable_wat_source() {
+        let committed = base64::engine::general_purpose::STANDARD
+            .decode(UI_NEW_TAB_BASE64.trim())
+            .unwrap();
+        assert_eq!(committed, wat::parse_str(UI_NEW_TAB_WAT).unwrap());
+
+        let output = run(UI_NEW_TAB_WAT, &["cterm:new-tab"]).unwrap();
+        assert_eq!(output.response().actions[0].id, "cterm:new-tab");
     }
 
     #[test]

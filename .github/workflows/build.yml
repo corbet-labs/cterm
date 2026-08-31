@@ -158,7 +158,7 @@ jobs:
         run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
       - name: Build cterm for UI tests
-        run: cargo build -p cterm
+        run: cargo build -p cterm -p cterm-plugin-host
 
       - name: Run Wayland pane UI/action test
         run: |
@@ -214,7 +214,7 @@ jobs:
               protobuf \
               rust
           run: |
-            cargo build --locked -p cterm -p cterm-headless
+            cargo build --locked -p cterm -p cterm-headless -p cterm-plugin-host
             cargo test --locked --workspace --exclude cterm-cocoa --exclude cterm-win32 --lib
             cargo test --locked -p cterm-headless --test grpc_integration -- --test-threads=1
 
@@ -222,6 +222,7 @@ jobs:
             install -m 0755 \
               target/debug/cterm \
               target/debug/ctermd \
+              target/debug/cterm-plugin-host \
               freebsd-ui-binaries/
 
       - name: Upload FreeBSD UI binaries
@@ -266,6 +267,7 @@ jobs:
             chmod +x \
               freebsd-ui-binaries/cterm \
               freebsd-ui-binaries/ctermd \
+              freebsd-ui-binaries/cterm-plugin-host \
               scripts/linux_ui_test.sh
 
             {
@@ -459,7 +461,7 @@ jobs:
         run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
       - name: Build cterm for UI tests
-        run: cargo build -p cterm
+        run: cargo build -p cterm -p cterm-plugin-host
 
       - name: Run UI automation test
         run: |
@@ -706,7 +708,7 @@ jobs:
         run: cargo test -p cterm-headless --test grpc_integration -- --test-threads=1
 
       - name: Build cterm for UI tests
-        run: cargo build -p cterm
+        run: cargo build -p cterm -p cterm-plugin-host
 
       - name: Run UI automation test
         shell: pwsh

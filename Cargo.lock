@@ -796,6 +796,7 @@ dependencies = [
 name = "cterm-plugin-host"
 version = "0.0.20"
 dependencies = [
+ "base64",
  "clap",
  "cterm-plugin-api",
  "tempfile",

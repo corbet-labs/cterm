@@ -659,6 +659,8 @@ enum PaneCiStep {
     WaitClose,
     WaitTemplate,
     WaitUniqueReuse,
+    WaitPluginPrompt,
+    WaitPluginExecution,
 }
 
 #[derive(Clone)]
@@ -720,6 +722,21 @@ fn pane_ci_activate(window: &ApplicationWindow, name: &str) -> Result<(), String
         return Err(format!("window action '{name}' is disabled"));
     }
     action.activate(None);
+    Ok(())
+}
+
+fn pane_ci_activate_with_string(
+    window: &ApplicationWindow,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    let action = window
+        .lookup_action(name)
+        .ok_or_else(|| format!("window action '{name}' is not registered"))?;
+    if !action.is_enabled() {
+        return Err(format!("window action '{name}' is disabled"));
+    }
+    action.activate(Some(&glib::Variant::from(value)));
     Ok(())
 }
 
@@ -2335,10 +2352,15 @@ impl CtermWindow {
             .unwrap_or_else(|| {
                 pane_ci_fail(PaneCiStep::WaitTemplate, "template workspace is unset")
             });
+        let plugin_action_id =
+            std::env::var("CTERM_WAYLAND_PLUGIN_CI_ACTION_ID").unwrap_or_else(|_| {
+                pane_ci_fail(PaneCiStep::WaitPluginPrompt, "plugin action ID is unset")
+            });
         let mut template_completed_at = None;
         let mut template_tab_id = None;
         let mut template_session_id = None;
         let mut unique_requested_at = None;
+        let mut plugin_tab_count = None;
 
         pane_ci_marker("CTERM_PANE_CI START backend=wayland");
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
@@ -2594,6 +2616,49 @@ impl CtermWindow {
                         );
                     }
                     pane_ci_marker("CTERM_TEMPLATE_CI UNIQUE_OK tabs=2 session=reused");
+                    plugin_tab_count = Some(template.tab_count);
+                    pane_ci_activate_with_string(&window, "run-plugin-command", &plugin_action_id)
+                        .unwrap_or_else(|error| pane_ci_fail(current_step, error));
+                    *step.borrow_mut() = PaneCiStep::WaitPluginPrompt;
+                }
+                PaneCiStep::WaitPluginPrompt => {
+                    let Some(dialog) = application
+                        .windows()
+                        .into_iter()
+                        .find_map(|candidate| candidate.downcast::<gtk4::MessageDialog>().ok())
+                    else {
+                        return glib::ControlFlow::Continue;
+                    };
+                    let text = dialog
+                        .text()
+                        .map_or_else(String::new, |text| text.to_string());
+                    if !text.contains("UI Test Plugin (org.example.ui)")
+                        || !text.contains("cterm:new-tab (new)")
+                    {
+                        pane_ci_fail(
+                            current_step,
+                            format!("native plugin approval text was incomplete: {text}"),
+                        );
+                    }
+                    pane_ci_marker("CTERM_PLUGIN_CI PROMPT_OK backend=wayland");
+                    dialog.response(gtk4::ResponseType::Yes);
+                    *step.borrow_mut() = PaneCiStep::WaitPluginExecution;
+                }
+                PaneCiStep::WaitPluginExecution => {
+                    let expected = plugin_tab_count
+                        .unwrap_or_else(|| pane_ci_fail(current_step, "tab baseline is absent"))
+                        + 1;
+                    let actual = tabs.borrow().len();
+                    if actual < expected {
+                        return glib::ControlFlow::Continue;
+                    }
+                    if actual != expected {
+                        pane_ci_fail(
+                            current_step,
+                            format!("plugin action produced {actual} tabs instead of {expected}"),
+                        );
+                    }
+                    pane_ci_marker("CTERM_PLUGIN_CI EXECUTION_OK action=cterm:new-tab");
                     pane_ci_marker("CTERM_PANE_CI COMPLETE");
                     destroy_all_pane_sessions(&tabs);
                     window.destroy();

@@ -136,6 +136,43 @@ end tell
 EOF
 }
 
+run_plugin_command_for_ci() {
+    focus_cterm
+    osascript <<EOF &
+tell application "System Events"
+    set ctermProcess to first process whose unix id is $CTERM_PID
+    tell ctermProcess
+        click menu item "UI Test Plugin — Open Test Tab" of menu 1 of menu item "Plugins" of menu 1 of menu bar item "Tools" of menu bar 1
+    end tell
+end tell
+EOF
+    local menu_click_pid=$!
+
+    osascript <<EOF
+tell application "System Events"
+    set ctermProcess to first process whose unix id is $CTERM_PID
+    repeat 80 times
+        tell ctermProcess
+            repeat with candidate in windows
+                try
+                    set promptText to (value of every static text of candidate) as text
+                    if promptText contains "Allow plugin command?" then
+                        if promptText does not contain "UI Test Plugin (org.example.ui)" then error "Plugin identity is absent from native prompt"
+                        if promptText does not contain "cterm:new-tab (new)" then error "Exact new action is absent from native prompt"
+                        click button "OK" of candidate
+                        return
+                    end if
+                end try
+            end repeat
+        end tell
+        delay 0.125
+    end repeat
+    error "Native plugin approval prompt did not appear"
+end tell
+EOF
+    wait "$menu_click_pid"
+}
+
 wait_for_cterm_log() {
     local pattern="$1"
     local description="$2"
@@ -294,6 +331,28 @@ export CTERM_LOG_FILE="$OUTPUT_DIR/cterm.log"
 export CTERM_TEST_HOME="$OUTPUT_DIR/home"
 mkdir -p "$CTERM_TEST_HOME"
 
+PLUGIN_DIR="$CTERM_TEST_HOME/Library/Application Support/com.cterm.cterm/plugins/org.example.ui"
+PLUGIN_GRANT="$CTERM_TEST_HOME/Library/Application Support/com.cterm.cterm/plugin-grants.toml"
+mkdir -p "$PLUGIN_DIR"
+cat >"$PLUGIN_DIR/cterm-plugin.toml" <<'EOF'
+manifest_version = 1
+id = "org.example.ui"
+name = "UI Test Plugin"
+version = "1.0.0"
+abi = "1.0"
+
+[[commands]]
+id = "new-tab"
+title = "Open Test Tab"
+
+[capabilities.invoke-actions]
+allow = ["cterm:new-tab"]
+EOF
+base64 -D \
+    <"$(dirname "$0")/../crates/cterm-plugin-host/tests/fixtures/ui_new_tab.wasm.base64" \
+    >"$PLUGIN_DIR/plugin.wasm"
+log "Prepared isolated native plugin fixture"
+
 # Start cterm in background
 log "Starting cterm..."
 HOME="$CTERM_TEST_HOME" "$CTERM_PATH" &
@@ -400,13 +459,26 @@ sleep 1
 # Take screenshot after ls
 take_screenshot "04_after_ls"
 
+# Exercise the full native command-plugin path before adding a regular tab.
+PLUGIN_LOG_MARK=$(cterm_log_line_count)
+log "Testing native plugin menu, approval, runner, and action dispatch..."
+run_plugin_command_for_ci
+wait_for_new_cterm_log 'Created daemon tab' \
+    "Plugin command created a tab through the native action dispatcher" \
+    "$PLUGIN_LOG_MARK"
+if [ ! -s "$PLUGIN_GRANT" ] || ! grep -Fq 'plugin = "org.example.ui"' "$PLUGIN_GRANT"; then
+    log "ERROR: accepted native plugin prompt did not persist its exact local grant"
+    exit 1
+fi
+take_screenshot "05_plugin_command"
+
 # Test Cmd+T for new tab
 log "Testing Cmd+T (new tab)..."
 send_key "t" "cmd"
 sleep 1
 
 # Take screenshot showing tabs
-take_screenshot "05_new_tab"
+take_screenshot "06_new_tab"
 
 # Exercise the native AppKit pane host. Key codes avoid keyboard-layout
 # ambiguity on the hosted runner (42=backslash, 27=minus, 36=return,
@@ -418,7 +490,7 @@ wait_for_cterm_log 'Split pane Horizontal' "Horizontal pane split succeeded"
 log "Testing native vertical pane split..."
 send_pane_shortcut 27 "ctrl+shift"
 wait_for_cterm_log 'Split pane Vertical' "Vertical pane split succeeded"
-take_screenshot "06_split_panes"
+take_screenshot "07_split_panes"
 
 log "Testing directional pane focus..."
 select_pane_menu_item "Focus Up"
@@ -437,7 +509,7 @@ wait_for_cterm_log 'Pane zoom false' "Pane unzoom succeeded"
 log "Testing pane close..."
 send_pane_shortcut 117 "ctrl+shift"
 wait_for_cterm_log 'Closed pane' "Pane close succeeded"
-take_screenshot "07_closed_pane"
+take_screenshot "08_closed_pane"
 
 # Preferences must replace ShortcutManager instances already owned by every
 # open terminal view, including panes that were created before the dialog.
@@ -451,7 +523,7 @@ wait_for_new_cterm_log \
     'Preferences saved; refreshed shortcuts for [1-9][0-9]* window\(s\) and ([2-9]|[1-9][0-9]+) terminal view\(s\)' \
     "Preferences save refreshed every pre-existing window and split pane" \
     "$PREFERENCES_LOG_MARK"
-take_screenshot "08_preferences_saved"
+take_screenshot "09_preferences_saved"
 
 # Focus a pane that was inactive while Preferences was open.
 FOCUS_LOG_MARK=$(cterm_log_line_count)
@@ -465,7 +537,7 @@ send_pane_shortcut 35 "ctrl+shift"
 wait_for_new_cterm_log 'Split pane Horizontal' \
     "Updated Ctrl+Shift+P binding split the pre-existing pane" \
     "$CUSTOM_SPLIT_LOG_MARK"
-take_screenshot "09_reloaded_shortcut"
+take_screenshot "10_reloaded_shortcut"
 
 # Quick Open reloads templates when shown, so an isolated local fixture can
 # exercise its real callback and the shared Cocoa launch plan without network
@@ -481,7 +553,7 @@ send_key "Return"
 wait_for_new_cterm_log 'Created daemon tab: UI Test Template' \
     "Quick Open launched the isolated local template" \
     "$QUICK_OPEN_LOG_MARK"
-take_screenshot "10_quick_open_template"
+take_screenshot "11_quick_open_template"
 
 # Close the window
 log "Closing window..."

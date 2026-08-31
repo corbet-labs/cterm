@@ -38,6 +38,33 @@ function Wait-ForCtermLog {
     throw "Timed out waiting for cterm log pattern: $Pattern"
 }
 
+function Get-CtermLogMatchCount {
+    param([string]$Pattern)
+    if (-not (Test-Path $env:CTERM_LOG_FILE)) {
+        return 0
+    }
+    return @(
+        Select-String -Path $env:CTERM_LOG_FILE -Pattern $Pattern -AllMatches
+    ).Count
+}
+
+function Wait-ForCtermLogCount {
+    param(
+        [string]$Pattern,
+        [int]$Minimum,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-CtermLogMatchCount -Pattern $Pattern) -ge $Minimum) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Timed out waiting for $Minimum cterm log matches: $Pattern"
+}
+
 function Wait-ForFileText {
     param(
         [string]$Path,
@@ -157,6 +184,9 @@ public class User32 {
     public static extern IntPtr GetSubMenu(IntPtr hMenu, int nPos);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetDlgItem(IntPtr hDlg, int nIDDlgItem);
+
+    [DllImport("user32.dll")]
     public static extern uint GetMenuItemID(IntPtr hMenu, int nPos);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetMenuStringW")]
@@ -164,6 +194,7 @@ public class User32 {
 
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_COMMAND = 0x0111;
+    public const uint BM_CLICK = 0x00F5;
     public const uint MF_BYPOSITION = 0x0400;
 
     public static IntPtr FindWindowByProcessId(uint processId) {
@@ -200,6 +231,14 @@ function Get-MenuLabel {
         [User32]::MF_BYPOSITION
     ) | Out-Null
     return (($label.ToString() -replace '&', '') -split "`t")[0].Trim()
+}
+
+function Get-NativeWindowText {
+    param([System.IntPtr]$Hwnd)
+    $length = [User32]::GetWindowTextLength($Hwnd)
+    $text = [System.Text.StringBuilder]::new($length + 1)
+    [User32]::GetWindowText($Hwnd, $text, $text.Capacity) | Out-Null
+    return $text.ToString()
 }
 
 function Find-SubmenuByLabel {
@@ -250,14 +289,55 @@ $roamingAppData = [System.Environment]::GetFolderPath(
 $configDir = Join-Path $roamingAppData "cterm\cterm\config"
 $configPath = Join-Path $configDir "config.toml"
 $shortcutsPath = Join-Path $configDir "shortcuts_windows.toml"
+$localAppData = [System.Environment]::GetFolderPath(
+    [System.Environment+SpecialFolder]::LocalApplicationData
+)
+$pluginDataDir = Join-Path $localAppData "cterm\cterm\data"
+$pluginDir = Join-Path $pluginDataDir "plugins\org.example.ui"
+$pluginGrantPath = Join-Path $pluginDataDir "plugin-grants.toml"
+$pluginBackupDir = Join-Path $OutputDir "plugin-backup"
 $hadConfig = Test-Path $configPath
 $hadShortcuts = Test-Path $shortcutsPath
+$hadPlugin = Test-Path $pluginDir
+$hadPluginGrant = Test-Path $pluginGrantPath
 $configBackup = if ($hadConfig) { [System.IO.File]::ReadAllBytes($configPath) } else { $null }
 $shortcutsBackup = if ($hadShortcuts) { [System.IO.File]::ReadAllBytes($shortcutsPath) } else { $null }
+$pluginGrantBackup = if ($hadPluginGrant) { [System.IO.File]::ReadAllBytes($pluginGrantPath) } else { $null }
 $process = $null
 
 try {
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+if ($hadPlugin) {
+    Copy-Item -Recurse -Force -Path $pluginDir -Destination $pluginBackupDir
+    Remove-Item -Recurse -Force -Path $pluginDir
+}
+[System.IO.File]::Delete($pluginGrantPath)
+New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
+$pluginManifest = @'
+manifest_version = 1
+id = "org.example.ui"
+name = "UI Test Plugin"
+version = "1.0.0"
+abi = "1.0"
+
+[[commands]]
+id = "new-tab"
+title = "Open Test Tab"
+
+[capabilities.invoke-actions]
+allow = ["cterm:new-tab"]
+'@
+[System.IO.File]::WriteAllText(
+    (Join-Path $pluginDir "cterm-plugin.toml"),
+    $pluginManifest
+)
+$pluginFixture = Join-Path $PSScriptRoot "..\crates\cterm-plugin-host\tests\fixtures\ui_new_tab.wasm.base64"
+$pluginWasm = [Convert]::FromBase64String(
+    ([System.IO.File]::ReadAllText($pluginFixture)).Trim()
+)
+[System.IO.File]::WriteAllBytes((Join-Path $pluginDir "plugin.wasm"), $pluginWasm)
+Log "Prepared isolated native plugin fixture"
+
 $toolWorkingDirectory = Join-Path $OutputDir "active cwd"
 New-Item -ItemType Directory -Force -Path $toolWorkingDirectory | Out-Null
 $workingDirectoryToml = ConvertTo-Json -Compress $toolWorkingDirectory
@@ -381,6 +461,63 @@ if (-not [string]::Equals($toolCwd, $activeCwd, [System.StringComparison]::Ordin
     throw "Configured tool CWD mismatch: active terminal '$activeCwd', tool '$toolCwd'"
 }
 Log "Tools submenu invoked configured tool in active CWD: $toolCwd"
+
+$pluginsMenu = Find-SubmenuByLabel -Menu $toolsMenu -ExpectedLabel "Plugins"
+if ($pluginsMenu -eq [System.IntPtr]::Zero) {
+    throw "Plugins submenu is missing from the native Tools menu"
+}
+$pluginCommandId = Find-MenuCommandByLabel -Menu $pluginsMenu -ExpectedLabel "UI Test Plugin — Open Test Tab"
+$attachCountBefore = Get-CtermLogMatchCount -Pattern "Pane source .* attached to daemon session"
+Log "Invoking plugin through native command ID $pluginCommandId..."
+if (-not [User32]::PostMessage(
+    $hwnd,
+    [User32]::WM_COMMAND,
+    [System.IntPtr]$pluginCommandId,
+    [System.IntPtr]::Zero
+)) {
+    throw "Failed to dispatch plugin command ID $pluginCommandId"
+}
+
+$pluginDialog = [System.IntPtr]::Zero
+$dialogDeadline = (Get-Date).AddSeconds(10)
+while ($pluginDialog -eq [System.IntPtr]::Zero -and (Get-Date) -lt $dialogDeadline) {
+    $candidate = [User32]::FindWindow("#32770", "Allow plugin command?")
+    if ($candidate -ne [System.IntPtr]::Zero) {
+        [uint32]$dialogProcessId = 0
+        [User32]::GetWindowThreadProcessId($candidate, [ref]$dialogProcessId) | Out-Null
+        if ($dialogProcessId -eq $process.Id) {
+            $pluginDialog = $candidate
+            break
+        }
+    }
+    Start-Sleep -Milliseconds 100
+}
+if ($pluginDialog -eq [System.IntPtr]::Zero) {
+    throw "Native plugin approval dialog did not appear"
+}
+$promptControl = [User32]::GetDlgItem($pluginDialog, -1)
+$promptText = Get-NativeWindowText -Hwnd $promptControl
+if (-not $promptText.Contains("UI Test Plugin (org.example.ui)")) {
+    throw "Plugin identity is absent from native prompt: $promptText"
+}
+if (-not $promptText.Contains("cterm:new-tab (new)")) {
+    throw "Exact new action is absent from native prompt: $promptText"
+}
+$yesButton = [User32]::GetDlgItem($pluginDialog, 6)
+if ($yesButton -eq [System.IntPtr]::Zero -or -not [User32]::PostMessage(
+    $yesButton,
+    [User32]::BM_CLICK,
+    [System.IntPtr]::Zero,
+    [System.IntPtr]::Zero
+)) {
+    throw "Could not accept the native plugin approval dialog"
+}
+Wait-ForCtermLogCount -Pattern "Pane source .* attached to daemon session" -Minimum ($attachCountBefore + 1)
+if (-not (Test-Path $pluginGrantPath) -or
+    -not (Select-String -Path $pluginGrantPath -SimpleMatch 'plugin = "org.example.ui"' -Quiet)) {
+    throw "Accepted native plugin prompt did not persist its exact local grant"
+}
+Log "Plugin menu, native approval, isolated runner, and action dispatch succeeded"
 
 Log "Typing 'echo hello world'..."
 [System.Windows.Forms.SendKeys]::SendWait("echo hello world")
@@ -507,6 +644,17 @@ Get-ChildItem $OutputDir -Filter "*.png" | ForEach-Object { Log "  - $($_.Name)"
         [System.IO.File]::WriteAllBytes($shortcutsPath, $shortcutsBackup)
     } else {
         [System.IO.File]::Delete($shortcutsPath)
+    }
+    if (Test-Path $pluginDir) {
+        Remove-Item -Recurse -Force -Path $pluginDir
+    }
+    if ($hadPlugin) {
+        Copy-Item -Recurse -Force -Path $pluginBackupDir -Destination $pluginDir
+    }
+    if ($hadPluginGrant) {
+        [System.IO.File]::WriteAllBytes($pluginGrantPath, $pluginGrantBackup)
+    } else {
+        [System.IO.File]::Delete($pluginGrantPath)
     }
     Remove-Item Env:\CTERM_UI_TOOL_MARKER -ErrorAction SilentlyContinue
 }
