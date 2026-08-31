@@ -311,7 +311,9 @@ if ($hadPlugin) {
     Copy-Item -Recurse -Force -Path $pluginDir -Destination $pluginBackupDir
     Remove-Item -Recurse -Force -Path $pluginDir
 }
-[System.IO.File]::Delete($pluginGrantPath)
+if (Test-Path -LiteralPath $pluginGrantPath) {
+    [System.IO.File]::Delete($pluginGrantPath)
+}
 New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
 $pluginManifest = @'
 manifest_version = 1
@@ -653,7 +655,7 @@ Get-ChildItem $OutputDir -Filter "*.png" | ForEach-Object { Log "  - $($_.Name)"
     }
     if ($hadPluginGrant) {
         [System.IO.File]::WriteAllBytes($pluginGrantPath, $pluginGrantBackup)
-    } else {
+    } elseif (Test-Path -LiteralPath $pluginGrantPath) {
         [System.IO.File]::Delete($pluginGrantPath)
     }
     Remove-Item Env:\CTERM_UI_TOOL_MARKER -ErrorAction SilentlyContinue
