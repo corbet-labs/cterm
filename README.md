@@ -483,7 +483,10 @@ unplaced short-lived images for eviction under quota pressure.
 Unicode placeholders use invisible virtual placements and Kitty's complete
 297-diacritic coordinate encoding. Their aspect-preserving RGBA fragments move
 with text and scrollback, are cached per viewport, and are rendered consistently
-below text on Cocoa, GTK/Wayland, and Direct2D.
+below text on Cocoa, GTK/Wayland, and Direct2D. Relative `P/Q/H/V` placements
+follow normal, virtual, or relative parents through named-placement updates;
+the bounded graph rejects missing parents, self-reference, cycles, and chains
+beyond 32 ancestors, and cascades parent lifetimes as required by Kitty.
 
 Test with:
 ```bash

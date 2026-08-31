@@ -664,6 +664,7 @@ impl TerminalImage {
 }
 
 /// Shared decoded pixels passed from a protocol adapter into screen storage.
+#[derive(Clone)]
 pub(crate) struct DecodedRgbaImage {
     pub data: Arc<Vec<u8>>,
     pub width: usize,
@@ -2975,6 +2976,32 @@ impl Screen {
         let Some(image) = self.images.get_mut(&id) else {
             return false;
         };
+        image.data = pixels.data;
+        image.pixel_width = pixels.width;
+        image.pixel_height = pixels.height;
+        image.z_index = pixels.z_index;
+        image.protocol_image_id = pixels.protocol_image_id;
+        self.dirty = true;
+        true
+    }
+
+    /// Replace the geometry and decoded pixels of an existing placement.
+    pub(crate) fn update_rgba_image_geometry(
+        &mut self,
+        id: u64,
+        col: usize,
+        absolute_line: usize,
+        cell_cols: usize,
+        cell_rows: usize,
+        pixels: DecodedRgbaImage,
+    ) -> bool {
+        let Some(image) = self.images.get_mut(&id) else {
+            return false;
+        };
+        image.col = col;
+        image.line = absolute_line;
+        image.cell_width = cell_cols;
+        image.cell_height = cell_rows;
         image.data = pixels.data;
         image.pixel_width = pixels.width;
         image.pixel_height = pixels.height;

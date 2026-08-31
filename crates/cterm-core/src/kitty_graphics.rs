@@ -30,6 +30,7 @@ const MAX_DIMENSION: u32 = 10_000;
 const MAX_SHARED_MEMORY_NAME_BYTES: usize = 2 * 1024;
 const STORE_QUOTA_BYTES: usize = 320 * 1024 * 1024;
 const USAGE_HINT_TRANSIENT: u32 = 1;
+const PARENT_DEPTH_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InterceptorState {
@@ -217,6 +218,9 @@ enum ErrorCode {
     BadFile,
     NoData,
     NoSpace,
+    NoParent,
+    Cycle,
+    TooDeep,
     #[cfg(not(any(
         target_os = "freebsd",
         target_os = "linux",
@@ -234,6 +238,9 @@ impl ErrorCode {
             Self::BadFile => "EBADF",
             Self::NoData => "ENODATA",
             Self::NoSpace => "ENOSPC",
+            Self::NoParent => "ENOPARENT",
+            Self::Cycle => "ECYCLE",
+            Self::TooDeep => "ETOODEEP",
             #[cfg(not(any(
                 target_os = "freebsd",
                 target_os = "linux",
@@ -310,6 +317,10 @@ struct Command {
     suppress_cursor_movement: bool,
     unicode_placeholder: bool,
     usage_hints: u32,
+    parent_image_id: u32,
+    parent_placement_id: u32,
+    horizontal_offset: i32,
+    vertical_offset: i32,
     delete_specifier: Option<u8>,
     frame_number: u32,
     other_frame_number: u32,
@@ -351,6 +362,10 @@ impl Default for Command {
             suppress_cursor_movement: false,
             unicode_placeholder: false,
             usage_hints: 0,
+            parent_image_id: 0,
+            parent_placement_id: 0,
+            horizontal_offset: 0,
+            vertical_offset: 0,
             delete_specifier: None,
             frame_number: 0,
             other_frame_number: 0,
@@ -571,7 +586,7 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
                         1 => Some(AnimationState::Stopped),
                         2 => Some(AnimationState::Loading),
                         3 => Some(AnimationState::Running),
-                        _ => None,
+                        _ => return Err(echo.error(ErrorCode::Invalid, "invalid animation state")),
                     };
             }
             b"s" => command.pixel_width = Some(required_u32(value, echo, "invalid width")?),
@@ -675,6 +690,19 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
                 }
             }
             b"N" => command.usage_hints = required_u32(value, echo, "invalid usage hints")?,
+            b"P" => command.parent_image_id = required_u32(value, echo, "invalid parent image id")?,
+            b"Q" => {
+                command.parent_placement_id =
+                    required_u32(value, echo, "invalid parent placement id")?
+            }
+            b"H" => {
+                command.horizontal_offset = parse_i32(value)
+                    .ok_or_else(|| echo.error(ErrorCode::Invalid, "invalid horizontal offset"))?
+            }
+            b"V" => {
+                command.vertical_offset = parse_i32(value)
+                    .ok_or_else(|| echo.error(ErrorCode::Invalid, "invalid vertical offset"))?
+            }
             _ => {}
         }
     }
@@ -1026,9 +1054,28 @@ struct VirtualPlacementRecord {
     command: Command,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlacementParent {
+    Real(u64),
+    Virtual(u64),
+    Relative(u64),
+}
+
+#[derive(Debug)]
+struct RelativePlacementRecord {
+    id: u64,
+    image_id: u32,
+    placement_id: u32,
+    parent: PlacementParent,
+    command: Command,
+    screen_id: Option<u64>,
+    allocated_bytes: usize,
+}
+
 #[derive(Debug)]
 struct PlaceholderFragment {
     screen_id: u64,
+    virtual_id: u64,
     allocated_bytes: usize,
 }
 
@@ -1059,12 +1106,14 @@ pub(crate) struct KittyGraphics {
     placements: HashMap<u64, PlacementRecord>,
     /// Invisible `U=1` prototypes. Actual fragments are derived from text.
     virtual_placements: Vec<VirtualPlacementRecord>,
+    relative_placements: Vec<RelativePlacementRecord>,
     /// Renderer images synthesized only for the current viewport.
     placeholder_fragments: Vec<PlaceholderFragment>,
     placeholder_projection: Vec<PlaceholderProjection>,
     placeholder_revision: u64,
     rendered_placeholder_revision: u64,
     next_virtual_id: u64,
+    next_relative_id: u64,
     next_image_id: u32,
     next_lru: u64,
     total_bytes: usize,
@@ -1080,11 +1129,13 @@ impl Default for KittyGraphics {
             image_numbers: HashMap::new(),
             placements: HashMap::new(),
             virtual_placements: Vec::new(),
+            relative_placements: Vec::new(),
             placeholder_fragments: Vec::new(),
             placeholder_projection: Vec::new(),
             placeholder_revision: 1,
             rendered_placeholder_revision: 0,
             next_virtual_id: 1,
+            next_relative_id: 1,
             next_image_id: 1,
             next_lru: 1,
             total_bytes: 0,
@@ -1570,6 +1621,7 @@ impl KittyGraphics {
                 }
             }
         }
+        self.refresh_relative_placements(screen);
     }
 
     pub(crate) fn advance_animations(
@@ -1637,6 +1689,7 @@ impl KittyGraphics {
         }
         if !changed_images.is_empty() {
             self.refresh_unicode_placements(screen);
+            self.refresh_relative_placements(screen);
         }
         GraphicsAnimationTick {
             changed: !changed_images.is_empty(),
@@ -1663,7 +1716,15 @@ impl KittyGraphics {
         screen: &mut Screen,
     ) -> Result<(), ProtocolError> {
         if command.unicode_placeholder {
+            if command.parent_image_id != 0 {
+                return Err(command
+                    .echo()
+                    .error(ErrorCode::Invalid, "virtual placement cannot have a parent"));
+            }
             return self.place_virtual(command, image_id, screen);
+        }
+        if command.parent_image_id != 0 {
+            return self.place_relative(command, image_id, screen);
         }
         let stored = self
             .images
@@ -1672,20 +1733,16 @@ impl KittyGraphics {
             .ok_or_else(|| command.echo().error(ErrorCode::NotFound, "image not found"))?;
         let placement = prepare_placement(&stored, command, screen)?;
         let placement_id = command.placement_id.unwrap_or(0);
-        let replacement = (placement_id != 0).then(|| {
-            self.placements
-                .iter()
-                .find(|(_, placement)| {
-                    placement.image_id == image_id && placement.placement_id == placement_id
-                })
-                .map(|(screen_id, placement)| (*screen_id, placement.allocated_bytes))
-        });
+        let replacements = self.named_placement_parents(image_id, placement_id);
         let allocated_bytes = if Arc::ptr_eq(&placement.pixels, &stored.rgba) {
             0
         } else {
             placement.pixels.len()
         };
-        let replaced_bytes = replacement.flatten().map_or(0, |(_, bytes)| bytes);
+        let replaced_bytes: usize = replacements
+            .iter()
+            .map(|parent| self.parent_allocated_bytes(*parent))
+            .sum();
         let projected = self
             .total_bytes
             .saturating_add(self.placement_bytes)
@@ -1696,8 +1753,11 @@ impl KittyGraphics {
                 .echo()
                 .error(ErrorCode::NoSpace, "placement storage quota exhausted"));
         }
-        if let Some((screen_id, _)) = replacement.flatten() {
-            self.remove_placement(screen_id, screen);
+        let replaced_virtual = replacements
+            .iter()
+            .any(|parent| matches!(parent, PlacementParent::Virtual(_)));
+        for parent in &replacements {
+            self.remove_for_replacement(*parent, screen);
         }
         let screen_id = screen.add_rgba_image_with_size(
             screen.cursor.col,
@@ -1724,6 +1784,11 @@ impl KittyGraphics {
                 command: command.clone(),
             },
         );
+        self.reparent(&replacements, PlacementParent::Real(screen_id));
+        if replaced_virtual {
+            self.placeholder_revision = self.placeholder_revision.saturating_add(1);
+            self.refresh_unicode_placements(screen);
+        }
         self.next_lru = self.next_lru.saturating_add(1);
         if let Some(image) = self.images.get_mut(&image_id) {
             image.lru = self.next_lru;
@@ -1731,7 +1796,389 @@ impl KittyGraphics {
         if !command.suppress_cursor_movement {
             advance_cursor(screen, placement.cell_width, placement.cell_height);
         }
+        self.refresh_relative_placements(screen);
         Ok(())
+    }
+
+    fn named_placement_parents(&self, image_id: u32, placement_id: u32) -> Vec<PlacementParent> {
+        if placement_id == 0 {
+            return Vec::new();
+        }
+        let mut parents = Vec::new();
+        parents.extend(self.placements.iter().filter_map(|(screen_id, placement)| {
+            (placement.image_id == image_id && placement.placement_id == placement_id)
+                .then_some(PlacementParent::Real(*screen_id))
+        }));
+        parents.extend(self.virtual_placements.iter().filter_map(|placement| {
+            (placement.image_id == image_id && placement.placement_id == placement_id)
+                .then_some(PlacementParent::Virtual(placement.id))
+        }));
+        parents.extend(self.relative_placements.iter().filter_map(|placement| {
+            (placement.image_id == image_id && placement.placement_id == placement_id)
+                .then_some(PlacementParent::Relative(placement.id))
+        }));
+        parents
+    }
+
+    fn parent_allocated_bytes(&self, parent: PlacementParent) -> usize {
+        match parent {
+            PlacementParent::Real(screen_id) => self
+                .placements
+                .get(&screen_id)
+                .map_or(0, |placement| placement.allocated_bytes),
+            PlacementParent::Virtual(_) => 0,
+            PlacementParent::Relative(id) => self
+                .relative_placements
+                .iter()
+                .find(|placement| placement.id == id)
+                .map_or(0, |placement| placement.allocated_bytes),
+        }
+    }
+
+    fn remove_for_replacement(&mut self, parent: PlacementParent, screen: &mut Screen) {
+        match parent {
+            PlacementParent::Real(screen_id) => {
+                self.remove_real_placement_only(screen_id, screen);
+            }
+            PlacementParent::Virtual(id) => {
+                self.virtual_placements
+                    .retain(|placement| placement.id != id);
+                self.clear_placeholder_fragments(screen);
+            }
+            PlacementParent::Relative(id) => {
+                self.remove_relative_record_only(id, screen);
+            }
+        }
+    }
+
+    fn reparent(&mut self, old_parents: &[PlacementParent], new_parent: PlacementParent) {
+        for relative in &mut self.relative_placements {
+            if old_parents.contains(&relative.parent) {
+                relative.parent = new_parent;
+            }
+        }
+    }
+
+    fn place_relative(
+        &mut self,
+        command: &Command,
+        image_id: u32,
+        screen: &mut Screen,
+    ) -> Result<(), ProtocolError> {
+        let stored = self
+            .images
+            .get(&image_id)
+            .cloned()
+            .ok_or_else(|| command.echo().error(ErrorCode::NotFound, "image not found"))?;
+        let prepared = prepare_placement(&stored, command, screen)?;
+        let parent = self
+            .find_parent(command.parent_image_id, command.parent_placement_id)
+            .ok_or_else(|| {
+                command
+                    .echo()
+                    .error(ErrorCode::NoParent, "parent placement not found")
+            })?;
+        let placement_id = command.placement_id.unwrap_or(0);
+        let replacements = self.named_placement_parents(image_id, placement_id);
+        self.validate_parent_chain(parent, &replacements, command)?;
+
+        let allocated_bytes = if Arc::ptr_eq(&prepared.pixels, &stored.rgba) {
+            0
+        } else {
+            prepared.pixels.len()
+        };
+        let replaced_bytes: usize = replacements
+            .iter()
+            .map(|parent| self.parent_allocated_bytes(*parent))
+            .sum();
+        if self
+            .total_bytes
+            .saturating_add(self.placement_bytes)
+            .saturating_sub(replaced_bytes)
+            .saturating_add(allocated_bytes)
+            > STORE_QUOTA_BYTES
+        {
+            return Err(command
+                .echo()
+                .error(ErrorCode::NoSpace, "placement storage quota exhausted"));
+        }
+
+        let id = if let Some(id) = replacements.iter().find_map(|parent| match parent {
+            PlacementParent::Relative(id) => Some(*id),
+            _ => None,
+        }) {
+            id
+        } else {
+            let id = self.next_relative_id;
+            self.next_relative_id = self.next_relative_id.saturating_add(1);
+            id
+        };
+        let replaced_virtual = replacements
+            .iter()
+            .any(|parent| matches!(parent, PlacementParent::Virtual(_)));
+        for replacement in &replacements {
+            self.remove_for_replacement(*replacement, screen);
+        }
+        let record = RelativePlacementRecord {
+            id,
+            image_id,
+            placement_id,
+            parent,
+            command: command.clone(),
+            screen_id: None,
+            allocated_bytes: 0,
+        };
+        self.relative_placements.push(record);
+        self.reparent(&replacements, PlacementParent::Relative(id));
+        if replaced_virtual {
+            self.placeholder_revision = self.placeholder_revision.saturating_add(1);
+            self.refresh_unicode_placements(screen);
+        }
+        self.touch_image(image_id);
+        self.refresh_relative_placements(screen);
+        Ok(())
+    }
+
+    fn find_parent(&self, image_id: u32, placement_id: u32) -> Option<PlacementParent> {
+        let matches = |candidate_image: u32, candidate_placement: u32| {
+            candidate_image == image_id
+                && (placement_id == 0 || candidate_placement == placement_id)
+        };
+        self.placements
+            .iter()
+            .filter(|(_, placement)| matches(placement.image_id, placement.placement_id))
+            .min_by_key(|(screen_id, _)| *screen_id)
+            .map(|(screen_id, _)| PlacementParent::Real(*screen_id))
+            .or_else(|| {
+                self.virtual_placements
+                    .iter()
+                    .find(|placement| matches(placement.image_id, placement.placement_id))
+                    .map(|placement| PlacementParent::Virtual(placement.id))
+            })
+            .or_else(|| {
+                self.relative_placements
+                    .iter()
+                    .find(|placement| matches(placement.image_id, placement.placement_id))
+                    .map(|placement| PlacementParent::Relative(placement.id))
+            })
+    }
+
+    fn validate_parent_chain(
+        &self,
+        mut parent: PlacementParent,
+        replaced_parents: &[PlacementParent],
+        command: &Command,
+    ) -> Result<(), ProtocolError> {
+        for depth in 0..PARENT_DEPTH_LIMIT {
+            if replaced_parents.contains(&parent) {
+                let (code, message) = if depth == 0 {
+                    (ErrorCode::Invalid, "placement cannot be its own parent")
+                } else {
+                    (ErrorCode::Cycle, "relative placement creates a cycle")
+                };
+                return Err(command.echo().error(code, message));
+            }
+            let PlacementParent::Relative(parent_id) = parent else {
+                return Ok(());
+            };
+            let Some(record) = self
+                .relative_placements
+                .iter()
+                .find(|placement| placement.id == parent_id)
+            else {
+                return Err(command
+                    .echo()
+                    .error(ErrorCode::NoParent, "parent chain is incomplete"));
+            };
+            parent = record.parent;
+        }
+        if matches!(parent, PlacementParent::Relative(_)) {
+            Err(command
+                .echo()
+                .error(ErrorCode::TooDeep, "relative placement chain is too deep"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn relative_origin(&self, id: u64, screen: &Screen, depth: usize) -> Option<(i64, i64)> {
+        if depth >= PARENT_DEPTH_LIMIT {
+            return None;
+        }
+        let record = self
+            .relative_placements
+            .iter()
+            .find(|placement| placement.id == id)?;
+        let (col, line) = self.parent_origin(record.parent, screen, depth + 1)?;
+        Some((
+            col.checked_add(i64::from(record.command.horizontal_offset))?,
+            line.checked_add(i64::from(record.command.vertical_offset))?,
+        ))
+    }
+
+    fn parent_origin(
+        &self,
+        parent: PlacementParent,
+        screen: &Screen,
+        depth: usize,
+    ) -> Option<(i64, i64)> {
+        match parent {
+            PlacementParent::Real(screen_id) => {
+                let image = screen.image_by_id(screen_id)?;
+                Some((
+                    i64::try_from(image.col).ok()?,
+                    i64::try_from(image.line).ok()?,
+                ))
+            }
+            PlacementParent::Virtual(virtual_id) => {
+                let mut origin: Option<(usize, usize)> = None;
+                for image in self
+                    .placeholder_fragments
+                    .iter()
+                    .filter(|fragment| fragment.virtual_id == virtual_id)
+                    .filter_map(|fragment| screen.image_by_id(fragment.screen_id))
+                {
+                    origin = Some(origin.map_or((image.col, image.line), |(col, line)| {
+                        (col.min(image.col), line.min(image.line))
+                    }));
+                }
+                let (col, line) = origin?;
+                Some((i64::try_from(col).ok()?, i64::try_from(line).ok()?))
+            }
+            PlacementParent::Relative(id) => self.relative_origin(id, screen, depth),
+        }
+    }
+
+    pub(crate) fn refresh_relative_placements(&mut self, screen: &mut Screen) {
+        self.sync_placements(screen);
+        let plans: Vec<(u64, Option<PreparedRelativePlacement>)> = self
+            .relative_placements
+            .iter()
+            .map(|record| {
+                let plan = self
+                    .relative_origin(record.id, screen, 0)
+                    .zip(self.images.get(&record.image_id))
+                    .and_then(|(origin, image)| {
+                        let prepared = prepare_placement(image, &record.command, screen).ok()?;
+                        let (col, line, prepared) =
+                            clip_relative_placement(origin, prepared).ok().flatten()?;
+                        let allocated_bytes = if Arc::ptr_eq(&prepared.pixels, &image.rgba) {
+                            0
+                        } else {
+                            prepared.pixels.len()
+                        };
+                        Some(PreparedRelativePlacement {
+                            col,
+                            line,
+                            allocated_bytes,
+                            prepared,
+                        })
+                    });
+                (record.id, plan)
+            })
+            .collect();
+
+        for (id, plan) in plans {
+            let Some(plan) = plan else {
+                self.hide_relative_placement(id, screen);
+                continue;
+            };
+            let Some(index) = self
+                .relative_placements
+                .iter()
+                .position(|placement| placement.id == id)
+            else {
+                continue;
+            };
+            let old_screen_id = self.relative_placements[index].screen_id;
+            let old_bytes = self.relative_placements[index].allocated_bytes;
+            if self
+                .total_bytes
+                .saturating_add(self.placement_bytes)
+                .saturating_sub(old_bytes)
+                .saturating_add(plan.allocated_bytes)
+                > STORE_QUOTA_BYTES
+            {
+                self.hide_relative_placement(id, screen);
+                continue;
+            }
+            let image_id = self.relative_placements[index].image_id;
+            let command = &self.relative_placements[index].command;
+            let pixels = DecodedRgbaImage {
+                data: plan.prepared.pixels,
+                width: plan.prepared.pixel_width,
+                height: plan.prepared.pixel_height,
+                z_index: command.z_index,
+                protocol_image_id: image_id,
+                clear_cells: false,
+            };
+            let screen_id = if let Some(screen_id) = old_screen_id {
+                if screen.update_rgba_image_geometry(
+                    screen_id,
+                    plan.col,
+                    plan.line,
+                    plan.prepared.cell_width,
+                    plan.prepared.cell_height,
+                    pixels.clone(),
+                ) {
+                    screen_id
+                } else {
+                    screen.add_rgba_image_at_absolute_line(
+                        plan.col,
+                        plan.line,
+                        plan.prepared.cell_width,
+                        plan.prepared.cell_height,
+                        pixels,
+                    )
+                }
+            } else {
+                screen.add_rgba_image_at_absolute_line(
+                    plan.col,
+                    plan.line,
+                    plan.prepared.cell_width,
+                    plan.prepared.cell_height,
+                    pixels,
+                )
+            };
+            self.placement_bytes = self
+                .placement_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(plan.allocated_bytes);
+            self.relative_placements[index].screen_id = Some(screen_id);
+            self.relative_placements[index].allocated_bytes = plan.allocated_bytes;
+        }
+    }
+
+    fn hide_relative_placement(&mut self, id: u64, screen: &mut Screen) {
+        let Some(record) = self
+            .relative_placements
+            .iter_mut()
+            .find(|placement| placement.id == id)
+        else {
+            return;
+        };
+        if let Some(screen_id) = record.screen_id.take() {
+            screen.remove_image(screen_id);
+        }
+        self.placement_bytes = self.placement_bytes.saturating_sub(record.allocated_bytes);
+        record.allocated_bytes = 0;
+    }
+
+    fn remove_relative_record_only(
+        &mut self,
+        id: u64,
+        screen: &mut Screen,
+    ) -> Option<RelativePlacementRecord> {
+        let index = self
+            .relative_placements
+            .iter()
+            .position(|placement| placement.id == id)?;
+        let record = self.relative_placements.swap_remove(index);
+        if let Some(screen_id) = record.screen_id {
+            screen.remove_image(screen_id);
+        }
+        self.placement_bytes = self.placement_bytes.saturating_sub(record.allocated_bytes);
+        Some(record)
     }
 
     fn place_virtual(
@@ -1746,10 +2193,9 @@ impl KittyGraphics {
             .ok_or_else(|| command.echo().error(ErrorCode::NotFound, "image not found"))?;
         virtual_grid_dimensions(image.width, image.height, command, screen)?;
         let placement_id = command.placement_id.unwrap_or(0);
-        if placement_id != 0 {
-            self.virtual_placements.retain(|placement| {
-                placement.image_id != image_id || placement.placement_id != placement_id
-            });
+        let replacements = self.named_placement_parents(image_id, placement_id);
+        for replacement in &replacements {
+            self.remove_for_replacement(*replacement, screen);
         }
         let virtual_id = self.next_virtual_id;
         self.next_virtual_id = self.next_virtual_id.saturating_add(1);
@@ -1759,9 +2205,11 @@ impl KittyGraphics {
             placement_id,
             command: command.clone(),
         });
+        self.reparent(&replacements, PlacementParent::Virtual(virtual_id));
         self.placeholder_revision = self.placeholder_revision.saturating_add(1);
         self.touch_image(image_id);
         self.refresh_unicode_placements(screen);
+        self.refresh_relative_placements(screen);
         Ok(())
     }
 
@@ -1866,6 +2314,7 @@ impl KittyGraphics {
             self.placement_bytes = self.placement_bytes.saturating_add(allocated_bytes);
             self.placeholder_fragments.push(PlaceholderFragment {
                 screen_id,
+                virtual_id: virtual_placement.id,
                 allocated_bytes,
             });
         }
@@ -1901,7 +2350,7 @@ impl KittyGraphics {
         let target_image = matches!(lower, b'i' | b'n')
             .then(|| self.resolve_image_id(command))
             .flatten();
-        let removed_virtual_images: Vec<u32> = self
+        let removed_virtual: Vec<(u64, u32)> = self
             .virtual_placements
             .iter()
             .filter(|placement| match lower {
@@ -1916,7 +2365,11 @@ impl KittyGraphics {
                 }
                 _ => false,
             })
-            .map(|placement| placement.image_id)
+            .map(|placement| (placement.id, placement.image_id))
+            .collect();
+        let removed_virtual_images: Vec<u32> = removed_virtual
+            .iter()
+            .map(|(_, image_id)| *image_id)
             .collect();
         let screen_ids: Vec<u64> = self
             .placements
@@ -1966,11 +2419,76 @@ impl KittyGraphics {
                 matches.then_some(*screen_id)
             })
             .collect();
+        let relative_ids: Vec<u64> = self
+            .relative_placements
+            .iter()
+            .filter_map(|placement| {
+                let image = placement
+                    .screen_id
+                    .and_then(|screen_id| screen.image_by_id(screen_id));
+                let matches = match lower {
+                    b'a' => image.is_some_and(|image| {
+                        image_intersects_rect(image, 0, live_top, screen.width(), screen.height())
+                    }),
+                    b'i' | b'n' => {
+                        target_image == Some(placement.image_id)
+                            && command
+                                .placement_id
+                                .is_none_or(|id| id == placement.placement_id)
+                    }
+                    b'c' => image.is_some_and(|image| {
+                        image_intersects_cell(
+                            image,
+                            screen.cursor.col,
+                            live_top.saturating_add(screen.cursor.row),
+                        )
+                    }),
+                    b'p' | b'q' => image.is_some_and(|image| {
+                        command.source_x.checked_sub(1).is_some_and(|col| {
+                            command.source_y.checked_sub(1).is_some_and(|row| {
+                                (lower != b'q' || placement.command.z_index == command.z_index)
+                                    && image_intersects_cell(
+                                        image,
+                                        col as usize,
+                                        live_top.saturating_add(row as usize),
+                                    )
+                            })
+                        })
+                    }),
+                    b'x' => image.is_some_and(|image| {
+                        command.source_x.checked_sub(1).is_some_and(|col| {
+                            image.col <= col as usize
+                                && image.col.saturating_add(image.cell_width) > col as usize
+                        })
+                    }),
+                    b'y' => image.is_some_and(|image| {
+                        command.source_y.checked_sub(1).is_some_and(|row| {
+                            let line = live_top.saturating_add(row as usize);
+                            image.line <= line
+                                && image.line.saturating_add(image.cell_height) > line
+                        })
+                    }),
+                    b'z' => placement.command.z_index == command.z_index,
+                    b'r' => {
+                        placement.image_id >= command.source_x
+                            && placement.image_id <= command.source_y
+                    }
+                    _ => false,
+                };
+                matches.then_some(placement.id)
+            })
+            .collect();
         let mut affected_images: Vec<u32> = screen_ids
             .iter()
             .filter_map(|id| self.placements.get(id).map(|placement| placement.image_id))
             .collect();
         affected_images.extend(&removed_virtual_images);
+        affected_images.extend(relative_ids.iter().filter_map(|id| {
+            self.relative_placements
+                .iter()
+                .find(|placement| placement.id == *id)
+                .map(|placement| placement.image_id)
+        }));
         if free_data {
             if matches!(lower, b'i' | b'n') {
                 affected_images.extend(target_image);
@@ -1988,19 +2506,16 @@ impl KittyGraphics {
         for screen_id in screen_ids {
             self.remove_placement(screen_id, screen);
         }
-        if !removed_virtual_images.is_empty() {
-            self.virtual_placements.retain(|placement| match lower {
-                b'i' | b'n' => {
-                    target_image != Some(placement.image_id)
-                        || command
-                            .placement_id
-                            .is_some_and(|id| id != placement.placement_id)
-                }
-                b'r' => {
-                    placement.image_id < command.source_x || placement.image_id > command.source_y
-                }
-                _ => true,
-            });
+        for relative_id in relative_ids {
+            self.remove_relative_root(relative_id, screen, false);
+        }
+        if !removed_virtual.is_empty() {
+            let virtual_ids: Vec<u64> = removed_virtual.iter().map(|(id, _)| *id).collect();
+            self.virtual_placements
+                .retain(|placement| !virtual_ids.contains(&placement.id));
+            for virtual_id in virtual_ids {
+                self.remove_relative_descendants(PlacementParent::Virtual(virtual_id), screen);
+            }
             self.placeholder_revision = self.placeholder_revision.saturating_add(1);
             self.refresh_unicode_placements(screen);
         }
@@ -2011,6 +2526,7 @@ impl KittyGraphics {
                 }
             }
         }
+        self.refresh_relative_placements(screen);
     }
 
     fn remove_placements_for_image(&mut self, image_id: u32, screen: &mut Screen) {
@@ -2027,24 +2543,97 @@ impl KittyGraphics {
     }
 
     fn remove_placement(&mut self, screen_id: u64, screen: &mut Screen) {
-        if let Some(placement) = self.placements.remove(&screen_id) {
-            self.placement_bytes = self
-                .placement_bytes
-                .saturating_sub(placement.allocated_bytes);
-            screen.remove_image(screen_id);
+        if self.remove_real_placement_only(screen_id, screen).is_some() {
+            self.remove_relative_descendants(PlacementParent::Real(screen_id), screen);
         }
     }
 
-    fn remove_image_data(&mut self, image_id: u32, screen: &mut Screen) {
-        self.remove_placements_for_image(image_id, screen);
-        let virtual_count = self.virtual_placements.len();
-        self.virtual_placements
-            .retain(|placement| placement.image_id != image_id);
-        let removed_virtual = self.virtual_placements.len() != virtual_count;
-        if removed_virtual {
-            self.placeholder_revision = self.placeholder_revision.saturating_add(1);
-            self.clear_placeholder_fragments(screen);
+    fn remove_real_placement_only(
+        &mut self,
+        screen_id: u64,
+        screen: &mut Screen,
+    ) -> Option<PlacementRecord> {
+        let placement = self.placements.remove(&screen_id)?;
+        self.placement_bytes = self
+            .placement_bytes
+            .saturating_sub(placement.allocated_bytes);
+        screen.remove_image(screen_id);
+        Some(placement)
+    }
+
+    fn relative_tree_ids(&self, roots: impl IntoIterator<Item = u64>) -> Vec<u64> {
+        let mut ids: Vec<u64> = roots.into_iter().collect();
+        let mut index = 0;
+        while index < ids.len() {
+            let parent = ids[index];
+            for child in &self.relative_placements {
+                if child.parent == PlacementParent::Relative(parent) && !ids.contains(&child.id) {
+                    ids.push(child.id);
+                }
+            }
+            index += 1;
         }
+        ids
+    }
+
+    fn remove_relative_records(&mut self, ids: &[u64], screen: &mut Screen) -> Vec<u32> {
+        let mut removed_images = Vec::new();
+        let mut released = 0usize;
+        self.relative_placements.retain(|placement| {
+            if ids.contains(&placement.id) {
+                if let Some(screen_id) = placement.screen_id {
+                    screen.remove_image(screen_id);
+                }
+                released = released.saturating_add(placement.allocated_bytes);
+                removed_images.push(placement.image_id);
+                false
+            } else {
+                true
+            }
+        });
+        self.placement_bytes = self.placement_bytes.saturating_sub(released);
+        removed_images
+    }
+
+    fn remove_relative_descendants(&mut self, parent: PlacementParent, screen: &mut Screen) {
+        let roots: Vec<u64> = self
+            .relative_placements
+            .iter()
+            .filter(|placement| placement.parent == parent)
+            .map(|placement| placement.id)
+            .collect();
+        let ids = self.relative_tree_ids(roots);
+        let image_ids = self.remove_relative_records(&ids, screen);
+        self.remove_orphaned_relative_images(image_ids);
+    }
+
+    fn remove_relative_root(&mut self, id: u64, screen: &mut Screen, free_root_data: bool) {
+        let ids = self.relative_tree_ids([id]);
+        let root_image_id = self
+            .relative_placements
+            .iter()
+            .find(|placement| placement.id == id)
+            .map(|placement| placement.image_id);
+        let image_ids = self.remove_relative_records(&ids, screen);
+        self.remove_orphaned_relative_images(
+            image_ids
+                .into_iter()
+                .filter(|image_id| free_root_data || Some(*image_id) != root_image_id),
+        );
+    }
+
+    fn remove_orphaned_relative_images(&mut self, image_ids: impl IntoIterator<Item = u32>) {
+        let mut image_ids: Vec<u32> = image_ids.into_iter().collect();
+        image_ids.sort_unstable();
+        image_ids.dedup();
+        for image_id in image_ids {
+            if !self.image_has_placements(image_id) {
+                self.remove_stored_image_only(image_id);
+            }
+        }
+    }
+
+    fn remove_stored_image_only(&mut self, image_id: u32) {
         if let Some(image) = self.images.remove(&image_id) {
             self.total_bytes = self.total_bytes.saturating_sub(image.allocated_bytes());
         }
@@ -2052,21 +2641,63 @@ impl KittyGraphics {
             ids.retain(|id| *id != image_id);
         }
         self.image_numbers.retain(|_, ids| !ids.is_empty());
+    }
+
+    fn remove_image_data(&mut self, image_id: u32, screen: &mut Screen) {
+        self.remove_placements_for_image(image_id, screen);
+        let virtual_ids: Vec<u64> = self
+            .virtual_placements
+            .iter()
+            .filter(|placement| placement.image_id == image_id)
+            .map(|placement| placement.id)
+            .collect();
+        let virtual_count = self.virtual_placements.len();
+        self.virtual_placements
+            .retain(|placement| placement.image_id != image_id);
+        let removed_virtual = self.virtual_placements.len() != virtual_count;
+        for virtual_id in virtual_ids {
+            self.remove_relative_descendants(PlacementParent::Virtual(virtual_id), screen);
+        }
+        let relative_ids: Vec<u64> = self
+            .relative_placements
+            .iter()
+            .filter(|placement| placement.image_id == image_id)
+            .map(|placement| placement.id)
+            .collect();
+        for relative_id in relative_ids {
+            self.remove_relative_root(relative_id, screen, false);
+        }
+        if removed_virtual {
+            self.placeholder_revision = self.placeholder_revision.saturating_add(1);
+            self.clear_placeholder_fragments(screen);
+        }
+        self.remove_stored_image_only(image_id);
         if removed_virtual {
             self.refresh_unicode_placements(screen);
         }
     }
 
-    fn sync_placements(&mut self, screen: &Screen) {
+    fn sync_placements(&mut self, screen: &mut Screen) {
+        let missing: Vec<u64> = self
+            .placements
+            .keys()
+            .filter(|screen_id| screen.image_by_id(**screen_id).is_none())
+            .copied()
+            .collect();
+        for screen_id in missing {
+            self.remove_placement(screen_id, screen);
+        }
         let mut released = 0usize;
-        self.placements.retain(|screen_id, placement| {
-            if screen.image_by_id(*screen_id).is_none() {
+        for placement in &mut self.relative_placements {
+            if placement
+                .screen_id
+                .is_some_and(|screen_id| screen.image_by_id(screen_id).is_none())
+            {
+                placement.screen_id = None;
                 released = released.saturating_add(placement.allocated_bytes);
-                false
-            } else {
-                true
+                placement.allocated_bytes = 0;
             }
-        });
+        }
         self.placement_bytes = self.placement_bytes.saturating_sub(released);
     }
 
@@ -2075,7 +2706,14 @@ impl KittyGraphics {
             .values()
             .filter(|placement| placement.image_id == image_id)
             .map(|placement| placement.allocated_bytes)
-            .sum()
+            .sum::<usize>()
+            .saturating_add(
+                self.relative_placements
+                    .iter()
+                    .filter(|placement| placement.image_id == image_id)
+                    .map(|placement| placement.allocated_bytes)
+                    .sum(),
+            )
     }
 
     fn image_has_placements(&self, image_id: u32) -> bool {
@@ -2084,6 +2722,10 @@ impl KittyGraphics {
             .any(|placement| placement.image_id == image_id)
             || self
                 .virtual_placements
+                .iter()
+                .any(|placement| placement.image_id == image_id)
+            || self
+                .relative_placements
                 .iter()
                 .any(|placement| placement.image_id == image_id)
     }
@@ -2150,6 +2792,74 @@ struct PreparedPlacement {
     pixel_height: usize,
     cell_width: usize,
     cell_height: usize,
+}
+
+struct PreparedRelativePlacement {
+    col: usize,
+    line: usize,
+    allocated_bytes: usize,
+    prepared: PreparedPlacement,
+}
+
+fn clip_relative_placement(
+    (col, line): (i64, i64),
+    placement: PreparedPlacement,
+) -> Result<Option<(usize, usize, PreparedPlacement)>, ()> {
+    let hidden_cols = if col < 0 {
+        usize::try_from(col.saturating_neg()).unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+    let hidden_rows = if line < 0 {
+        usize::try_from(line.saturating_neg()).unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+    if hidden_cols >= placement.cell_width || hidden_rows >= placement.cell_height {
+        return Ok(None);
+    }
+    let col = usize::try_from(col.max(0)).map_err(|_| ())?;
+    let line = usize::try_from(line.max(0)).map_err(|_| ())?;
+    if hidden_cols == 0 && hidden_rows == 0 {
+        return Ok(Some((col, line, placement)));
+    }
+
+    let pixel_left = hidden_cols
+        .saturating_mul(placement.pixel_width)
+        .div_ceil(placement.cell_width);
+    let pixel_top = hidden_rows
+        .saturating_mul(placement.pixel_height)
+        .div_ceil(placement.cell_height);
+    if pixel_left >= placement.pixel_width || pixel_top >= placement.pixel_height {
+        return Ok(None);
+    }
+    let source = RgbaImage::from_raw(
+        placement.pixel_width as u32,
+        placement.pixel_height as u32,
+        placement.pixels.as_ref().clone(),
+    )
+    .ok_or(())?;
+    let cropped = imageops::crop_imm(
+        &source,
+        pixel_left as u32,
+        pixel_top as u32,
+        (placement.pixel_width - pixel_left) as u32,
+        (placement.pixel_height - pixel_top) as u32,
+    )
+    .to_image();
+    let pixel_width = cropped.width() as usize;
+    let pixel_height = cropped.height() as usize;
+    Ok(Some((
+        col,
+        line,
+        PreparedPlacement {
+            pixels: Arc::new(cropped.into_raw()),
+            pixel_width,
+            pixel_height,
+            cell_width: placement.cell_width - hidden_cols,
+            cell_height: placement.cell_height - hidden_rows,
+        },
+    )))
 }
 
 fn virtual_grid_dimensions(
@@ -2859,6 +3569,414 @@ mod tests {
     }
 
     #[test]
+    fn relative_placements_follow_named_parents_without_moving_the_cursor() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        screen.cursor.col = 1;
+        screen.cursor.row = 1;
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=81,p=1,C=1", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=82", &[4, 5, 6, 255]),
+        );
+        let cursor = (screen.cursor.col, screen.cursor.row);
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=82,p=2,P=81,Q=1,H=2,V=1\x1b\\",
+        );
+
+        assert_eq!((screen.cursor.col, screen.cursor.row), cursor);
+        let child = screen
+            .images()
+            .into_iter()
+            .find(|image| image.protocol_image_id == 82)
+            .unwrap();
+        assert_eq!((child.col, child.line), (3, 2));
+
+        screen.cursor.col = 3;
+        screen.cursor.row = 2;
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=81,p=1,C=1\x1b\\");
+        let child = screen
+            .images()
+            .into_iter()
+            .find(|image| image.protocol_image_id == 82)
+            .unwrap();
+        assert_eq!((child.col, child.line), (5, 3));
+    }
+
+    #[test]
+    fn relative_placements_resolve_virtual_parent_placeholder_origins() {
+        use crate::cell::KITTY_IMAGE_PLACEHOLDER;
+        use crate::color::Color;
+
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=83,p=3,U=1,c=1,r=1", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=84", &[4, 5, 6, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=84,p=4,P=83,Q=3,H=1,V=2\x1b\\",
+        );
+        assert!(screen.images().is_empty());
+
+        let cell = screen.grid_mut().get_mut(1, 2).unwrap();
+        cell.set_text(&format!("{KITTY_IMAGE_PLACEHOLDER}\u{0305}\u{0305}"));
+        cell.fg = Color::Indexed(83);
+        cell.underline_color = Some(Color::Indexed(3));
+        graphics.refresh_unicode_placements(&mut screen);
+        graphics.refresh_relative_placements(&mut screen);
+
+        let child = screen
+            .images()
+            .into_iter()
+            .find(|image| image.protocol_image_id == 84)
+            .unwrap();
+        assert_eq!((child.col, child.line), (3, 3));
+    }
+
+    #[test]
+    fn relative_placements_reject_missing_parents_and_cycles() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        for id in 85..=87 {
+            feed(
+                &mut graphics,
+                &mut screen,
+                &sequence(&format!("a=t,f=32,s=1,v=1,i={id}"), &[1, 2, 3, 255]),
+            );
+        }
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=85,p=5,P=999,Q=1\x1b\\",
+        );
+        assert!(
+            String::from_utf8(screen.take_pending_responses().pop().unwrap())
+                .unwrap()
+                .contains("ENOPARENT")
+        );
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=85,p=5,C=1\x1b\\");
+        screen.take_pending_responses();
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=85,p=5,P=85,Q=5\x1b\\",
+        );
+        assert!(
+            String::from_utf8(screen.take_pending_responses().pop().unwrap())
+                .unwrap()
+                .contains("EINVAL")
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=86,p=6,P=85,Q=5\x1b\\",
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=87,p=7,P=86,Q=6\x1b\\",
+        );
+        screen.take_pending_responses();
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=86,p=6,P=87,Q=7\x1b\\",
+        );
+        assert!(
+            String::from_utf8(screen.take_pending_responses().pop().unwrap())
+                .unwrap()
+                .contains("ECYCLE")
+        );
+    }
+
+    #[test]
+    fn deleting_a_parent_cascades_relative_placements_and_orphaned_data() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        for id in 88..=90 {
+            feed(
+                &mut graphics,
+                &mut screen,
+                &sequence(&format!("a=t,f=32,s=1,v=1,i={id}"), &[1, 2, 3, 255]),
+            );
+        }
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=88,p=8,C=1\x1b\\");
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=89,p=9,P=88,Q=8,H=1\x1b\\",
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=90,p=10,P=89,Q=9,H=1\x1b\\",
+        );
+        assert_eq!(graphics.relative_placements.len(), 2);
+        assert_eq!(screen.images().len(), 3);
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=i,i=88,p=8\x1b\\");
+
+        assert!(graphics.relative_placements.is_empty());
+        assert!(screen.images().is_empty());
+        assert!(graphics.images.contains_key(&88));
+        assert!(!graphics.images.contains_key(&89));
+        assert!(!graphics.images.contains_key(&90));
+    }
+
+    #[test]
+    fn erased_parent_screen_images_reap_relative_groups_on_refresh() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=96,p=16,C=1", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=97", &[4, 5, 6, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=97,p=17,P=96,Q=16\x1b\\",
+        );
+        let parent_screen_id = *graphics.placements.keys().next().unwrap();
+
+        screen.remove_image(parent_screen_id);
+        graphics.refresh_relative_placements(&mut screen);
+
+        assert!(graphics.placements.is_empty());
+        assert!(graphics.relative_placements.is_empty());
+        assert!(!graphics.images.contains_key(&97));
+    }
+
+    #[test]
+    fn relative_placements_participate_in_geometric_and_freeing_deletes() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=101,p=21,C=1", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=102", &[4, 5, 6, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=102,p=22,P=101,Q=21,z=5\x1b\\",
+        );
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=z,z=5\x1b\\");
+        assert!(graphics.relative_placements.is_empty());
+        assert!(graphics.images.contains_key(&102));
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=102,p=22,P=101,Q=21,z=5\x1b\\",
+        );
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=Z,z=5\x1b\\");
+        assert!(graphics.relative_placements.is_empty());
+        assert!(!graphics.images.contains_key(&102));
+        assert!(graphics.images.contains_key(&101));
+    }
+
+    #[test]
+    fn deleting_a_virtual_parent_cascades_hidden_relative_children() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=98,p=18,U=1,c=1,r=1", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=99", &[4, 5, 6, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=99,p=19,P=98,Q=18\x1b\\",
+        );
+        assert_eq!(graphics.relative_placements.len(), 1);
+        assert!(screen.images().is_empty());
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=i,i=98,p=18\x1b\\");
+
+        assert!(graphics.virtual_placements.is_empty());
+        assert!(graphics.relative_placements.is_empty());
+        assert!(graphics.images.contains_key(&98));
+        assert!(!graphics.images.contains_key(&99));
+    }
+
+    #[test]
+    fn named_parent_type_changes_preserve_relative_children() {
+        use crate::cell::KITTY_IMAGE_PLACEHOLDER;
+        use crate::color::Color;
+
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=91,p=11,C=1", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=92", &[4, 5, 6, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=92,p=12,P=91,Q=11,H=1\x1b\\",
+        );
+        assert_eq!(screen.images().len(), 2);
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=91,p=11,U=1,c=1,r=1\x1b\\",
+        );
+        assert!(screen.images().is_empty());
+        assert_eq!(graphics.relative_placements.len(), 1);
+
+        let cell = screen.grid_mut().get_mut(2, 2).unwrap();
+        cell.set_text(&format!("{KITTY_IMAGE_PLACEHOLDER}\u{0305}\u{0305}"));
+        cell.fg = Color::Indexed(91);
+        cell.underline_color = Some(Color::Indexed(11));
+        graphics.refresh_unicode_placements(&mut screen);
+        graphics.refresh_relative_placements(&mut screen);
+        let child = screen
+            .images()
+            .into_iter()
+            .find(|image| image.protocol_image_id == 92)
+            .unwrap();
+        assert_eq!((child.col, child.line), (3, 2));
+
+        screen.cursor.col = 4;
+        screen.cursor.row = 1;
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=91,p=11,C=1\x1b\\");
+        assert!(graphics.virtual_placements.is_empty());
+        let child = screen
+            .images()
+            .into_iter()
+            .find(|image| image.protocol_image_id == 92)
+            .unwrap();
+        assert_eq!((child.col, child.line), (5, 1));
+    }
+
+    #[test]
+    fn negative_relative_offsets_clip_whole_cells_from_the_image() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=93,p=13,C=1", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=2,v=1,i=94", &[10, 20, 30, 255, 40, 50, 60, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=94,p=14,P=93,Q=13,H=-1,c=2,r=1\x1b\\",
+        );
+
+        let child = screen
+            .images()
+            .into_iter()
+            .find(|image| image.protocol_image_id == 94)
+            .unwrap();
+        assert_eq!((child.col, child.cell_width), (0, 1));
+        assert_eq!(child.data.as_slice(), &[40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn relative_chains_allow_32_ancestors_then_report_too_deep() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(8, 6, ScreenConfig::default());
+        screen.set_cell_width_hint(1.0);
+        screen.set_cell_height_hint(1.0);
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=95", &[1, 2, 3, 255]),
+        );
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=95,p=1,C=1\x1b\\");
+        for placement_id in 2..=34 {
+            feed(
+                &mut graphics,
+                &mut screen,
+                format!(
+                    "\x1b_Ga=p,i=95,p={placement_id},P=95,Q={}\x1b\\",
+                    placement_id - 1
+                )
+                .as_bytes(),
+            );
+        }
+        assert_eq!(graphics.relative_placements.len(), 33);
+        screen.take_pending_responses();
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=p,i=95,p=35,P=95,Q=34\x1b\\",
+        );
+        assert!(
+            String::from_utf8(screen.take_pending_responses().pop().unwrap())
+                .unwrap()
+                .contains("ETOODEEP")
+        );
+        assert_eq!(graphics.relative_placements.len(), 33);
+    }
+
+    #[test]
     fn zlib_compressed_rgba_is_inflated_before_display() {
         let mut graphics = KittyGraphics::default();
         let mut screen = Screen::new(10, 5, ScreenConfig::default());
@@ -3287,6 +4405,30 @@ mod tests {
         assert_eq!(
             graphics.images[&74].animation_state,
             AnimationState::Loading
+        );
+    }
+
+    #[test]
+    fn invalid_animation_states_are_rejected_instead_of_silently_ignored() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=75", &[1, 2, 3, 255]),
+        );
+        screen.take_pending_responses();
+
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=a,i=75,s=9\x1b\\");
+
+        assert!(
+            String::from_utf8(screen.take_pending_responses().pop().unwrap())
+                .unwrap()
+                .contains("EINVAL")
+        );
+        assert_eq!(
+            graphics.images[&75].animation_state,
+            AnimationState::Stopped
         );
     }
 

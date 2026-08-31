@@ -197,12 +197,14 @@ impl Parser {
             }
         }
         self.kitty_graphics.refresh_unicode_placements(screen);
+        self.kitty_graphics.refresh_relative_placements(screen);
     }
 
     /// Re-project Kitty Unicode placeholders after viewport or geometry changes.
     pub(crate) fn refresh_graphics_viewport(&mut self, screen: &mut Screen) {
         self.kitty_graphics
             .refresh_unicode_placement_geometry(screen);
+        self.kitty_graphics.refresh_relative_placements(screen);
     }
 
     /// Sample terminal-driven Kitty animations from a monotonic clock.
