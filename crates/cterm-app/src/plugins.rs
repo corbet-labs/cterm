@@ -549,6 +549,7 @@ mod tests {
         );
         fs::write(root.join("README.txt"), "ignored").unwrap();
 
+        let canonical_root = root.canonicalize().unwrap();
         let catalog = PluginCatalog::discover(&root).unwrap();
         let actions = catalog
             .commands()
@@ -566,7 +567,7 @@ mod tests {
         assert_eq!(catalog.failures().len(), 1);
         assert!(catalog.commands().iter().all(|command| {
             command.package_root().is_absolute()
-                && command.package_root().parent() == Some(root.as_path())
+                && command.package_root().parent() == Some(canonical_root.as_path())
         }));
         assert!(matches!(
             catalog.failures()[0].error(),
