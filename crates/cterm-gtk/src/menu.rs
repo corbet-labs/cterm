@@ -37,7 +37,7 @@ pub fn create_menu_model_with_options(
         file_menu.append_item(&menu_item(
             "Quick Open Template...",
             "win.quick-open",
-            Some("<Ctrl><Shift>o"),
+            Some("<Ctrl><Shift>g"),
         ));
 
         // Docker submenu
@@ -74,6 +74,15 @@ pub fn create_menu_model_with_options(
         Some("<Ctrl><Shift>a"),
     ));
     menu.append_submenu(Some("Edit"), &edit_menu);
+
+    // View menu
+    let view_menu = gio::Menu::new();
+    view_menu.append_item(&menu_item(
+        "Fullscreen",
+        "win.toggle-fullscreen",
+        Some("F11"),
+    ));
+    menu.append_submenu(Some("View"), &view_menu);
 
     // Terminal menu
     let terminal_menu = gio::Menu::new();

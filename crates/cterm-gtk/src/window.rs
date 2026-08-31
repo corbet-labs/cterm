@@ -12,7 +12,7 @@ use gtk4::{
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
-use cterm_ui::events::{Action, KeyCode, Modifiers};
+use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
 use cterm_ui::theme::Theme;
 use cterm_ui::{
     PaneDirection, PaneId, PaneLayout, PaneTree, SplitDirection, SplitPlacement, SplitRatio,
@@ -132,7 +132,7 @@ pub struct CtermWindow {
     pub tab_bar: TabBar,
     pub config: Rc<RefCell<Config>>,
     pub theme: Theme,
-    pub shortcuts: ShortcutManager,
+    pub shortcuts: Rc<RefCell<ShortcutManager>>,
     tabs: Rc<RefCell<Vec<TabEntry>>>,
     next_tab_id: Rc<RefCell<u64>>,
     menu_bar: PopoverMenuBar,
@@ -156,6 +156,118 @@ struct PaneActionContext {
     notification_bar: NotificationBar,
 }
 
+#[derive(Clone)]
+struct TerminalViewActionContext {
+    notebook: Notebook,
+    tabs: Rc<RefCell<Vec<TabEntry>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GtkActionActivation {
+    name: &'static str,
+    parameter: Option<String>,
+}
+
+impl GtkActionActivation {
+    fn simple(name: &'static str) -> Self {
+        Self {
+            name,
+            parameter: None,
+        }
+    }
+
+    fn with_string(name: &'static str, parameter: impl Into<String>) -> Self {
+        Self {
+            name,
+            parameter: Some(parameter.into()),
+        }
+    }
+}
+
+/// Map a shared semantic action onto the canonical GTK window action.
+///
+/// Keep this match exhaustive: adding an `Action` must require an explicit GTK
+/// dispatch decision instead of silently falling through to the terminal.
+fn gtk_action_activation(action: &Action) -> GtkActionActivation {
+    match action {
+        Action::NewTab => GtkActionActivation::simple("new-tab"),
+        Action::CloseTab => GtkActionActivation::simple("close-tab"),
+        Action::NextTab => GtkActionActivation::simple("next-tab"),
+        Action::PrevTab => GtkActionActivation::simple("prev-tab"),
+        Action::NextAlertedTab => GtkActionActivation::simple("next-alerted-tab"),
+        Action::Tab(tab) => GtkActionActivation::with_string("select-tab-index", tab.to_string()),
+        Action::SplitPane(SplitDirection::Horizontal) => {
+            GtkActionActivation::simple("split-pane-horizontal")
+        }
+        Action::SplitPane(SplitDirection::Vertical) => {
+            GtkActionActivation::simple("split-pane-vertical")
+        }
+        Action::ClosePane => GtkActionActivation::simple("close-pane"),
+        Action::FocusPane(PaneDirection::Left) => GtkActionActivation::simple("focus-pane-left"),
+        Action::FocusPane(PaneDirection::Right) => GtkActionActivation::simple("focus-pane-right"),
+        Action::FocusPane(PaneDirection::Up) => GtkActionActivation::simple("focus-pane-up"),
+        Action::FocusPane(PaneDirection::Down) => GtkActionActivation::simple("focus-pane-down"),
+        Action::ResizePane(PaneDirection::Left) => GtkActionActivation::simple("resize-pane-left"),
+        Action::ResizePane(PaneDirection::Right) => {
+            GtkActionActivation::simple("resize-pane-right")
+        }
+        Action::ResizePane(PaneDirection::Up) => GtkActionActivation::simple("resize-pane-up"),
+        Action::ResizePane(PaneDirection::Down) => GtkActionActivation::simple("resize-pane-down"),
+        Action::TogglePaneZoom => GtkActionActivation::simple("toggle-pane-zoom"),
+        Action::NewWindow => GtkActionActivation::simple("new-window"),
+        Action::CloseWindow => GtkActionActivation::simple("close-window"),
+        Action::Copy => GtkActionActivation::simple("copy"),
+        Action::Paste => GtkActionActivation::simple("paste"),
+        Action::SelectAll => GtkActionActivation::simple("select-all"),
+        Action::ZoomIn => GtkActionActivation::simple("zoom-in"),
+        Action::ZoomOut => GtkActionActivation::simple("zoom-out"),
+        Action::ZoomReset => GtkActionActivation::simple("zoom-reset"),
+        Action::ToggleFullscreen => GtkActionActivation::simple("toggle-fullscreen"),
+        Action::ScrollUp => GtkActionActivation::simple("scroll-up"),
+        Action::ScrollDown => GtkActionActivation::simple("scroll-down"),
+        Action::ScrollPageUp => GtkActionActivation::simple("scroll-page-up"),
+        Action::ScrollPageDown => GtkActionActivation::simple("scroll-page-down"),
+        Action::ScrollToTop => GtkActionActivation::simple("scroll-to-top"),
+        Action::ScrollToBottom => GtkActionActivation::simple("scroll-to-bottom"),
+        Action::PromptPrevious => GtkActionActivation::simple("prompt-previous"),
+        Action::PromptNext => GtkActionActivation::simple("prompt-next"),
+        Action::OpenPreferences => GtkActionActivation::simple("preferences"),
+        Action::FindText => GtkActionActivation::simple("find"),
+        Action::ResetTerminal => GtkActionActivation::simple("reset"),
+        Action::QuickOpenTemplate => GtkActionActivation::simple("quick-open"),
+    }
+}
+
+fn activate_shared_action(window: &ApplicationWindow, action: &Action) {
+    let activation = gtk_action_activation(action);
+    let parameter = activation
+        .parameter
+        .as_ref()
+        .map(|value| glib::Variant::from(value.as_str()));
+
+    if window.lookup_action(activation.name).is_none() {
+        log::error!(
+            "GTK action '{}' is not registered for shared action {:?}",
+            activation.name,
+            action
+        );
+        return;
+    }
+
+    gtk4::prelude::ActionGroupExt::activate_action(window, activation.name, parameter.as_ref());
+}
+
+fn shortcut_manager(config: &Config) -> ShortcutManager {
+    let mut shortcuts = ShortcutManager::from_config(&config.shortcuts);
+    // Fullscreen is not yet configurable in the shared config. Keep the
+    // conventional desktop binding local to GTK until it becomes one.
+    shortcuts.bind(
+        Shortcut::new(KeyCode::F11, Modifiers::empty()),
+        Action::ToggleFullscreen,
+    );
+    shortcuts
+}
+
 /// Show an error dialog when a seamless upgrade fails.
 fn show_upgrade_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::Display) {
     let dialog = gtk4::MessageDialog::new(
@@ -172,6 +284,30 @@ fn show_upgrade_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::D
 fn reject_managed_secondary_action(action: &str) -> bool {
     if crate::get_args().managed {
         log::warn!("Ignoring {action} request in managed mode");
+        true
+    } else {
+        false
+    }
+}
+
+fn is_managed_restricted_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewTab
+            | Action::SplitPane(_)
+            | Action::ClosePane
+            | Action::FocusPane(_)
+            | Action::ResizePane(_)
+            | Action::TogglePaneZoom
+            | Action::NewWindow
+            | Action::OpenPreferences
+            | Action::QuickOpenTemplate
+    )
+}
+
+fn reject_managed_action(action: &Action) -> bool {
+    if crate::get_args().managed && is_managed_restricted_action(action) {
+        log::warn!("Ignoring {action:?} request in managed mode");
         true
     } else {
         false
@@ -294,7 +430,58 @@ fn register_pane_actions(window: &ApplicationWindow, context: &PaneActionContext
     ] {
         let context = context.clone();
         let gtk_action = gio::SimpleAction::new(name, None);
-        gtk_action.connect_activate(move |_, _| perform_pane_action(&context, action.clone()));
+        gtk_action.connect_activate(move |_, _| {
+            if reject_managed_action(&action) {
+                return;
+            }
+            perform_pane_action(&context, action.clone());
+        });
+        window.add_action(&gtk_action);
+    }
+}
+
+fn perform_terminal_view_action(context: &TerminalViewActionContext, action: &Action) {
+    let Some(page_idx) = context.notebook.current_page() else {
+        return;
+    };
+    let tabs = context.tabs.borrow();
+    let Some(tab) = tabs.get(page_idx as usize) else {
+        return;
+    };
+
+    match action {
+        Action::ZoomIn => tab.terminal.zoom_in(),
+        Action::ZoomOut => tab.terminal.zoom_out(),
+        Action::ZoomReset => tab.terminal.zoom_reset(),
+        Action::ScrollUp => tab.terminal.scroll_viewport_up(1),
+        Action::ScrollDown => tab.terminal.scroll_viewport_down(1),
+        Action::ScrollPageUp => tab.terminal.scroll_viewport_page(true),
+        Action::ScrollPageDown => tab.terminal.scroll_viewport_page(false),
+        Action::ScrollToTop => tab.terminal.scroll_viewport_edge(true),
+        Action::ScrollToBottom => tab.terminal.scroll_viewport_edge(false),
+        Action::PromptPrevious => tab.terminal.scroll_to_shell_prompt(true),
+        Action::PromptNext => tab.terminal.scroll_to_shell_prompt(false),
+        _ => unreachable!("non-view action registered as a terminal view action"),
+    }
+}
+
+fn register_terminal_view_actions(window: &ApplicationWindow, context: &TerminalViewActionContext) {
+    for (name, action) in [
+        ("zoom-in", Action::ZoomIn),
+        ("zoom-out", Action::ZoomOut),
+        ("zoom-reset", Action::ZoomReset),
+        ("scroll-up", Action::ScrollUp),
+        ("scroll-down", Action::ScrollDown),
+        ("scroll-page-up", Action::ScrollPageUp),
+        ("scroll-page-down", Action::ScrollPageDown),
+        ("scroll-to-top", Action::ScrollToTop),
+        ("scroll-to-bottom", Action::ScrollToBottom),
+        ("prompt-previous", Action::PromptPrevious),
+        ("prompt-next", Action::PromptNext),
+    ] {
+        let context = context.clone();
+        let gtk_action = gio::SimpleAction::new(name, None);
+        gtk_action.connect_activate(move |_, _| perform_terminal_view_action(&context, &action));
         window.add_action(&gtk_action);
     }
 }
@@ -412,7 +599,7 @@ impl CtermWindow {
         window.set_child(Some(&main_box));
 
         // Create shortcut manager
-        let shortcuts = ShortcutManager::from_config(&config.shortcuts);
+        let shortcuts = Rc::new(RefCell::new(shortcut_manager(config)));
 
         let has_bell = Rc::new(RefCell::new(false));
         let file_manager = Rc::new(RefCell::new(PendingFileManager::new()));
@@ -530,7 +717,7 @@ impl CtermWindow {
         main_box.append(&notebook);
         window.set_child(Some(&main_box));
 
-        let shortcuts = ShortcutManager::from_config(&config.shortcuts);
+        let shortcuts = Rc::new(RefCell::new(shortcut_manager(config)));
         let has_bell = Rc::new(RefCell::new(false));
         let file_manager = Rc::new(RefCell::new(PendingFileManager::new()));
 
@@ -656,6 +843,11 @@ impl CtermWindow {
             notification_bar: self.notification_bar.clone(),
         };
         register_pane_actions(window, &pane_context);
+        let terminal_view_context = TerminalViewActionContext {
+            notebook: notebook.clone(),
+            tabs: Rc::clone(&tabs),
+        };
+        register_terminal_view_actions(window, &terminal_view_context);
 
         // File menu actions
         {
@@ -671,7 +863,7 @@ impl CtermWindow {
             let notification_bar = self.notification_bar.clone();
             let action = gio::SimpleAction::new("new-tab", None);
             action.connect_activate(move |_, _| {
-                if reject_managed_secondary_action("new tab") {
+                if reject_managed_action(&Action::NewTab) {
                     return;
                 }
                 // Get info from the active terminal
@@ -714,7 +906,7 @@ impl CtermWindow {
             let theme = theme.clone();
             let action = gio::SimpleAction::new("new-window", None);
             action.connect_activate(move |_, _| {
-                if reject_managed_secondary_action("new window") {
+                if reject_managed_action(&Action::NewWindow) {
                     return;
                 }
                 let cfg = config.borrow();
@@ -761,12 +953,24 @@ impl CtermWindow {
             window.add_action(&action);
         }
 
+        {
+            // `CloseWindow` is a window-scoped semantic action. Keep it
+            // separate from the menu's historical "quit" action so it cannot
+            // accidentally acquire application-wide semantics later.
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("close-window", None);
+            action.connect_activate(move |_, _| {
+                window_clone.close();
+            });
+            window.add_action(&action);
+        }
+
         // Quick Open Template action
         {
             let quick_open = self.quick_open.clone();
             let action = gio::SimpleAction::new("quick-open", None);
             action.connect_activate(move |_, _| {
-                if reject_managed_secondary_action("quick open") {
+                if reject_managed_action(&Action::QuickOpenTemplate) {
                     return;
                 }
                 // Load templates and show overlay
@@ -1101,6 +1305,19 @@ impl CtermWindow {
             window.add_action(&action);
         }
 
+        {
+            let window_clone = window.clone();
+            let action = gio::SimpleAction::new("toggle-fullscreen", None);
+            action.connect_activate(move |_, _| {
+                if window_clone.is_fullscreen() {
+                    window_clone.unfullscreen();
+                } else {
+                    window_clone.fullscreen();
+                }
+            });
+            window.add_action(&action);
+        }
+
         // Terminal menu actions
         {
             let window_clone = window.clone();
@@ -1250,6 +1467,32 @@ impl CtermWindow {
                     let prev = if current == 0 { n - 1 } else { current - 1 };
                     notebook.set_current_page(Some(prev));
                     sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                    focus_current_terminal(&notebook, &tabs);
+                }
+            });
+            window.add_action(&action);
+        }
+
+        {
+            let notebook = notebook.clone();
+            let tabs = Rc::clone(&tabs);
+            let tab_bar = tab_bar.clone();
+            let action = gio::SimpleAction::new(
+                "select-tab-index",
+                Some(&glib::VariantType::new("s").unwrap()),
+            );
+            action.connect_activate(move |_, param| {
+                let Some(tab_number) = param
+                    .and_then(|value| value.get::<String>())
+                    .and_then(|value| value.parse::<u32>().ok())
+                else {
+                    return;
+                };
+                let page = tab_number.saturating_sub(1);
+                if page < notebook.n_pages() {
+                    notebook.set_current_page(Some(page));
+                    sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                    focus_current_terminal(&notebook, &tabs);
                 }
             });
             window.add_action(&action);
@@ -1266,6 +1509,7 @@ impl CtermWindow {
                     let current = notebook.current_page().unwrap_or(0);
                     notebook.set_current_page(Some((current + 1) % n));
                     sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                    focus_current_terminal(&notebook, &tabs);
                 }
             });
             window.add_action(&action);
@@ -1288,6 +1532,7 @@ impl CtermWindow {
                                 drop(tabs_ref);
                                 notebook.set_current_page(Some(idx as u32));
                                 sync_tab_bar_active(&tab_bar, &tabs, &notebook);
+                                focus_current_terminal(&notebook, &tabs);
                                 return;
                             }
                         }
@@ -1380,14 +1625,16 @@ impl CtermWindow {
         {
             let window_clone = window.clone();
             let config = Rc::clone(&config);
+            let shortcuts = Rc::clone(&self.shortcuts);
             let menu_bar_clone = menu_bar.clone();
             let action = gio::SimpleAction::new("preferences", None);
             action.connect_activate(move |_, _| {
-                if reject_managed_secondary_action("preferences") {
+                if reject_managed_action(&Action::OpenPreferences) {
                     return;
                 }
                 let cfg = config.borrow().clone();
                 let config_for_save = Rc::clone(&config);
+                let shortcuts_for_save = Rc::clone(&shortcuts);
                 let menu_bar = menu_bar_clone.clone();
                 dialogs::show_preferences_dialog(&window_clone, &cfg, move |new_config| {
                     log::info!("Preferences saved");
@@ -1404,6 +1651,9 @@ impl CtermWindow {
                         crate::get_args().updater_enabled(),
                         crate::get_args().managed,
                     );
+                    // The key controller borrows this shared manager for every
+                    // event, so shortcut edits take effect immediately.
+                    *shortcuts_for_save.borrow_mut() = shortcut_manager(&new_config);
                     // Update internal config state
                     *config_for_save.borrow_mut() = new_config;
                 });
@@ -1936,28 +2186,8 @@ impl CtermWindow {
         // swallow Ctrl+Shift+letter events before key-pressed fires.
         key_controller.set_im_context(None::<&gtk4::IMContext>);
 
-        let shortcuts = self.shortcuts.clone();
-        let notebook = self.notebook.clone();
-        let tabs = Rc::clone(&self.tabs);
-        let next_tab_id = Rc::clone(&self.next_tab_id);
+        let shortcuts = Rc::clone(&self.shortcuts);
         let window = self.window.clone();
-        let config = self.config.clone();
-        let theme = self.theme.clone();
-        let tab_bar = self.tab_bar.clone();
-        let has_bell = Rc::clone(&self.has_bell);
-        let file_manager = Rc::clone(&self.file_manager);
-        let notification_bar = self.notification_bar.clone();
-        let pane_context = PaneActionContext {
-            notebook: notebook.clone(),
-            tabs: Rc::clone(&tabs),
-            config: Rc::clone(&config),
-            theme: theme.clone(),
-            tab_bar: tab_bar.clone(),
-            window: window.clone(),
-            has_bell: Rc::clone(&has_bell),
-            file_manager: Rc::clone(&file_manager),
-            notification_bar: notification_bar.clone(),
-        };
 
         key_controller.connect_key_pressed(move |_, keyval, _keycode, state| {
             // Convert GTK modifiers to our modifiers
@@ -1973,234 +2203,16 @@ impl CtermWindow {
                 }
             }
 
-            // Convert keyval to our key code
-            if let Some(key) = keyval_to_keycode(keyval) {
-                // Check for shortcut match
-                if let Some(action) = shortcuts.match_event(key, modifiers) {
-                    match action {
-                        Action::SplitPane(_)
-                        | Action::ClosePane
-                        | Action::FocusPane(_)
-                        | Action::ResizePane(_)
-                        | Action::TogglePaneZoom => {
-                            perform_pane_action(&pane_context, action.clone());
-                            return glib::Propagation::Stop;
-                        }
-                        Action::NewTab => {
-                            if reject_managed_secondary_action("new-tab shortcut") {
-                                return glib::Propagation::Stop;
-                            }
-                            let (cwd, daemon_socket) = {
-                                let tabs_borrow = tabs.borrow();
-                                if let Some(page_idx) = notebook.current_page() {
-                                    let entry = tabs_borrow.get(page_idx as usize);
-                                    #[cfg(unix)]
-                                    let cwd = entry.and_then(|e| e.terminal.foreground_cwd());
-                                    #[cfg(not(unix))]
-                                    let cwd: Option<String> = None;
-                                    let socket = entry.and_then(|e| e.daemon_socket.clone());
-                                    (cwd, socket)
-                                } else {
-                                    (None, None)
-                                }
-                            };
+            let Some(key) = keyval_to_keycode(keyval) else {
+                return glib::Propagation::Proceed;
+            };
+            let action = shortcuts.borrow().match_event(key, modifiers).cloned();
+            let Some(action) = action else {
+                return glib::Propagation::Proceed;
+            };
 
-                            create_new_tab(
-                                &notebook,
-                                &tabs,
-                                &next_tab_id,
-                                &config,
-                                &theme,
-                                &tab_bar,
-                                &window,
-                                &has_bell,
-                                &file_manager,
-                                &notification_bar,
-                                cwd,
-                                daemon_socket,
-                            );
-                            return glib::Propagation::Stop;
-                        }
-                        Action::CloseTab => {
-                            close_current_tab(&notebook, &tabs, &tab_bar, &window, &config);
-                            return glib::Propagation::Stop;
-                        }
-                        Action::NextTab => {
-                            let n = notebook.n_pages();
-                            if n > 0 {
-                                let current = notebook.current_page().unwrap_or(0);
-                                notebook.set_current_page(Some((current + 1) % n));
-                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook, &tabs);
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::PrevTab => {
-                            let n = notebook.n_pages();
-                            if n > 0 {
-                                let current = notebook.current_page().unwrap_or(0);
-                                let prev = if current == 0 { n - 1 } else { current - 1 };
-                                notebook.set_current_page(Some(prev));
-                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook, &tabs);
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::NextAlertedTab => {
-                            let n = notebook.n_pages();
-                            if n > 0 {
-                                let current = notebook.current_page().unwrap_or(0) as usize;
-                                let tabs_ref = tabs.borrow();
-                                for offset in 1..tabs_ref.len() {
-                                    let idx = (current + offset) % tabs_ref.len();
-                                    if let Some(entry) = tabs_ref.get(idx) {
-                                        if tab_bar.has_bell(entry.id) {
-                                            drop(tabs_ref);
-                                            notebook.set_current_page(Some(idx as u32));
-                                            sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                            focus_current_terminal(&notebook, &tabs);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::Tab(n) => {
-                            let idx = (*n as u32).saturating_sub(1);
-                            if idx < notebook.n_pages() {
-                                notebook.set_current_page(Some(idx));
-                                sync_tab_bar_active(&tab_bar, &tabs, &notebook);
-                                focus_current_terminal(&notebook, &tabs);
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::Copy => {
-                            // Copy selection to clipboard
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    tab.terminal.copy_selection();
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::Paste => {
-                            // Get clipboard and paste to current terminal
-                            if let Some(display) = gdk::Display::default() {
-                                let clipboard = display.clipboard();
-                                let tabs_paste = Rc::clone(&tabs);
-                                let notebook_paste = notebook.clone();
-                                clipboard.read_text_async(
-                                    None::<&gio::Cancellable>,
-                                    move |result| {
-                                        if let Ok(Some(text)) = result {
-                                            // Find current terminal and write
-                                            if let Some(page_idx) = notebook_paste.current_page() {
-                                                let tabs = tabs_paste.borrow();
-                                                if let Some(tab) = tabs.get(page_idx as usize) {
-                                                    tab.terminal.write_str(&text);
-                                                }
-                                            }
-                                        }
-                                    },
-                                );
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::ZoomIn => {
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    tab.terminal.zoom_in();
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::ZoomOut => {
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    tab.terminal.zoom_out();
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::ZoomReset => {
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    tab.terminal.zoom_reset();
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::ScrollUp
-                        | Action::ScrollDown
-                        | Action::ScrollPageUp
-                        | Action::ScrollPageDown
-                        | Action::ScrollToTop
-                        | Action::ScrollToBottom
-                        | Action::PromptPrevious
-                        | Action::PromptNext => {
-                            if let Some(page_idx) = notebook.current_page() {
-                                let tabs_ref = tabs.borrow();
-                                if let Some(tab) = tabs_ref.get(page_idx as usize) {
-                                    match action {
-                                        Action::ScrollUp => tab.terminal.scroll_viewport_up(1),
-                                        Action::ScrollDown => tab.terminal.scroll_viewport_down(1),
-                                        Action::ScrollPageUp => {
-                                            tab.terminal.scroll_viewport_page(true)
-                                        }
-                                        Action::ScrollPageDown => {
-                                            tab.terminal.scroll_viewport_page(false)
-                                        }
-                                        Action::ScrollToTop => {
-                                            tab.terminal.scroll_viewport_edge(true)
-                                        }
-                                        Action::ScrollToBottom => {
-                                            tab.terminal.scroll_viewport_edge(false)
-                                        }
-                                        Action::PromptPrevious => {
-                                            tab.terminal.scroll_to_shell_prompt(true)
-                                        }
-                                        Action::PromptNext => {
-                                            tab.terminal.scroll_to_shell_prompt(false)
-                                        }
-                                        _ => unreachable!(),
-                                    }
-                                }
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        Action::NewWindow => {
-                            gtk4::prelude::ActionGroupExt::activate_action(
-                                &window,
-                                "new-window",
-                                None,
-                            );
-                            return glib::Propagation::Stop;
-                        }
-                        Action::CloseWindow => {
-                            window.close();
-                            return glib::Propagation::Stop;
-                        }
-                        Action::QuickOpenTemplate => {
-                            // Activate the quick-open action
-                            gtk4::prelude::ActionGroupExt::activate_action(
-                                &window,
-                                "quick-open",
-                                None,
-                            );
-                            return glib::Propagation::Stop;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Pass to terminal
-            glib::Propagation::Proceed
+            activate_shared_action(&window, &action);
+            glib::Propagation::Stop
         });
 
         self.window.add_controller(key_controller);
@@ -4775,6 +4787,78 @@ mod tests {
         assert_eq!(
             keyval_to_keycode(gdk::Key::underscore),
             Some(KeyCode::Minus)
+        );
+    }
+
+    #[test]
+    fn formerly_missing_shortcut_actions_map_to_native_gtk_actions() {
+        for (action, name) in [
+            (Action::SelectAll, "select-all"),
+            (Action::ToggleFullscreen, "toggle-fullscreen"),
+            (Action::OpenPreferences, "preferences"),
+            (Action::FindText, "find"),
+            (Action::ResetTerminal, "reset"),
+        ] {
+            assert_eq!(
+                gtk_action_activation(&action),
+                GtkActionActivation::simple(name)
+            );
+        }
+    }
+
+    #[test]
+    fn parameterized_actions_preserve_their_native_parameters() {
+        assert_eq!(
+            gtk_action_activation(&Action::Tab(7)),
+            GtkActionActivation::with_string("select-tab-index", "7")
+        );
+        assert_eq!(
+            gtk_action_activation(&Action::SplitPane(SplitDirection::Horizontal)),
+            GtkActionActivation::simple("split-pane-horizontal")
+        );
+        assert_eq!(
+            gtk_action_activation(&Action::FocusPane(PaneDirection::Down)),
+            GtkActionActivation::simple("focus-pane-down")
+        );
+    }
+
+    #[test]
+    fn managed_policy_blocks_secondary_session_and_configuration_actions() {
+        for action in [
+            Action::NewTab,
+            Action::SplitPane(SplitDirection::Vertical),
+            Action::ClosePane,
+            Action::FocusPane(PaneDirection::Left),
+            Action::ResizePane(PaneDirection::Right),
+            Action::TogglePaneZoom,
+            Action::NewWindow,
+            Action::OpenPreferences,
+            Action::QuickOpenTemplate,
+        ] {
+            assert!(is_managed_restricted_action(&action), "{action:?}");
+        }
+
+        for action in [
+            Action::CloseTab,
+            Action::CloseWindow,
+            Action::Copy,
+            Action::SelectAll,
+            Action::ToggleFullscreen,
+            Action::FindText,
+            Action::ResetTerminal,
+        ] {
+            assert!(!is_managed_restricted_action(&action), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn gtk_provides_the_conventional_fullscreen_shortcut() {
+        let shortcuts = shortcut_manager(&Config::default());
+        assert_eq!(
+            shortcuts
+                .match_event(KeyCode::F11, Modifiers::empty())
+                .cloned(),
+            Some(Action::ToggleFullscreen)
         );
     }
 }
