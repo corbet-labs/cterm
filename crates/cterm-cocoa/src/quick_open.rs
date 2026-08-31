@@ -205,14 +205,12 @@ impl QuickOpenOverlay {
         // Set up appearance
         this.setWantsLayer(true);
         if let Some(layer) = this.layer() {
-            unsafe {
-                // Dark semi-transparent background
-                let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.12, 0.12, 0.95);
-                let cg_color: *mut std::ffi::c_void = msg_send![&*color, CGColor];
-                let _: () = msg_send![&*layer, setBackgroundColor: cg_color];
-                // Rounded corners
-                let _: () = msg_send![&*layer, setCornerRadius: 8.0f64];
-            }
+            // Dark semi-transparent background. Keep the CoreGraphics type
+            // intact so objc2 can validate the Objective-C ABI encoding.
+            let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.12, 0.12, 0.95);
+            let cg_color = color.CGColor();
+            layer.setBackgroundColor(Some(&cg_color));
+            layer.setCornerRadius(8.0);
         }
 
         // Create UI elements
