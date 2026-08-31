@@ -533,6 +533,9 @@ mod tests {
 
     use super::*;
 
+    #[cfg(windows)]
+    static WINDOWS_HOST_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     const MANIFEST: &str = r#"manifest_version = 1
 id = "org.example.broker"
 name = "Broker fixture"
@@ -814,6 +817,8 @@ allow = ["cterm:new-tab"]
 
     #[tokio::test]
     async fn malformed_host_response_is_rejected() {
+        #[cfg(windows)]
+        let _host_test_guard = WINDOWS_HOST_TEST_LOCK.lock().await;
         let fixture = fixture();
         #[cfg(unix)]
         let host = responding_host("printf malformed");
@@ -845,6 +850,8 @@ allow = ["cterm:new-tab"]
 
     #[tokio::test]
     async fn valid_response_round_trips_through_the_sibling_protocol() {
+        #[cfg(windows)]
+        let _host_test_guard = WINDOWS_HOST_TEST_LOCK.lock().await;
         let fixture = fixture();
         let host = response_host(&response("cterm:new-tab"));
         let broker = PluginBroker::for_test(
@@ -868,6 +875,8 @@ allow = ["cterm:new-tab"]
 
     #[tokio::test]
     async fn oversized_host_stdout_is_rejected_and_reaped() {
+        #[cfg(windows)]
+        let _host_test_guard = WINDOWS_HOST_TEST_LOCK.lock().await;
         let fixture = fixture();
         #[cfg(unix)]
         let host = responding_host(format!(
@@ -955,6 +964,7 @@ allow = ["cterm:new-tab"]
     #[cfg(windows)]
     #[tokio::test]
     async fn timeout_terminates_the_windows_job_after_leader_exit() {
+        let _host_test_guard = WINDOWS_HOST_TEST_LOCK.lock().await;
         let fixture = fixture();
         let host = responding_host(
             "$null=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','while ($true) {}' -PassThru; exit 0",
