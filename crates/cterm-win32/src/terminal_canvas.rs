@@ -43,6 +43,12 @@ pub struct CellDimensions {
     pub baseline: f32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GridPass {
+    Background,
+    Foreground,
+}
+
 impl Default for CellDimensions {
     fn default() -> Self {
         Self {
@@ -380,8 +386,11 @@ impl TerminalRenderer {
             base.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
         let draw_result = (|| {
-            self.draw_grid(screen, blink_phase)?;
-            self.draw_images(screen)?;
+            self.draw_images(screen, cterm_core::ImageLayer::BehindCellBackground)?;
+            self.draw_grid(screen, blink_phase, GridPass::Background)?;
+            self.draw_images(screen, cterm_core::ImageLayer::BehindText)?;
+            self.draw_grid(screen, blink_phase, GridPass::Foreground)?;
+            self.draw_images(screen, cterm_core::ImageLayer::AboveText)?;
             if active {
                 self.draw_cursor(screen, blink_phase)?;
             }
@@ -444,7 +453,11 @@ impl TerminalRenderer {
     }
 
     /// Draw decoded SIXEL and other inline images through Direct2D.
-    fn draw_images(&self, screen: &Screen) -> windows::core::Result<()> {
+    fn draw_images(
+        &self,
+        screen: &Screen,
+        layer: cterm_core::ImageLayer,
+    ) -> windows::core::Result<()> {
         let rt = self.render_target.clone().unwrap();
         let base: ID2D1RenderTarget = rt.cast()?;
         let bitmap_properties = D2D1_BITMAP_PROPERTIES {
@@ -456,7 +469,7 @@ impl TerminalRenderer {
             dpiY: 96.0,
         };
 
-        for image in screen.visible_images() {
+        for image in screen.visible_images_in_layer(layer) {
             let Some(visible_row) = screen.image_visible_row(image) else {
                 continue;
             };
@@ -513,7 +526,12 @@ impl TerminalRenderer {
     }
 
     /// Draw the terminal grid
-    fn draw_grid(&mut self, screen: &Screen, blink_phase: BlinkPhase) -> windows::core::Result<()> {
+    fn draw_grid(
+        &mut self,
+        screen: &Screen,
+        blink_phase: BlinkPhase,
+        pass: GridPass,
+    ) -> windows::core::Result<()> {
         let grid = screen.grid();
         let rows = grid.height();
         let cols = grid.width();
@@ -526,7 +544,7 @@ impl TerminalRenderer {
                     if cell.is_wide_spacer() {
                         continue;
                     }
-                    self.draw_cell(row, col, absolute_line, cell, screen, blink_phase)?;
+                    self.draw_cell(row, col, absolute_line, cell, screen, blink_phase, pass)?;
                 }
             }
         }
@@ -543,6 +561,7 @@ impl TerminalRenderer {
         cell: &Cell,
         screen: &Screen,
         blink_phase: BlinkPhase,
+        pass: GridPass,
     ) -> windows::core::Result<()> {
         let x = self.origin_x + col as f32 * self.cell_dims.width;
         let y = self.origin_y + row as f32 * self.cell_dims.height;
@@ -564,7 +583,7 @@ impl TerminalRenderer {
         } else {
             palette.background
         };
-        let bg_brush = if bg != canvas_background || is_selected {
+        let bg_brush = if pass == GridPass::Background && (bg != canvas_background || is_selected) {
             Some(self.get_brush(bg)?)
         } else {
             None
@@ -572,7 +591,8 @@ impl TerminalRenderer {
 
         let text = cell.text();
         let has_hyperlink = cell.hyperlink.is_some();
-        let needs_fg = foreground_visible
+        let needs_fg = pass == GridPass::Foreground
+            && foreground_visible
             && (text != " " && text != "\0"
                 || attrs.has_underline()
                 || has_hyperlink
@@ -583,7 +603,10 @@ impl TerminalRenderer {
             None
         };
 
-        let underline_brush = if foreground_visible && (attrs.has_underline() || has_hyperlink) {
+        let underline_brush = if pass == GridPass::Foreground
+            && foreground_visible
+            && (attrs.has_underline() || has_hyperlink)
+        {
             let color = if has_hyperlink {
                 Rgb::new(100, 149, 237)
             } else if let Some(color) = cell.underline_color {
@@ -612,7 +635,12 @@ impl TerminalRenderer {
         }
 
         // Draw character
-        if foreground_visible && text != " " && text != "\0" && !attrs.contains(CellAttrs::HIDDEN) {
+        if pass == GridPass::Foreground
+            && foreground_visible
+            && text != " "
+            && text != "\0"
+            && !attrs.contains(CellAttrs::HIDDEN)
+        {
             let text_format = match (
                 attrs.contains(CellAttrs::BOLD),
                 attrs.contains(CellAttrs::ITALIC),
@@ -647,7 +675,7 @@ impl TerminalRenderer {
 
         // Draw underline (also for hyperlinks)
         let visible = foreground_visible && !attrs.contains(CellAttrs::HIDDEN);
-        if visible && (attrs.has_underline() || has_hyperlink) {
+        if pass == GridPass::Foreground && visible && (attrs.has_underline() || has_hyperlink) {
             let underline_y = y + self.cell_dims.baseline + 2.0;
             self.draw_underline_pattern(
                 &base,
@@ -660,7 +688,7 @@ impl TerminalRenderer {
         }
 
         // Draw strikethrough
-        if visible && attrs.contains(CellAttrs::STRIKETHROUGH) {
+        if pass == GridPass::Foreground && visible && attrs.contains(CellAttrs::STRIKETHROUGH) {
             let strike_y = y + self.cell_dims.height / 2.0;
             unsafe {
                 base.DrawLine(
@@ -676,7 +704,7 @@ impl TerminalRenderer {
             };
         }
 
-        if visible && attrs.contains(CellAttrs::OVERLINE) {
+        if pass == GridPass::Foreground && visible && attrs.contains(CellAttrs::OVERLINE) {
             unsafe {
                 base.DrawLine(
                     D2D_POINT_2F { x, y: y + 1.0 },

@@ -624,6 +624,43 @@ pub struct TerminalImage {
     pub pixel_width: usize,
     /// Pixel height
     pub pixel_height: usize,
+    /// Kitty graphics z-index. Negative values are rendered behind text.
+    pub z_index: i32,
+    /// Protocol-level image ID used to order equal-z Kitty placements.
+    pub protocol_image_id: u32,
+}
+
+/// Compositing phase for an inline terminal image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageLayer {
+    /// Below non-default cell backgrounds and text.
+    BehindCellBackground,
+    /// Above cell backgrounds but below glyphs and decorations.
+    BehindText,
+    /// Above the text grid.
+    AboveText,
+}
+
+impl TerminalImage {
+    /// Resolve Kitty's signed z-index into a renderer-independent phase.
+    pub fn layer(&self) -> ImageLayer {
+        if self.z_index < i32::MIN / 2 {
+            ImageLayer::BehindCellBackground
+        } else if self.z_index < 0 {
+            ImageLayer::BehindText
+        } else {
+            ImageLayer::AboveText
+        }
+    }
+
+    fn paint_order(&self) -> (i32, u64, u64) {
+        let protocol_order = if self.protocol_image_id == 0 {
+            self.id
+        } else {
+            u64::from(self.protocol_image_id)
+        };
+        (self.z_index, protocol_order, self.id)
+    }
 }
 
 /// Shared decoded pixels passed from a protocol adapter into screen storage.
@@ -631,6 +668,9 @@ pub(crate) struct DecodedRgbaImage {
     pub data: Arc<Vec<u8>>,
     pub width: usize,
     pub height: usize,
+    pub z_index: i32,
+    pub protocol_image_id: u32,
+    pub clear_cells: bool,
 }
 
 /// Sentinel column value meaning "end of row" for line selection mode.
@@ -2714,6 +2754,9 @@ impl Screen {
                 data: Arc::new(sixel_image.data),
                 width: sixel_image.width,
                 height: sixel_image.height,
+                z_index: 0,
+                protocol_image_id: 0,
+                clear_cells: true,
             },
         )
     }
@@ -2742,11 +2785,15 @@ impl Screen {
             data: pixels.data,
             pixel_width: pixels.width,
             pixel_height: pixels.height,
+            z_index: pixels.z_index,
+            protocol_image_id: pixels.protocol_image_id,
         };
 
-        // Clear grid cells underneath the image (xterm behavior)
-        // This ensures text doesn't show through the image
-        self.clear_cells_for_image(col, row, cell_cols, cell_rows);
+        if pixels.clear_cells {
+            // SIXEL follows xterm's replacement behavior. Overlay protocols
+            // such as Kitty preserve the grid for negative-z composition.
+            self.clear_cells_for_image(col, row, cell_cols, cell_rows);
+        }
 
         self.images.insert(id, image);
         self.dirty = true;
@@ -2802,7 +2849,26 @@ impl Screen {
         // HashMap iteration order is deliberately unspecified. Images are
         // painted from oldest to newest so overlapping graphics are stable and
         // a later image consistently appears on top on every backend.
-        images.sort_unstable_by_key(|image| image.id);
+        images.sort_unstable_by_key(|image| image.paint_order());
+        images
+    }
+
+    /// Get visible images belonging to one compositing phase.
+    pub fn visible_images_in_layer(&self, layer: ImageLayer) -> Vec<&TerminalImage> {
+        let scrollback_len = self.scrollback.len();
+        let first_visible_line = scrollback_len.saturating_sub(self.scroll_offset);
+        let last_visible_line = first_visible_line + self.height();
+        let mut images: Vec<_> = self
+            .images
+            .values()
+            .filter(|image| {
+                let image_bottom = image.line + image.cell_height.max(1);
+                image.layer() == layer
+                    && image_bottom > first_visible_line
+                    && image.line < last_visible_line
+            })
+            .collect();
+        images.sort_unstable_by_key(|image| image.paint_order());
         images
     }
 
@@ -2825,7 +2891,7 @@ impl Screen {
     /// Get all stored images in deterministic paint order.
     pub fn images(&self) -> Vec<&TerminalImage> {
         let mut images: Vec<_> = self.images.values().collect();
-        images.sort_unstable_by_key(|image| image.id);
+        images.sort_unstable_by_key(|image| image.paint_order());
         images
     }
 
@@ -3696,6 +3762,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_images_follow_kitty_z_and_image_id_paint_order() {
+        let image = |id, z_index, protocol_image_id| TerminalImage {
+            id,
+            col: 0,
+            line: 0,
+            cell_width: 1,
+            cell_height: 1,
+            data: Arc::new(vec![255, 0, 0, 255]),
+            pixel_width: 1,
+            pixel_height: 1,
+            z_index,
+            protocol_image_id,
+        };
+        let mut screen = Screen::new(10, 3, ScreenConfig::default());
+        screen.replace_images([
+            image(1, 0, 20),
+            image(2, -1, 30),
+            image(3, 0, 10),
+            image(4, i32::MIN / 2 - 1, 40),
+        ]);
+
+        let ids: Vec<_> = screen.images().iter().map(|image| image.id).collect();
+        assert_eq!(ids, vec![4, 2, 3, 1]);
+        assert_eq!(screen.images()[0].layer(), ImageLayer::BehindCellBackground);
+        assert_eq!(screen.images()[1].layer(), ImageLayer::BehindText);
+        assert_eq!(screen.images()[2].layer(), ImageLayer::AboveText);
+    }
+
+    #[test]
     fn partially_scrolled_image_remains_visible() {
         let mut screen = Screen::new(10, 2, ScreenConfig::default());
         screen.add_image_with_size(
@@ -3729,6 +3824,8 @@ mod tests {
             data: Arc::new(vec![0, 255, 0, 255]),
             pixel_width: 1,
             pixel_height: 1,
+            z_index: 0,
+            protocol_image_id: 0,
         }]);
 
         screen.add_image_with_size(

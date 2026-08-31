@@ -201,6 +201,8 @@ pub fn terminal_image_to_proto(image: &TerminalImage) -> proto::TerminalImage {
         rgba: image.data.as_ref().clone(),
         pixel_width: image.pixel_width as u32,
         pixel_height: image.pixel_height as u32,
+        z_index: image.z_index,
+        protocol_image_id: image.protocol_image_id,
     }
 }
 
@@ -231,6 +233,8 @@ pub fn proto_to_terminal_image(image: &proto::TerminalImage) -> Option<TerminalI
         data: Arc::new(image.rgba.clone()),
         pixel_width,
         pixel_height,
+        z_index: image.z_index,
+        protocol_image_id: image.protocol_image_id,
     })
 }
 
@@ -796,8 +800,29 @@ mod tests {
             rgba: vec![1, 2, 3],
             pixel_width: 1,
             pixel_height: 1,
+            z_index: 0,
+            protocol_image_id: 0,
         };
 
         assert!(proto_to_terminal_image(&image).is_none());
+    }
+
+    #[test]
+    fn terminal_image_wire_roundtrip_preserves_kitty_layer_metadata() {
+        let image = TerminalImage {
+            id: 9,
+            col: 2,
+            line: 3,
+            cell_width: 4,
+            cell_height: 5,
+            data: Arc::new(vec![1, 2, 3, 4]),
+            pixel_width: 1,
+            pixel_height: 1,
+            z_index: -7,
+            protocol_image_id: 42,
+        };
+
+        let encoded = terminal_image_to_proto(&image);
+        assert_eq!(proto_to_terminal_image(&encoded), Some(image));
     }
 }

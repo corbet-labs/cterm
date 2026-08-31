@@ -939,6 +939,9 @@ impl KittyGraphics {
                 data: placement.pixels,
                 width: placement.pixel_width,
                 height: placement.pixel_height,
+                z_index: command.z_index,
+                protocol_image_id: image_id,
+                clear_cells: false,
             },
         );
         self.placement_bytes = self.placement_bytes.saturating_add(allocated_bytes);
@@ -1715,6 +1718,26 @@ mod tests {
         feed(&mut graphics, &mut screen, b"\x1b_Ga=d,d=x,x=5\x1b\\");
         assert!(screen.images().is_empty());
         assert!(graphics.images.contains_key(&60));
+    }
+
+    #[test]
+    fn placement_preserves_text_and_exposes_renderer_layer_metadata() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        screen.put_char('X');
+        screen.cursor.col = 0;
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=70,z=-1,C=1", &[1, 2, 3, 4]),
+        );
+
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "X");
+        let image = screen.images()[0];
+        assert_eq!(image.z_index, -1);
+        assert_eq!(image.protocol_image_id, 70);
+        assert_eq!(image.layer(), crate::ImageLayer::BehindText);
     }
 
     #[test]

@@ -470,9 +470,12 @@ pipeline used by Sixel and iTerm2 images. The first implementation tranche
 supports direct, regular-file, and secure temporary-file transfers; raw RGB,
 RGBA, and PNG images; zlib compression; chunked uploads; support queries;
 transmit/display/place/delete actions; cropping, cell scaling, pixel offsets,
-quiet replies, storage quotas, and cursor suppression. Animation, shared-memory
-transport, Unicode placeholders, and exact z-layer compositing remain staged
-follow-up work rather than silently advertised capabilities.
+quiet replies, storage quotas, cursor suppression, and the complete placement
+delete selectors. Signed z-ordering is shared by Cocoa, GTK, and Direct2D,
+including Kitty's below-background and below-text layers; image identifiers and
+z-indices also survive daemon snapshots. Animation, shared-memory transport,
+and Unicode placeholders remain staged follow-up work rather than silently
+advertised capabilities.
 
 Test with:
 ```bash

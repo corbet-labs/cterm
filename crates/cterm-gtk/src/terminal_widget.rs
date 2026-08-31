@@ -2269,136 +2269,169 @@ fn draw_terminal(
     let rows = grid.height();
     let cols = grid.width();
 
-    for row_idx in 0..rows {
-        let y = row_idx as f64 * cell_height;
-        let absolute_line = screen.visible_row_to_absolute_line(row_idx);
+    draw_terminal_images(
+        cr,
+        screen,
+        cell_width,
+        cell_height,
+        cterm_core::ImageLayer::BehindCellBackground,
+    );
 
-        for col_idx in 0..cols {
-            let cell = if let Some(c) = screen.get_cell_with_scrollback(absolute_line, col_idx) {
-                c
-            } else {
-                continue;
-            };
-            let x = col_idx as f64 * cell_width;
-            let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
+    for render_foreground in [false, true] {
+        if render_foreground {
+            draw_terminal_images(
+                cr,
+                screen,
+                cell_width,
+                cell_height,
+                cterm_core::ImageLayer::BehindText,
+            );
+        }
 
-            // Skip wide char spacers
-            if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
-                continue;
-            }
+        for row_idx in 0..rows {
+            let y = row_idx as f64 * cell_height;
+            let absolute_line = screen.visible_row_to_absolute_line(row_idx);
 
-            // Check if this cell is selected
-            let is_selected = screen.is_selected(absolute_line, col_idx);
-
-            // Determine if cell has INVERSE attribute (XOR with selection)
-            let is_inverted =
-                cell.attrs.contains(CellAttrs::INVERSE) ^ is_selected ^ screen.modes.reverse_video;
-            let char_width = if cell.attrs.contains(CellAttrs::WIDE) {
-                cell_width * 2.0
-            } else {
-                cell_width
-            };
-
-            let fg_color = if is_inverted {
-                if cell.bg == Color::Default {
-                    *normal_background
+            for col_idx in 0..cols {
+                let cell = if let Some(c) = screen.get_cell_with_scrollback(absolute_line, col_idx)
+                {
+                    c
                 } else {
-                    screen.resolve_color(cell.bg, palette)
+                    continue;
+                };
+                let x = col_idx as f64 * cell_width;
+                let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
+
+                // Skip wide char spacers
+                if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
+                    continue;
                 }
-            } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
-                Rgb::new(100, 149, 237)
-            } else if cell.fg == Color::Default {
-                palette.foreground
-            } else {
-                screen.resolve_color(cell.fg, palette)
-            };
-            let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
-                Rgb::new(fg_color.r / 2, fg_color.g / 2, fg_color.b / 2)
-            } else {
-                fg_color
-            };
 
-            // Draw background (always draw for selected cells to show highlight)
-            let needs_bg = cell.bg != Color::Default
-                || is_inverted
-                || is_selected
-                || screen.modes.reverse_video;
+                // Check if this cell is selected
+                let is_selected = screen.is_selected(absolute_line, col_idx);
 
-            if needs_bg {
-                let bg_color = if is_inverted {
-                    // Inverted: use foreground color as background
-                    if cell.fg == Color::Default {
-                        palette.foreground
-                    } else {
-                        screen.resolve_color(cell.fg, palette)
-                    }
-                } else if cell.bg == Color::Default {
-                    *normal_background
+                // Determine if cell has INVERSE attribute (XOR with selection)
+                let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
+                    ^ is_selected
+                    ^ screen.modes.reverse_video;
+                let char_width = if cell.attrs.contains(CellAttrs::WIDE) {
+                    cell_width * 2.0
                 } else {
-                    screen.resolve_color(cell.bg, palette)
+                    cell_width
                 };
 
-                let (r, g, b) = bg_color.to_f64();
-                cr.set_source_rgb(r, g, b);
-
-                cr.rectangle(x, y, char_width, cell_height);
-                cr.fill().ok();
-            }
-
-            // Draw character
-            if foreground_visible && cell.text() != " " && !cell.attrs.contains(CellAttrs::HIDDEN) {
-                let sprite_width = cell_width.round().max(1.0) as u32;
-                let sprite_height = cell_height.round().max(1.0) as u32;
-                if let Some(sprite) = cell
-                    .single_char()
-                    .and_then(|c| sprite_cache.get(c as u32, sprite_width, sprite_height))
-                {
-                    draw_sprite(cr, sprite, x, y, cell_width, cell_height, &fg_color);
+                let fg_color = if is_inverted {
+                    if cell.bg == Color::Default {
+                        *normal_background
+                    } else {
+                        screen.resolve_color(cell.bg, palette)
+                    }
+                } else if cell.hyperlink.is_some() && cell.fg == Color::Default {
+                    Rgb::new(100, 149, 237)
+                } else if cell.fg == Color::Default {
+                    palette.foreground
                 } else {
-                    let (r, g, b) = fg_color.to_f64();
+                    screen.resolve_color(cell.fg, palette)
+                };
+                let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
+                    Rgb::new(fg_color.r / 2, fg_color.g / 2, fg_color.b / 2)
+                } else {
+                    fg_color
+                };
+
+                // Draw background (always draw for selected cells to show highlight)
+                let needs_bg = cell.bg != Color::Default
+                    || is_inverted
+                    || is_selected
+                    || screen.modes.reverse_video;
+
+                if !render_foreground && needs_bg {
+                    let bg_color = if is_inverted {
+                        // Inverted: use foreground color as background
+                        if cell.fg == Color::Default {
+                            palette.foreground
+                        } else {
+                            screen.resolve_color(cell.fg, palette)
+                        }
+                    } else if cell.bg == Color::Default {
+                        *normal_background
+                    } else {
+                        screen.resolve_color(cell.bg, palette)
+                    };
+
+                    let (r, g, b) = bg_color.to_f64();
                     cr.set_source_rgb(r, g, b);
 
-                    // Apply text attributes to font
-                    let attrs = pango::AttrList::new();
-
-                    if cell.attrs.contains(CellAttrs::BOLD) {
-                        let attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                        attrs.insert(attr);
-                    }
-
-                    if cell.attrs.contains(CellAttrs::ITALIC) {
-                        let attr = pango::AttrInt::new_style(pango::Style::Italic);
-                        attrs.insert(attr);
-                    }
-
-                    layout.set_attributes(Some(&attrs));
-                    layout.set_text(cell.text());
-
-                    cr.move_to(x, y);
-                    pangocairo::functions::show_layout(cr, &layout);
-
-                    // Reset attributes
-                    layout.set_attributes(None::<&pango::AttrList>);
+                    cr.rectangle(x, y, char_width, cell_height);
+                    cr.fill().ok();
                 }
-            }
 
-            if foreground_visible && !cell.attrs.contains(CellAttrs::HIDDEN) {
-                draw_cell_decorations(
-                    cr,
-                    cell,
-                    (x, y),
-                    (char_width, cell_height),
-                    &fg_color,
-                    palette,
-                    screen,
-                );
+                // Draw character
+                if render_foreground
+                    && foreground_visible
+                    && cell.text() != " "
+                    && !cell.attrs.contains(CellAttrs::HIDDEN)
+                {
+                    let sprite_width = cell_width.round().max(1.0) as u32;
+                    let sprite_height = cell_height.round().max(1.0) as u32;
+                    if let Some(sprite) = cell
+                        .single_char()
+                        .and_then(|c| sprite_cache.get(c as u32, sprite_width, sprite_height))
+                    {
+                        draw_sprite(cr, sprite, x, y, cell_width, cell_height, &fg_color);
+                    } else {
+                        let (r, g, b) = fg_color.to_f64();
+                        cr.set_source_rgb(r, g, b);
+
+                        // Apply text attributes to font
+                        let attrs = pango::AttrList::new();
+
+                        if cell.attrs.contains(CellAttrs::BOLD) {
+                            let attr = pango::AttrInt::new_weight(pango::Weight::Bold);
+                            attrs.insert(attr);
+                        }
+
+                        if cell.attrs.contains(CellAttrs::ITALIC) {
+                            let attr = pango::AttrInt::new_style(pango::Style::Italic);
+                            attrs.insert(attr);
+                        }
+
+                        layout.set_attributes(Some(&attrs));
+                        layout.set_text(cell.text());
+
+                        cr.move_to(x, y);
+                        pangocairo::functions::show_layout(cr, &layout);
+
+                        // Reset attributes
+                        layout.set_attributes(None::<&pango::AttrList>);
+                    }
+                }
+
+                if render_foreground
+                    && foreground_visible
+                    && !cell.attrs.contains(CellAttrs::HIDDEN)
+                {
+                    draw_cell_decorations(
+                        cr,
+                        cell,
+                        (x, y),
+                        (char_width, cell_height),
+                        &fg_color,
+                        palette,
+                        screen,
+                    );
+                }
             }
         }
     }
 
-    // Images replace the cells beneath them and must therefore be composited
-    // after the text grid but before the cursor and overlays.
-    draw_terminal_images(cr, screen, cell_width, cell_height);
+    draw_terminal_images(
+        cr,
+        screen,
+        cell_width,
+        cell_height,
+        cterm_core::ImageLayer::AboveText,
+    );
 
     // Draw cursor
     if cursor_visible(screen, blink_phase) {
@@ -2660,8 +2693,9 @@ fn draw_terminal_images(
     screen: &cterm_core::Screen,
     cell_width: f64,
     cell_height: f64,
+    layer: cterm_core::ImageLayer,
 ) {
-    for image in screen.visible_images() {
+    for image in screen.visible_images_in_layer(layer) {
         let Some(visible_row) = screen.image_visible_row(image) else {
             continue;
         };
