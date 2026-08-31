@@ -84,7 +84,7 @@ async fn detach_snapshot_handles(sessions: &[cterm_app::daemon_reconnect::Reconn
 
 /// Application state stored in the delegate
 pub struct AppDelegateIvars {
-    config: Config,
+    config: std::cell::RefCell<Config>,
     theme: Theme,
     windows: std::cell::RefCell<Vec<Retained<CtermWindow>>>,
     /// Manages cached SSH connections to remote ctermd instances
@@ -118,7 +118,7 @@ define_class!(
                     "Restoring {} window(s) from upgrade state",
                     upgrade_state.windows.len()
                 );
-                let config = self.ivars().config.clone();
+                let config = self.ivars().config.borrow().clone();
                 let theme = self.ivars().theme.clone();
 
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -198,7 +198,7 @@ define_class!(
             // Try to reconnect to existing daemon sessions. Explicit child
             // launches must never be replaced by an old session.
             if !get_args().requests_fresh_session() {
-                let config = self.ivars().config.clone();
+                let config = self.ivars().config.borrow().clone();
                 let theme = self.ivars().theme.clone();
 
                 // Check if daemon has existing sessions (non-blocking, don't auto-start)
@@ -263,13 +263,14 @@ define_class!(
             // Normal startup - create the main window
             log::debug!("Creating main window...");
             let args = get_args();
-            let opts = args.initial_session_options(&self.ivars().config, 80, 24);
+            let config = self.ivars().config.borrow().clone();
+            let opts = args.initial_session_options(&config, 80, 24);
             let window = CtermWindow::new_cli_daemon(
                 mtm,
-                &self.ivars().config,
+                &config,
                 &self.ivars().theme,
                 opts,
-                args.initial_title(&self.ivars().config),
+                args.initial_title(&config),
                 args.title.is_some(),
             );
             log::debug!("Main window created");
@@ -312,7 +313,13 @@ define_class!(
             }
 
             // Check if config says to confirm close with running processes
-            if !self.ivars().config.general.confirm_close_with_running {
+            if !self
+                .ivars()
+                .config
+                .borrow()
+                .general
+                .confirm_close_with_running
+            {
                 return NSApplicationTerminateReply::TerminateNow;
             }
 
@@ -381,10 +388,13 @@ define_class!(
                 return;
             }
             let mtm = MainThreadMarker::from(self);
-            let config = self.ivars().config.clone();
-            crate::preferences::show_preferences(mtm, &config, |_new_config| {
-                // Config saved - could reload theme or apply changes here
-                log::info!("Preferences saved");
+            let config = self.ivars().config.borrow().clone();
+            let delegate = unsafe {
+                Retained::retain(self as *const _ as *mut AppDelegate)
+                    .expect("the live application delegate can be retained")
+            };
+            crate::preferences::show_preferences(mtm, &config, move |new_config| {
+                delegate.apply_preferences_shortcuts(new_config);
             });
         }
 
@@ -398,6 +408,7 @@ define_class!(
             let remote_names: Vec<String> = self
                 .ivars()
                 .config
+                .borrow()
                 .remotes
                 .iter()
                 .map(|r| r.name.clone())
@@ -530,7 +541,8 @@ define_class!(
             use objc2_app_kit::NSWindowTabbingMode;
 
             let mtm = MainThreadMarker::from(self);
-            let window = CtermWindow::new(mtm, &self.ivars().config, &self.ivars().theme);
+            let config = self.ivars().config.borrow().clone();
+            let window = CtermWindow::new(mtm, &config, &self.ivars().theme);
 
             // Temporarily disable tabbing to force a new window instead of a tab
             window.setTabbingMode(NSWindowTabbingMode::Disallowed);
@@ -684,7 +696,7 @@ define_class!(
                 return;
             }
             let mtm = MainThreadMarker::from(self);
-            let config = self.ivars().config.clone();
+            let config = self.ivars().config.borrow().clone();
             let theme = self.ivars().theme.clone();
 
             // Run session listing in background
@@ -763,7 +775,7 @@ define_class!(
             }
             let mtm = MainThreadMarker::from(self);
             let remote_manager = self.ivars().remote_manager.clone();
-            let config = self.ivars().config.clone();
+            let config = self.ivars().config.borrow().clone();
             let theme = self.ivars().theme.clone();
 
             // Show a simple input dialog for the SSH host
@@ -935,7 +947,7 @@ define_class!(
                 return;
             }
             let mtm = MainThreadMarker::from(self);
-            let config = self.ivars().config.clone();
+            let config = self.ivars().config.borrow().clone();
             crate::remotes_dialog::show_remotes_dialog(mtm, config);
         }
 
@@ -1119,7 +1131,7 @@ impl AppDelegate {
     pub fn new(mtm: MainThreadMarker, config: Config, theme: Theme) -> Retained<Self> {
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(AppDelegateIvars {
-            config,
+            config: std::cell::RefCell::new(config),
             theme,
             windows: std::cell::RefCell::new(Vec::new()),
             remote_manager: cterm_client::RemoteManager::new(),
@@ -1127,6 +1139,22 @@ impl AppDelegate {
             bell_count: std::cell::Cell::new(0),
         });
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn apply_preferences_shortcuts(&self, config: Config) {
+        let shortcuts = config.shortcuts;
+        self.ivars().config.borrow_mut().shortcuts = shortcuts.clone();
+
+        let windows = self.ivars().windows.borrow().clone();
+        let terminal_count = windows
+            .iter()
+            .map(|window| window.reload_shortcuts(&shortcuts))
+            .sum::<usize>();
+        log::info!(
+            "Preferences saved; refreshed shortcuts for {} window(s) and {} terminal view(s)",
+            windows.len(),
+            terminal_count
+        );
     }
 
     fn reconnect_upgrade_pane(
@@ -1353,7 +1381,7 @@ impl AppDelegate {
             }
         }
 
-        let config = self.ivars().config.clone();
+        let config = self.ivars().config.borrow().clone();
         let theme = self.ivars().theme.clone();
 
         let opts = cterm_client::CreateSessionOpts {

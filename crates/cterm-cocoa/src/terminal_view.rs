@@ -20,13 +20,14 @@ use objc2_foundation::{
 };
 use parking_lot::Mutex;
 
-use cterm_app::config::Config;
+use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::upgrade::PaneLaunchContext;
 use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
 use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyboardEnhancementFlags, Terminal};
 use cterm_ui::theme::Theme;
+use cterm_ui::{Action, KeyCode, Modifiers};
 
 use crate::cg_renderer::CGRenderer;
 use crate::file_transfer::PendingFileManager;
@@ -40,6 +41,19 @@ const MAX_FONT_SIZE: f64 = 72.0;
 
 fn adjusted_font_size(current: f64, delta: f64) -> f64 {
     (current + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+fn replace_shortcut_bindings(shortcuts: &RefCell<ShortcutManager>, config: &ShortcutsConfig) {
+    *shortcuts.borrow_mut() = ShortcutManager::from_config(config);
+}
+
+fn match_configured_action(
+    shortcuts: &RefCell<ShortcutManager>,
+    key: KeyCode,
+    modifiers: Modifiers,
+) -> Option<Action> {
+    // Own the action before dispatch: opening Preferences may replace this manager.
+    shortcuts.borrow().match_event(key, modifiers).cloned()
 }
 
 fn key_event_kind(is_repeat: bool) -> KeyEventKind {
@@ -196,7 +210,7 @@ struct PaneSessionContext {
 /// Terminal view state
 pub struct TerminalViewIvars {
     terminal: Arc<Mutex<Terminal>>,
-    shortcuts: ShortcutManager,
+    shortcuts: RefCell<ShortcutManager>,
     renderer: RefCell<Option<CGRenderer>>,
     cell_width: Cell<f64>,
     cell_height: Cell<f64>,
@@ -1502,9 +1516,11 @@ struct ViewInitOptions {
 impl TerminalView {
     fn dispatch_configured_shortcut(&self, event: &NSEvent) -> bool {
         let Some(action) = keycode::keycode_from_event(event).and_then(|key| {
-            self.ivars()
-                .shortcuts
-                .match_event(key, keycode::modifiers_from_event(event))
+            match_configured_action(
+                &self.ivars().shortcuts,
+                key,
+                keycode::modifiers_from_event(event),
+            )
         }) else {
             return false;
         };
@@ -1523,7 +1539,7 @@ impl TerminalView {
 
         let cterm_window =
             unsafe { &*(&*window as *const objc2_app_kit::NSWindow as *const CtermWindow) };
-        cterm_window.dispatch_action(action);
+        cterm_window.dispatch_action(&action);
         true
     }
 
@@ -1555,7 +1571,7 @@ impl TerminalView {
         let this = mtm.alloc::<Self>();
         let this = this.set_ivars(TerminalViewIvars {
             terminal: terminal.clone(),
-            shortcuts: ShortcutManager::from_config(&config.shortcuts),
+            shortcuts: RefCell::new(ShortcutManager::from_config(&config.shortcuts)),
             renderer: RefCell::new(Some(renderer)),
             cell_width: Cell::new(cell_width),
             cell_height: Cell::new(cell_height),
@@ -2542,6 +2558,10 @@ impl TerminalView {
         )
     }
 
+    pub(crate) fn reload_shortcuts(&self, config: &ShortcutsConfig) {
+        replace_shortcut_bindings(&self.ivars().shortcuts, config);
+    }
+
     pub(crate) fn paste_clipboard(&self) {
         let Some(text) = clipboard::get_text() else {
             return;
@@ -3339,5 +3359,29 @@ mod keyboard_event_tests {
         assert_eq!(adjusted_font_size(12.0, 1.0), 13.0);
         assert_eq!(adjusted_font_size(MIN_FONT_SIZE, -1.0), MIN_FONT_SIZE);
         assert_eq!(adjusted_font_size(MAX_FONT_SIZE, 1.0), MAX_FONT_SIZE);
+    }
+
+    #[test]
+    fn shortcut_bindings_can_be_replaced_without_stale_matches() {
+        let mut config = ShortcutsConfig::default();
+        let shortcuts = RefCell::new(ShortcutManager::from_config(&config));
+        let old_modifiers = Modifiers::CTRL | Modifiers::ALT;
+
+        assert_eq!(
+            match_configured_action(&shortcuts, KeyCode::Left, old_modifiers),
+            Some(Action::FocusPane(cterm_ui::PaneDirection::Left))
+        );
+
+        config.focus_pane_left = "Ctrl+H".to_string();
+        replace_shortcut_bindings(&shortcuts, &config);
+
+        assert_eq!(
+            match_configured_action(&shortcuts, KeyCode::Left, old_modifiers),
+            None
+        );
+        assert_eq!(
+            match_configured_action(&shortcuts, KeyCode::H, Modifiers::CTRL),
+            Some(Action::FocusPane(cterm_ui::PaneDirection::Left))
+        );
     }
 }

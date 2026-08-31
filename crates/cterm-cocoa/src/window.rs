@@ -16,7 +16,7 @@ use objc2_foundation::{
     MainThreadMarker, NSArray, NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
-use cterm_app::config::Config;
+use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_app::upgrade::{PaneLaunchContext, PaneUpgradeState, TabUpgradeState};
 use cterm_ui::{
@@ -62,6 +62,12 @@ fn is_managed_restricted_action(action: &Action) -> bool {
     )
 }
 
+fn config_with_shortcuts(config: &Config, shortcuts: &ShortcutsConfig) -> Config {
+    let mut config = config.clone();
+    config.shortcuts = shortcuts.clone();
+    config
+}
+
 struct DaemonProcessQuery {
     session_id: String,
     daemon_socket: Option<std::path::PathBuf>,
@@ -72,7 +78,8 @@ struct DaemonProcessQuery {
 pub struct CtermWindowIvars {
     config: Config,
     theme: Theme,
-    shortcuts: ShortcutManager,
+    shortcut_config: RefCell<ShortcutsConfig>,
+    shortcuts: RefCell<ShortcutManager>,
     active_terminal: RefCell<Option<Retained<TerminalView>>>,
     panes: RefCell<PaneRegistry<NativePane>>,
     pane_host: RefCell<Option<Retained<PaneHostView>>>,
@@ -347,9 +354,10 @@ define_class!(
             let daemon_socket = active.as_ref().and_then(|t| t.daemon_socket());
             drop(active);
 
+            let config = self.config_with_live_shortcuts();
             let new_window = CtermWindow::new_with_cwd_and_socket(
                 mtm,
-                &self.ivars().config,
+                &config,
                 &self.ivars().theme,
                 cwd,
                 daemon_socket,
@@ -718,7 +726,8 @@ impl CtermWindow {
         let this = this.set_ivars(CtermWindowIvars {
             config: config.clone(),
             theme: theme.clone(),
-            shortcuts: ShortcutManager::from_config(&config.shortcuts),
+            shortcut_config: RefCell::new(config.shortcuts.clone()),
+            shortcuts: RefCell::new(ShortcutManager::from_config(&config.shortcuts)),
             active_terminal: RefCell::new(None),
             panes: RefCell::new(PaneRegistry::default()),
             pane_host: RefCell::new(None),
@@ -1095,7 +1104,7 @@ impl CtermWindow {
         }
         let terminal_frame: NSRect = unsafe { msg_send![&*terminal, frame] };
         let (cell_width, cell_height) = terminal.cell_size();
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         let theme = self.ivars().theme.clone();
         let mut opts = cterm_client::CreateSessionOpts {
             cols: (terminal_frame.size.width / cell_width).floor().max(1.0) as u32,
@@ -1282,7 +1291,7 @@ impl CtermWindow {
         daemon_socket: Option<std::path::PathBuf>,
     ) -> Retained<Self> {
         let this = Self::init_window(mtm, config, theme, "Terminal", None);
-        let config = this.ivars().config.clone();
+        let config = this.config_with_live_shortcuts();
         let opts = cterm_client::CreateSessionOpts {
             cols: 80,
             rows: 24,
@@ -1298,7 +1307,7 @@ impl CtermWindow {
     /// Spawn a daemon session in the background and attach the terminal when ready.
     /// Used for initial window creation where the window must exist immediately.
     fn spawn_initial_daemon_session(&self, cwd: Option<String>) {
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         let opts = cterm_client::CreateSessionOpts {
             cols: 80,
             rows: 24,
@@ -1322,7 +1331,7 @@ impl CtermWindow {
         daemon_socket: Option<std::path::PathBuf>,
         title_locked: bool,
     ) {
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
@@ -1555,8 +1564,8 @@ impl CtermWindow {
     pub fn create_daemon_tab(&self, session: cterm_client::SessionHandle) {
         let mtm = MainThreadMarker::from(self);
 
-        let new_window =
-            CtermWindow::from_daemon(mtm, &self.ivars().config, &self.ivars().theme, session);
+        let config = self.config_with_live_shortcuts();
+        let new_window = CtermWindow::from_daemon(mtm, &config, &self.ivars().theme, session);
 
         // Register with AppDelegate
         let app = NSApplication::sharedApplication(mtm);
@@ -1589,7 +1598,7 @@ impl CtermWindow {
         let daemon_socket = active.as_ref().and_then(|t| t.daemon_socket());
         drop(active);
 
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         let opts = cterm_client::CreateSessionOpts {
             cols: 80,
             rows: 24,
@@ -1617,7 +1626,7 @@ impl CtermWindow {
         remote: Option<(cterm_client::RemoteManager, String, String, bool)>,
         daemon_socket: Option<std::path::PathBuf>,
     ) {
-        let config = self.ivars().config.clone();
+        let config = self.config_with_live_shortcuts();
         ensure_session_pixel_size(&config, &mut opts);
         let theme = self.ivars().theme.clone();
         opts.base_palette = Some(terminal_palette(&theme, background_color.as_deref()));
@@ -1740,6 +1749,22 @@ impl CtermWindow {
             .into_iter()
             .filter_map(|id| panes.get(id).map(|entry| entry.terminal.clone()))
             .collect()
+    }
+
+    /// Replace configured bindings for this window and every pane it owns.
+    pub(crate) fn reload_shortcuts(&self, shortcuts: &ShortcutsConfig) -> usize {
+        *self.ivars().shortcut_config.borrow_mut() = shortcuts.clone();
+        *self.ivars().shortcuts.borrow_mut() = ShortcutManager::from_config(shortcuts);
+
+        let terminals = self.terminal_views();
+        for terminal in &terminals {
+            terminal.reload_shortcuts(shortcuts);
+        }
+        terminals.len()
+    }
+
+    fn config_with_live_shortcuts(&self) -> Config {
+        config_with_shortcuts(&self.ivars().config, &self.ivars().shortcut_config.borrow())
     }
 
     /// Keep daemon sessions alive when this frontend hands them to a new process.
@@ -2047,7 +2072,7 @@ impl CtermWindow {
             }
         }
 
-        let config = &self.ivars().config;
+        let config = self.config_with_live_shortcuts();
         let opts = cterm_client::CreateSessionOpts {
             cols: 80,
             rows: 24,
@@ -2380,6 +2405,19 @@ fn terminal_palette(theme: &Theme, background: Option<&str>) -> cterm_core::Colo
 #[cfg(test)]
 mod action_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn live_shortcuts_are_inherited_by_future_terminal_configs() {
+        let config = Config::default();
+        let original = config.shortcuts.new_tab.clone();
+        let mut shortcuts = ShortcutsConfig::default();
+        shortcuts.new_tab = "Ctrl+Alt+T".to_string();
+
+        let merged = config_with_shortcuts(&config, &shortcuts);
+
+        assert_eq!(merged.shortcuts.new_tab, "Ctrl+Alt+T");
+        assert_eq!(config.shortcuts.new_tab, original);
+    }
 
     #[test]
     fn managed_mode_restricts_secondary_topology_and_configuration_actions() {
