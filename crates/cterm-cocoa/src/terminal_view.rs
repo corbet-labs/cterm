@@ -25,13 +25,17 @@ use cterm_app::config::{Config, ShortcutsConfig};
 use cterm_app::upgrade::PaneLaunchContext;
 use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
-use cterm_core::term::{Key, Modifiers as CoreModifiers, NamedKey, TerminalEvent};
+use cterm_core::term::{Key, Modifiers as CoreModifiers, TerminalEvent};
 use cterm_core::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags, Terminal};
 use cterm_ui::theme::Theme;
 use cterm_ui::{Action, BlinkClock, BlinkNeeds, BlinkPhase, KeyCode, Modifiers};
 
 use crate::cg_renderer::CGRenderer;
 use crate::file_transfer::PendingFileManager;
+use crate::keycode::{
+    direct_modified_key_char, exactly_one_char, key_event_kind, modifier_key_for_keycode,
+    terminal_key_for_keycode, unmodified_key_char, ReportedKey,
+};
 use crate::mouse::{self, MouseButton, MouseEvent, MouseModifiers, MousePosition};
 use crate::notification_bar::{NotificationBar, NOTIFICATION_BAR_HEIGHT};
 use crate::window::CtermWindow;
@@ -62,135 +66,6 @@ fn match_configured_action(
 ) -> Option<Action> {
     // Own the action before dispatch: opening Preferences may replace this manager.
     shortcuts.borrow().match_event(key, modifiers).cloned()
-}
-
-fn key_event_kind(is_repeat: bool) -> KeyEventKind {
-    if is_repeat {
-        KeyEventKind::Repeat
-    } else {
-        KeyEventKind::Press
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ReportedKey {
-    key: Key,
-    shifted_key: Option<char>,
-    base_layout_key: Option<char>,
-}
-
-impl ReportedKey {
-    fn metadata(self) -> KeyEventMetadata<'static> {
-        KeyEventMetadata::new()
-            .with_shifted_key(self.shifted_key)
-            .with_base_layout_key(self.base_layout_key)
-    }
-}
-
-fn terminal_key_for_keycode(keycode: u16) -> Option<Key> {
-    Some(match keycode {
-        // Arrow keys
-        0x7E => Key::Up,
-        0x7D => Key::Down,
-        0x7B => Key::Left,
-        0x7C => Key::Right,
-        // Navigation
-        0x73 => Key::Home,
-        0x77 => Key::End,
-        0x74 => Key::PageUp,
-        0x79 => Key::PageDown,
-        // Editing
-        0x72 => Key::Insert,
-        0x75 => Key::Delete,
-        0x33 => Key::Backspace,
-        0x24 => Key::Enter,
-        0x30 => Key::Tab,
-        0x35 => Key::Escape,
-        // Numeric keypad (preserve physical identity for DECKPAM and Kitty).
-        0x52 => Key::NumpadDigit(0),
-        0x53 => Key::NumpadDigit(1),
-        0x54 => Key::NumpadDigit(2),
-        0x55 => Key::NumpadDigit(3),
-        0x56 => Key::NumpadDigit(4),
-        0x57 => Key::NumpadDigit(5),
-        0x58 => Key::NumpadDigit(6),
-        0x59 => Key::NumpadDigit(7),
-        0x5B => Key::NumpadDigit(8),
-        0x5C => Key::NumpadDigit(9),
-        0x41 => Key::NumpadDecimal,
-        0x4B => Key::NumpadDivide,
-        0x43 => Key::NumpadMultiply,
-        0x4E => Key::NumpadSubtract,
-        0x45 => Key::NumpadAdd,
-        0x4C => Key::NumpadEnter,
-        0x51 => Key::Named(NamedKey::NumpadEqual),
-        // Function keys
-        0x7A => Key::F(1),
-        0x78 => Key::F(2),
-        0x63 => Key::F(3),
-        0x76 => Key::F(4),
-        0x60 => Key::F(5),
-        0x61 => Key::F(6),
-        0x62 => Key::F(7),
-        0x64 => Key::F(8),
-        0x65 => Key::F(9),
-        0x6D => Key::F(10),
-        0x67 => Key::F(11),
-        0x6F => Key::F(12),
-        0x69 => Key::F(13),
-        0x6B => Key::F(14),
-        0x71 => Key::F(15),
-        0x6A => Key::F(16),
-        0x40 => Key::F(17),
-        0x4F => Key::F(18),
-        0x50 => Key::F(19),
-        0x5A => Key::F(20),
-        _ => return None,
-    })
-}
-
-fn modifier_key_for_keycode(keycode: u16) -> Option<(NamedKey, Modifiers)> {
-    Some(match keycode {
-        0x38 => (NamedKey::LeftShift, Modifiers::SHIFT),
-        0x3C => (NamedKey::RightShift, Modifiers::SHIFT),
-        0x3B => (NamedKey::LeftControl, Modifiers::CTRL),
-        0x3E => (NamedKey::RightControl, Modifiers::CTRL),
-        0x3A => (NamedKey::LeftAlt, Modifiers::ALT),
-        0x3D => (NamedKey::RightAlt, Modifiers::ALT),
-        0x37 => (NamedKey::LeftSuper, Modifiers::SUPER),
-        0x36 => (NamedKey::RightSuper, Modifiers::SUPER),
-        0x39 => (NamedKey::CapsLock, Modifiers::CAPS_LOCK),
-        _ => return None,
-    })
-}
-
-fn exactly_one_char(text: &str) -> Option<char> {
-    let mut chars = text.chars();
-    let character = chars.next()?;
-    chars.next().is_none().then_some(character)
-}
-
-fn unmodified_key_char(text: &str) -> Option<char> {
-    let character = exactly_one_char(text)?;
-    let mut lowercase = character.to_lowercase();
-    let character = lowercase.next()?;
-    lowercase.next().is_none().then_some(character)
-}
-
-fn direct_modified_key_char(
-    event_text: &str,
-    base_text: &str,
-    alt_may_produce_text: bool,
-) -> Option<char> {
-    let event = exactly_one_char(event_text)?;
-    let base = unmodified_key_char(base_text)?;
-    if alt_may_produce_text && !event.is_control() {
-        let mut lowercase = event.to_lowercase();
-        if lowercase.next() != Some(base) || lowercase.next().is_some() {
-            return None;
-        }
-    }
-    Some(base)
 }
 
 /// Shared state between the view and PTY thread
@@ -3514,60 +3389,6 @@ impl TerminalView {
 #[cfg(test)]
 mod keyboard_event_tests {
     use super::*;
-
-    #[test]
-    fn maps_press_and_repeat_event_kinds() {
-        assert_eq!(key_event_kind(false), KeyEventKind::Press);
-        assert_eq!(key_event_kind(true), KeyEventKind::Repeat);
-    }
-
-    #[test]
-    fn maps_functional_keycodes() {
-        assert_eq!(terminal_key_for_keycode(0x7E), Some(Key::Up));
-        assert_eq!(terminal_key_for_keycode(0x75), Some(Key::Delete));
-        assert_eq!(terminal_key_for_keycode(0x7A), Some(Key::F(1)));
-        assert_eq!(terminal_key_for_keycode(0x6F), Some(Key::F(12)));
-        assert_eq!(terminal_key_for_keycode(0x57), Some(Key::NumpadDigit(5)));
-        assert_eq!(terminal_key_for_keycode(0x4C), Some(Key::NumpadEnter));
-        assert_eq!(terminal_key_for_keycode(0x5A), Some(Key::F(20)));
-        assert_eq!(
-            terminal_key_for_keycode(0x51),
-            Some(Key::Named(NamedKey::NumpadEqual))
-        );
-        assert_eq!(terminal_key_for_keycode(0x00), None);
-    }
-
-    #[test]
-    fn modifier_keycodes_preserve_left_and_right_kitty_identity() {
-        assert_eq!(
-            modifier_key_for_keycode(0x38),
-            Some((NamedKey::LeftShift, Modifiers::SHIFT))
-        );
-        assert_eq!(
-            modifier_key_for_keycode(0x36),
-            Some((NamedKey::RightSuper, Modifiers::SUPER))
-        );
-        assert_eq!(
-            modifier_key_for_keycode(0x39),
-            Some((NamedKey::CapsLock, Modifiers::CAPS_LOCK))
-        );
-    }
-
-    #[test]
-    fn accepts_only_one_unicode_scalar_for_direct_reporting() {
-        assert_eq!(exactly_one_char("a"), Some('a'));
-        assert_eq!(exactly_one_char("é"), Some('é'));
-        assert_eq!(exactly_one_char(""), None);
-        assert_eq!(exactly_one_char("ab"), None);
-        assert_eq!(exactly_one_char("e\u{301}"), None);
-        assert_eq!(unmodified_key_char("A"), Some('a'));
-        assert_eq!(unmodified_key_char("İ"), None);
-        assert_eq!(direct_modified_key_char("a", "a", true), Some('a'));
-        assert_eq!(direct_modified_key_char("A", "A", true), Some('a'));
-        assert_eq!(direct_modified_key_char("å", "a", true), None);
-        assert_eq!(direct_modified_key_char("\u{1}", "A", false), Some('a'));
-        assert_eq!(direct_modified_key_char("\u{1}", "A", true), Some('a'));
-    }
 
     #[test]
     fn font_zoom_stays_within_supported_bounds() {

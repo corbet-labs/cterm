@@ -2,8 +2,212 @@
 //!
 //! Maps Windows virtual key codes to cterm-ui KeyCode values.
 
+use cterm_core::term::{Key, NamedKey};
+use cterm_core::KeyEventMetadata;
 use cterm_ui::events::{KeyCode, Modifiers};
 use winapi::um::winuser;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReportedKey {
+    pub(crate) key: Key,
+    pub(crate) shifted_key: Option<char>,
+    pub(crate) base_layout_key: Option<char>,
+}
+
+impl ReportedKey {
+    pub(crate) fn metadata(self) -> KeyEventMetadata<'static> {
+        KeyEventMetadata::new()
+            .with_shifted_key(self.shifted_key)
+            .with_base_layout_key(self.base_layout_key)
+    }
+}
+
+/// Map the standard PC-101 base-layout ASCII identity required by Kitty.
+fn ascii_key_for_vk(vk: u16) -> Option<char> {
+    Some(match vk as i32 {
+        value @ 0x30..=0x39 => value as u8 as char,
+        value @ 0x41..=0x5a => (b'a' + (value as u8 - b'A')) as char,
+        winuser::VK_SPACE => ' ',
+        winuser::VK_OEM_MINUS => '-',
+        winuser::VK_OEM_PLUS => '=',
+        winuser::VK_OEM_4 => '[',
+        winuser::VK_OEM_6 => ']',
+        winuser::VK_OEM_1 => ';',
+        winuser::VK_OEM_7 => '\'',
+        winuser::VK_OEM_3 => '`',
+        winuser::VK_OEM_5 => '\\',
+        winuser::VK_OEM_COMMA => ',',
+        winuser::VK_OEM_PERIOD => '.',
+        winuser::VK_OEM_2 => '/',
+        _ => return None,
+    })
+}
+
+pub(crate) fn sided_virtual_key(vk: u16, scan_code: u8, extended: bool) -> u16 {
+    match vk as i32 {
+        winuser::VK_SHIFT => {
+            let scan = u32::from(scan_code) | if extended { 0xe000 } else { 0 };
+            let mapped =
+                unsafe { winuser::MapVirtualKeyW(scan, winuser::MAPVK_VSC_TO_VK_EX) } as u16;
+            if mapped == 0 {
+                vk
+            } else {
+                mapped
+            }
+        }
+        winuser::VK_CONTROL => {
+            if extended {
+                winuser::VK_RCONTROL as u16
+            } else {
+                winuser::VK_LCONTROL as u16
+            }
+        }
+        winuser::VK_MENU => {
+            if extended {
+                winuser::VK_RMENU as u16
+            } else {
+                winuser::VK_LMENU as u16
+            }
+        }
+        _ => vk,
+    }
+}
+
+fn translated_key_text(vk: u16, scan_code: u8, keyboard_state: &[u8; 256]) -> Option<String> {
+    let mut buffer = [0u16; 8];
+    let count = unsafe {
+        winuser::ToUnicodeEx(
+            u32::from(vk),
+            u32::from(scan_code),
+            keyboard_state.as_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len() as i32,
+            // Read without mutating the keyboard/dead-key state.
+            1 << 2,
+            winuser::GetKeyboardLayout(0),
+        )
+    };
+    (count > 0)
+        .then(|| String::from_utf16(&buffer[..count as usize]).ok())
+        .flatten()
+}
+
+pub(crate) fn translated_key_char(vk: u16, scan_code: u8, shifted: bool) -> Option<char> {
+    let mut state = [0u8; 256];
+    if shifted {
+        state[winuser::VK_SHIFT as usize] = 0x80;
+    }
+    let text = translated_key_text(vk, scan_code, &state)?;
+    let mut characters = text.chars();
+    let character = characters.next()?;
+    characters.next().is_none().then_some(character)
+}
+
+pub(crate) fn associated_key_text(vk: u16, scan_code: u8) -> Option<String> {
+    let mut state = [0u8; 256];
+    let ok = unsafe { winuser::GetKeyboardState(state.as_mut_ptr()) };
+    if ok == 0 {
+        return None;
+    }
+    translated_key_text(vk, scan_code, &state)
+}
+
+pub(crate) fn pc101_key_for_scan_code(scan_code: u8) -> Option<char> {
+    Some(match scan_code {
+        0x02..=0x0b => "1234567890".chars().nth((scan_code - 0x02) as usize)?,
+        0x0c => '-',
+        0x0d => '=',
+        0x10..=0x1b => "qwertyuiop[]".chars().nth((scan_code - 0x10) as usize)?,
+        0x1e..=0x29 => "asdfghjkl;'`".chars().nth((scan_code - 0x1e) as usize)?,
+        0x2b => '\\',
+        0x2c..=0x35 => "zxcvbnm,./".chars().nth((scan_code - 0x2c) as usize)?,
+        0x39 => ' ',
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+fn mapped_terminal_key(
+    vk: u16,
+    modifiers: Modifiers,
+    enhanced_text: bool,
+    extended: bool,
+) -> Option<Key> {
+    mapped_terminal_key_with_layout(vk, modifiers, enhanced_text, extended, None)
+}
+
+pub(crate) fn mapped_terminal_key_with_layout(
+    vk: u16,
+    modifiers: Modifiers,
+    enhanced_text: bool,
+    extended: bool,
+    layout_char: Option<char>,
+) -> Option<Key> {
+    let functional = match vk as i32 {
+        winuser::VK_UP => Key::Up,
+        winuser::VK_DOWN => Key::Down,
+        winuser::VK_LEFT => Key::Left,
+        winuser::VK_RIGHT => Key::Right,
+        winuser::VK_HOME => Key::Home,
+        winuser::VK_END => Key::End,
+        winuser::VK_PRIOR => Key::PageUp,
+        winuser::VK_NEXT => Key::PageDown,
+        winuser::VK_INSERT => Key::Insert,
+        winuser::VK_DELETE => Key::Delete,
+        winuser::VK_BACK => Key::Backspace,
+        winuser::VK_RETURN if extended => Key::NumpadEnter,
+        winuser::VK_RETURN => Key::Enter,
+        winuser::VK_TAB => Key::Tab,
+        winuser::VK_ESCAPE => Key::Escape,
+        value if (winuser::VK_NUMPAD0..=winuser::VK_NUMPAD9).contains(&value) => {
+            Key::NumpadDigit((value - winuser::VK_NUMPAD0) as u8)
+        }
+        winuser::VK_DECIMAL => Key::NumpadDecimal,
+        winuser::VK_DIVIDE => Key::NumpadDivide,
+        winuser::VK_MULTIPLY => Key::NumpadMultiply,
+        winuser::VK_SUBTRACT => Key::NumpadSubtract,
+        winuser::VK_ADD => Key::NumpadAdd,
+        value if (winuser::VK_F1..=winuser::VK_F24).contains(&value) => {
+            Key::F((value - winuser::VK_F1 + 1) as u8)
+        }
+        winuser::VK_CAPITAL => Key::Named(NamedKey::CapsLock),
+        winuser::VK_SCROLL => Key::Named(NamedKey::ScrollLock),
+        winuser::VK_NUMLOCK => Key::Named(NamedKey::NumLock),
+        winuser::VK_SNAPSHOT => Key::Named(NamedKey::PrintScreen),
+        winuser::VK_PAUSE => Key::Named(NamedKey::Pause),
+        winuser::VK_APPS => Key::Named(NamedKey::Menu),
+        winuser::VK_MEDIA_PLAY_PAUSE => Key::Named(NamedKey::MediaPlayPause),
+        winuser::VK_MEDIA_STOP => Key::Named(NamedKey::MediaStop),
+        winuser::VK_MEDIA_NEXT_TRACK => Key::Named(NamedKey::MediaTrackNext),
+        winuser::VK_MEDIA_PREV_TRACK => Key::Named(NamedKey::MediaTrackPrevious),
+        winuser::VK_VOLUME_DOWN => Key::Named(NamedKey::LowerVolume),
+        winuser::VK_VOLUME_UP => Key::Named(NamedKey::RaiseVolume),
+        winuser::VK_VOLUME_MUTE => Key::Named(NamedKey::MuteVolume),
+        winuser::VK_LSHIFT => Key::Named(NamedKey::LeftShift),
+        winuser::VK_RSHIFT => Key::Named(NamedKey::RightShift),
+        winuser::VK_LCONTROL => Key::Named(NamedKey::LeftControl),
+        winuser::VK_RCONTROL => Key::Named(NamedKey::RightControl),
+        winuser::VK_LMENU => Key::Named(NamedKey::LeftAlt),
+        winuser::VK_RMENU => Key::Named(NamedKey::RightAlt),
+        winuser::VK_LWIN => Key::Named(NamedKey::LeftSuper),
+        winuser::VK_RWIN => Key::Named(NamedKey::RightSuper),
+        _ => {
+            if enhanced_text {
+                return layout_char.or_else(|| ascii_key_for_vk(vk)).map(Key::Char);
+            }
+            if modifiers.contains(Modifiers::CTRL)
+                && !modifiers.intersects(Modifiers::ALT | Modifiers::SUPER)
+            {
+                return layout_char
+                    .or_else(|| ascii_key_for_vk(vk))
+                    .filter(char::is_ascii_alphabetic)
+                    .map(Key::Char);
+            }
+            return None;
+        }
+    };
+    Some(functional)
+}
 
 /// Convert a Windows virtual key code to our KeyCode
 pub fn vk_to_keycode(vk: u16) -> Option<KeyCode> {
@@ -326,6 +530,101 @@ pub fn is_modifier_key(vk: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_mapping_keeps_layout_text_on_wm_char() {
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_UP as u16, Modifiers::empty(), false, false),
+            Some(Key::Up)
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_F12 as u16, Modifiers::empty(), false, false),
+            Some(Key::F(12))
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_F24 as u16, Modifiers::empty(), false, false),
+            Some(Key::F(24))
+        );
+        assert_eq!(
+            mapped_terminal_key(
+                winuser::VK_MEDIA_PLAY_PAUSE as u16,
+                Modifiers::empty(),
+                false,
+                false,
+            ),
+            Some(Key::Named(NamedKey::MediaPlayPause))
+        );
+        assert_eq!(
+            mapped_terminal_key(0x41, Modifiers::empty(), false, false),
+            None
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_OEM_1 as u16, Modifiers::CTRL, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_mapping_preserves_numeric_keypad_identity() {
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_NUMPAD7 as u16, Modifiers::empty(), false, false),
+            Some(Key::NumpadDigit(7))
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_ADD as u16, Modifiers::empty(), false, false),
+            Some(Key::NumpadAdd)
+        );
+        assert_eq!(
+            mapped_terminal_key(winuser::VK_RETURN as u16, Modifiers::empty(), false, true),
+            Some(Key::NumpadEnter)
+        );
+    }
+
+    #[test]
+    fn legacy_ctrl_letters_and_enhanced_ascii_are_mapped_exactly() {
+        assert_eq!(
+            mapped_terminal_key(0x41, Modifiers::CTRL, false, false),
+            Some(Key::Char('a'))
+        );
+        assert_eq!(
+            mapped_terminal_key(0x5a, Modifiers::CTRL | Modifiers::SHIFT, false, false),
+            Some(Key::Char('z'))
+        );
+        assert_eq!(
+            mapped_terminal_key(0x41, Modifiers::CTRL | Modifiers::ALT, false, false),
+            None
+        );
+        assert_eq!(
+            mapped_terminal_key(
+                winuser::VK_OEM_1 as u16,
+                Modifiers::CTRL | Modifiers::SHIFT,
+                true,
+                false,
+            ),
+            Some(Key::Char(';'))
+        );
+        assert_eq!(
+            mapped_terminal_key(0x32, Modifiers::ALT, true, false),
+            Some(Key::Char('2'))
+        );
+    }
+
+    #[test]
+    fn kitty_physical_identity_and_sided_modifiers_are_stable() {
+        assert_eq!(pc101_key_for_scan_code(0x02), Some('1'));
+        assert_eq!(pc101_key_for_scan_code(0x1e), Some('a'));
+        assert_eq!(pc101_key_for_scan_code(0x2b), Some('\\'));
+        assert_eq!(pc101_key_for_scan_code(0x39), Some(' '));
+        assert_eq!(pc101_key_for_scan_code(0xff), None);
+        assert_eq!(
+            sided_virtual_key(winuser::VK_CONTROL as u16, 0x1d, false),
+            winuser::VK_LCONTROL as u16
+        );
+        assert_eq!(
+            sided_virtual_key(winuser::VK_CONTROL as u16, 0x1d, true),
+            winuser::VK_RCONTROL as u16
+        );
+    }
 
     #[test]
     fn test_vk_to_keycode_letters() {

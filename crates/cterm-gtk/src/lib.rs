@@ -7,6 +7,7 @@ mod desktop_notification;
 mod dialogs;
 mod docker_dialog;
 mod file_transfer;
+mod keyboard;
 mod log_viewer;
 mod menu;
 mod notification_bar;
