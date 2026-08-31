@@ -870,7 +870,10 @@ allow = ["cterm:new-tab"]
         let broker = PluginBroker::for_test(
             host,
             fixture.plugins_root.clone(),
-            PluginBrokerTimeout::default(),
+            // Windows PowerShell startup is variable under the concurrent CI
+            // load. This test exercises the byte ceiling, not the default
+            // invocation latency policy, so use the broker's hard maximum.
+            PluginBrokerTimeout::new(MAX_INVOCATION_TIMEOUT).unwrap(),
         );
         let error = broker
             .invoke(
@@ -880,12 +883,15 @@ allow = ["cterm:new-tab"]
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            error,
-            PluginBrokerError::StdoutLimitExceeded {
-                limit: MAX_FRAME_BYTES
-            }
-        ));
+        assert!(
+            matches!(
+                error,
+                PluginBrokerError::StdoutLimitExceeded {
+                    limit: MAX_FRAME_BYTES
+                }
+            ),
+            "unexpected broker error: {error:?}"
+        );
     }
 
     #[cfg(unix)]
