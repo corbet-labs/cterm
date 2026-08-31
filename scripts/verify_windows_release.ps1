@@ -60,6 +60,7 @@ try {
     $clientRoot = Join-Path $clientExtract "cterm-windows-x86_64"
     Assert-File (Join-Path $clientRoot "cterm.exe")
     Assert-File (Join-Path $clientRoot "ctermd.exe")
+    Assert-File (Join-Path $clientRoot "cterm-plugin-host.exe")
     Assert-File (Join-Path $clientRoot "README.md")
     Assert-Licenses $clientRoot
 
@@ -74,7 +75,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Release package contract: 7-Zip could not inspect $Installer"
     }
-    foreach ($requiredName in @("cterm.exe", "ctermd.exe", "THIRD_PARTY_LICENSES.md", "KARPELESLAB-CTERM-MIT.txt")) {
+    foreach ($requiredName in @("cterm.exe", "ctermd.exe", "cterm-plugin-host.exe", "THIRD_PARTY_LICENSES.md", "KARPELESLAB-CTERM-MIT.txt")) {
         if ($installerListing -notmatch [regex]::Escape($requiredName)) {
             throw "Release package contract: installer does not contain $requiredName"
         }

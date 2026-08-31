@@ -41,6 +41,7 @@ verify_client_directory() {
     local root="$1"
     require_executable "$root/cterm"
     require_executable "$root/ctermd"
+    require_executable "$root/cterm-plugin-host"
     require_file "$root/README.md"
     verify_licenses "$root"
 }
@@ -56,6 +57,7 @@ verify_macos_app() {
     local app="$1"
     require_executable "$app/Contents/MacOS/cterm"
     require_executable "$app/Contents/MacOS/ctermd"
+    require_executable "$app/Contents/MacOS/cterm-plugin-host"
     require_file "$app/Contents/Info.plist"
     require_file "$app/Contents/Resources/LICENSE"
     require_file "$app/Contents/Resources/THIRD_PARTY_LICENSES.md"
