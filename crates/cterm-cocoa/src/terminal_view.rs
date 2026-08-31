@@ -2187,8 +2187,12 @@ impl TerminalView {
                     state.needs_redraw.store(true, Ordering::Relaxed);
                 }
 
-                let blink_needs = BlinkNeeds::for_screen(terminal.lock().screen());
-                if blink_clock.update(started.elapsed(), blink_needs) {
+                let now = started.elapsed();
+                let mut terminal = terminal.lock();
+                let blink_needs = BlinkNeeds::for_screen(terminal.screen());
+                let animation_changed = terminal.advance_graphics_animations(now).changed;
+                drop(terminal);
+                if blink_clock.update(now, blink_needs) || animation_changed {
                     state
                         .blink_phase
                         .store(blink_clock.phase().bits(), Ordering::Relaxed);

@@ -494,13 +494,17 @@ impl WindowState {
             return;
         };
         let mut needs = BlinkNeeds::default();
+        let now = self.blink_started.elapsed();
+        let mut animation_changed = false;
         for pane in tab.panes.values() {
-            let pane_needs = BlinkNeeds::for_screen(pane.terminal.lock().unwrap().screen());
+            let mut terminal = pane.terminal.lock().unwrap();
+            let pane_needs = BlinkNeeds::for_screen(terminal.screen());
+            animation_changed |= terminal.advance_graphics_animations(now).changed;
             needs.cursor |= pane_needs.cursor;
             needs.slow_cells |= pane_needs.slow_cells;
             needs.rapid_cells |= pane_needs.rapid_cells;
         }
-        if self.blink_clock.update(self.blink_started.elapsed(), needs) {
+        if self.blink_clock.update(now, needs) || animation_changed {
             self.invalidate();
         }
     }

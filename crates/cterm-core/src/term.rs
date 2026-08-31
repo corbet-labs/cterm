@@ -3,6 +3,7 @@
 //! Provides a high-level interface for terminal emulation.
 
 use crate::color::ColorPalette;
+use crate::kitty_graphics::GraphicsAnimationTick;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
 use crate::screen::{
@@ -107,6 +108,12 @@ impl Terminal {
     /// Get a mutable reference to the screen
     pub fn screen_mut(&mut self) -> &mut Screen {
         &mut self.screen
+    }
+
+    /// Advance terminal-driven Kitty image animation independently of PTY I/O.
+    pub fn advance_graphics_animations(&mut self, now: Duration) -> GraphicsAnimationTick {
+        self.parser
+            .advance_graphics_animations(&mut self.screen, now)
     }
 
     /// Get the PTY if available

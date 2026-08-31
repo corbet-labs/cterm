@@ -635,8 +635,11 @@ impl TerminalWidget {
             let Some(drawing_area) = drawing_area.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            let needs = BlinkNeeds::for_screen(terminal.lock().screen());
-            if blink_clock.borrow_mut().update(started.elapsed(), needs) {
+            let now = started.elapsed();
+            let mut terminal = terminal.lock();
+            let needs = BlinkNeeds::for_screen(terminal.screen());
+            let animation_changed = terminal.advance_graphics_animations(now).changed;
+            if blink_clock.borrow_mut().update(now, needs) || animation_changed {
                 drawing_area.queue_draw();
             }
             glib::ControlFlow::Continue

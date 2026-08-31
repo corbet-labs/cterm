@@ -31,6 +31,7 @@ pub use grid::Grid;
 pub use image_decode::{decode_image, DecodedImage, ImageDecodeError};
 pub use iterm2::{Iterm2Dimension, Iterm2FileParams};
 pub use keyboard::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
+pub use kitty_graphics::GraphicsAnimationTick;
 pub use parser::Parser;
 #[cfg(unix)]
 pub use pty::save_original_nofile_limit;

@@ -707,6 +707,7 @@ dependencies = [
  "image",
  "libc",
  "log",
+ "nix 0.31.3",
  "parking_lot",
  "puressh",
  "regex",

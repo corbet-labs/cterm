@@ -13,7 +13,7 @@ use std::sync::Arc;
 use base64::alphabet::STANDARD as BASE64_ALPHABET;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use base64::engine::{DecodePaddingMode, Engine as _};
-use image::{imageops, RgbaImage};
+use image::{imageops, Pixel, Rgba, RgbaImage};
 
 use crate::image_decode::decode_image;
 use crate::screen::{DecodedRgbaImage, Screen, TerminalImage};
@@ -175,6 +175,22 @@ enum Action {
     Display,
     Delete,
     Query,
+    TransmitFrame,
+    ControlAnimation,
+    ComposeFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameComposition {
+    AlphaBlend,
+    Overwrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimationState {
+    Stopped,
+    Loading,
+    Running,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +295,15 @@ struct Command {
     quiet: u8,
     suppress_cursor_movement: bool,
     delete_specifier: Option<u8>,
+    frame_number: u32,
+    other_frame_number: u32,
+    frame_gap: Option<i32>,
+    frame_composition: FrameComposition,
+    frame_background: u32,
+    frame_source_x: u32,
+    frame_source_y: u32,
+    animation_state: Option<AnimationState>,
+    loop_count: Option<u32>,
     image: Option<DecodedImage>,
 }
 
@@ -309,6 +334,15 @@ impl Default for Command {
             quiet: 0,
             suppress_cursor_movement: false,
             delete_specifier: None,
+            frame_number: 0,
+            other_frame_number: 0,
+            frame_gap: None,
+            frame_composition: FrameComposition::AlphaBlend,
+            frame_background: 0,
+            frame_source_x: 0,
+            frame_source_y: 0,
+            animation_state: None,
+            loop_count: None,
             image: None,
         }
     }
@@ -400,7 +434,10 @@ impl CommandParser {
             Ok(command) => command,
             Err(error) => return Some(Err(error)),
         };
-        if matches!(command.action, Action::Delete | Action::Display) {
+        if matches!(
+            command.action,
+            Action::Delete | Action::Display | Action::ControlAnimation | Action::ComposeFrame
+        ) {
             return Some(Ok(command));
         }
         if command.more_chunks {
@@ -467,25 +504,27 @@ fn scan_echo_fields(control: &[u8]) -> EchoFields {
 fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
     let echo = scan_echo_fields(control);
     let mut command = Command::default();
-    for (key, value) in
-        tokenize(control).map_err(|()| echo.error(ErrorCode::Invalid, "malformed control data"))?
-    {
+    let pairs =
+        tokenize(control).map_err(|()| echo.error(ErrorCode::Invalid, "malformed control data"))?;
+    for (key, value) in &pairs {
+        if *key != b"a" {
+            continue;
+        }
+        command.action = match *value {
+            b"t" => Action::Transmit,
+            b"T" => Action::TransmitAndDisplay,
+            b"p" => Action::Display,
+            b"d" => Action::Delete,
+            b"q" => Action::Query,
+            b"f" => Action::TransmitFrame,
+            b"a" => Action::ControlAnimation,
+            b"c" => Action::ComposeFrame,
+            _ => return Err(echo.error(ErrorCode::Invalid, "invalid action")),
+        };
+    }
+    for (key, value) in pairs {
         match key {
-            b"a" => {
-                command.action = match value {
-                    b"t" => Action::Transmit,
-                    b"T" => Action::TransmitAndDisplay,
-                    b"p" => Action::Display,
-                    b"d" => Action::Delete,
-                    b"q" => Action::Query,
-                    b"f" | b"a" | b"c" => {
-                        return Err(
-                            echo.error(ErrorCode::NotSupported, "animation is not supported")
-                        )
-                    }
-                    _ => return Err(echo.error(ErrorCode::Invalid, "invalid action")),
-                }
-            }
+            b"a" => {}
             b"f" => {
                 command.format = match parse_u32(value) {
                     Some(24) => Format::Rgb24,
@@ -503,7 +542,20 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
                     _ => return Err(echo.error(ErrorCode::Invalid, "invalid medium")),
                 }
             }
+            b"s" if command.action == Action::ControlAnimation => {
+                command.animation_state =
+                    match required_u32(value, echo, "invalid animation state")? {
+                        0 => None,
+                        1 => Some(AnimationState::Stopped),
+                        2 => Some(AnimationState::Loading),
+                        3 => Some(AnimationState::Running),
+                        _ => None,
+                    };
+            }
             b"s" => command.pixel_width = Some(required_u32(value, echo, "invalid width")?),
+            b"v" if command.action == Action::ControlAnimation => {
+                command.loop_count = Some(required_u32(value, echo, "invalid loop count")?);
+            }
             b"v" => command.pixel_height = Some(required_u32(value, echo, "invalid height")?),
             b"S" => command.data_size = Some(required_u32(value, echo, "invalid data size")?),
             b"O" => command.data_offset = Some(required_u32(value, echo, "invalid offset")?),
@@ -514,10 +566,48 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
             b"y" => command.source_y = required_u32(value, echo, "invalid source y")?,
             b"w" => command.source_w = required_u32(value, echo, "invalid source width")?,
             b"h" => command.source_h = required_u32(value, echo, "invalid source height")?,
+            b"c" if matches!(
+                command.action,
+                Action::TransmitFrame | Action::ControlAnimation | Action::ComposeFrame
+            ) =>
+            {
+                command.other_frame_number =
+                    required_u32(value, echo, "invalid other frame number")?;
+            }
             b"c" => command.columns = required_u32(value, echo, "invalid columns")?,
+            b"r" if matches!(
+                command.action,
+                Action::TransmitFrame | Action::ControlAnimation | Action::ComposeFrame
+            ) =>
+            {
+                command.frame_number = required_u32(value, echo, "invalid frame number")?;
+            }
             b"r" => command.rows = required_u32(value, echo, "invalid rows")?,
+            b"X" if command.action == Action::TransmitFrame => {
+                command.frame_composition = parse_frame_composition(value, echo)?;
+            }
+            b"X" if command.action == Action::ComposeFrame => {
+                command.frame_source_x = required_u32(value, echo, "invalid frame source x")?;
+            }
             b"X" => command.cell_offset_x = required_u32(value, echo, "invalid cell x offset")?,
+            b"Y" if command.action == Action::TransmitFrame => {
+                command.frame_background =
+                    required_u32(value, echo, "invalid frame background color")?;
+            }
+            b"Y" if command.action == Action::ComposeFrame => {
+                command.frame_source_y = required_u32(value, echo, "invalid frame source y")?;
+            }
             b"Y" => command.cell_offset_y = required_u32(value, echo, "invalid cell y offset")?,
+            b"z" if matches!(
+                command.action,
+                Action::TransmitFrame | Action::ControlAnimation
+            ) =>
+            {
+                command.frame_gap = Some(
+                    parse_i32(value)
+                        .ok_or_else(|| echo.error(ErrorCode::Invalid, "invalid frame gap"))?,
+                );
+            }
             b"z" => {
                 command.z_index = parse_i32(value)
                     .ok_or_else(|| echo.error(ErrorCode::Invalid, "invalid z index"))?;
@@ -536,6 +626,9 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
                     Some(value @ 0..=2) => value as u8,
                     _ => return Err(echo.error(ErrorCode::Invalid, "invalid quiet level")),
                 }
+            }
+            b"C" if command.action == Action::ComposeFrame => {
+                command.frame_composition = parse_frame_composition(value, echo)?;
             }
             b"C" => {
                 command.suppress_cursor_movement = match parse_u32(value) {
@@ -565,6 +658,17 @@ fn parse_control_data(control: &[u8]) -> Result<Command, ProtocolError> {
         ));
     }
     Ok(command)
+}
+
+fn parse_frame_composition(
+    value: &[u8],
+    echo: EchoFields,
+) -> Result<FrameComposition, ProtocolError> {
+    match parse_u32(value) {
+        Some(0) => Ok(FrameComposition::AlphaBlend),
+        Some(1) => Ok(FrameComposition::Overwrite),
+        _ => Err(echo.error(ErrorCode::Invalid, "invalid frame composition mode")),
+    }
 }
 
 fn required_u32(
@@ -647,12 +751,7 @@ fn read_file_payload(
     read_result.map_err(|_| echo.error(ErrorCode::BadFile, "could not read file"))
 }
 
-#[cfg(any(
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "macos",
-    windows
-))]
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
 fn read_shared_memory_payload(
     command: &Command,
     name_bytes: Vec<u8>,
@@ -663,24 +762,62 @@ fn read_shared_memory_payload(
     }
     let name = String::from_utf8(name_bytes)
         .map_err(|_| echo.error(ErrorCode::BadFile, "invalid shared memory name"))?;
-    #[cfg(unix)]
     if !name.starts_with('/') || name[1..].contains('/') {
         return Err(echo.error(ErrorCode::BadFile, "invalid POSIX shared memory name"));
     }
-    let configuration = shared_memory::ShmemConf::new().os_id(name);
-    #[cfg(windows)]
-    let configuration = configuration.allow_raw(true);
-    let mut mapping = configuration
+    let descriptor = nix::sys::mman::shm_open(
+        name.as_str(),
+        nix::fcntl::OFlag::O_RDONLY,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|_| echo.error(ErrorCode::BadFile, "could not open shared memory"))?;
+    // Ownership passes to the terminal as soon as open succeeds. The live
+    // descriptor remains readable after unlink and closes through File RAII.
+    let _ = nix::sys::mman::shm_unlink(name.as_str());
+    let mut file = std::fs::File::from(descriptor);
+    let mapped_size = file
+        .metadata()
+        .map_err(|_| echo.error(ErrorCode::BadFile, "could not inspect shared memory"))?
+        .len();
+
+    let start = u64::from(command.data_offset.unwrap_or(0));
+    if start > mapped_size {
+        return Err(echo.error(ErrorCode::BadFile, "shared memory offset is out of range"));
+    }
+    let available = mapped_size - start;
+    let length = command
+        .data_size
+        .filter(|size| *size > 0)
+        .map_or(available, |size| available.min(u64::from(size)));
+    if length > MAX_DECODED_BYTES as u64 {
+        return Err(echo.error(ErrorCode::NoSpace, "image data too large"));
+    }
+    file.seek(std::io::SeekFrom::Start(start))
+        .map_err(|_| echo.error(ErrorCode::BadFile, "could not seek shared memory"))?;
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(length)
+        .read_to_end(&mut bytes)
+        .map_err(|_| echo.error(ErrorCode::BadFile, "could not read shared memory"))?;
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn read_shared_memory_payload(
+    command: &Command,
+    name_bytes: Vec<u8>,
+    echo: EchoFields,
+) -> Result<Vec<u8>, ProtocolError> {
+    if name_bytes.is_empty() || name_bytes.len() > MAX_SHARED_MEMORY_NAME_BYTES {
+        return Err(echo.error(ErrorCode::BadFile, "invalid shared memory name"));
+    }
+    let name = String::from_utf8(name_bytes)
+        .map_err(|_| echo.error(ErrorCode::BadFile, "invalid shared memory name"))?;
+    let mapping = shared_memory::ShmemConf::new()
+        .os_id(name)
+        .allow_raw(true)
         .open()
         .map_err(|_| echo.error(ErrorCode::BadFile, "could not open shared memory"))?;
-
-    // Kitty transfers ownership of POSIX shared memory cleanup to the
-    // terminal. Windows named mappings disappear when all handles close.
-    #[cfg(unix)]
-    mapping.set_owner(true);
-
-    let start = usize::try_from(command.data_offset.unwrap_or(0))
-        .map_err(|_| echo.error(ErrorCode::BadFile, "shared memory offset is out of range"))?;
+    let start = command.data_offset.unwrap_or(0) as usize;
     if start > mapping.len() {
         return Err(echo.error(ErrorCode::BadFile, "shared memory offset is out of range"));
     }
@@ -692,13 +829,9 @@ fn read_shared_memory_payload(
     if length > MAX_DECODED_BYTES {
         return Err(echo.error(ErrorCode::NoSpace, "image data too large"));
     }
-
     let mut bytes = vec![0; length];
-    // SAFETY: `mapping` owns a live mapping of `mapping.len()` bytes. The
-    // checked source range and newly allocated destination cannot overlap.
-    // The protocol requires the sender to finish writing before sending the
-    // APC command; after this snapshot all decoding uses ordinary Rust-owned
-    // memory.
+    // SAFETY: the mapping owns a live range of `mapping.len()` bytes and the
+    // checked source range cannot overlap the newly allocated destination.
     unsafe {
         std::ptr::copy_nonoverlapping(
             mapping.as_ptr().add(start).cast_const(),
@@ -803,11 +936,41 @@ fn decode_png(data: Vec<u8>, echo: EchoFields) -> Result<DecodedImage, ProtocolE
 }
 
 #[derive(Debug, Clone)]
+struct AnimationFrame {
+    rgba: Arc<Vec<u8>>,
+    gap_ms: u32,
+}
+
+#[derive(Debug, Clone)]
 struct StoredImage {
     rgba: Arc<Vec<u8>>,
     width: u32,
     height: u32,
+    frames: Vec<AnimationFrame>,
+    current_frame: usize,
+    animation_state: AnimationState,
+    max_loops: u32,
+    current_loop: u32,
+    shown_at_ms: Option<u64>,
     lru: u64,
+}
+
+impl StoredImage {
+    fn allocated_bytes(&self) -> usize {
+        self.frames.iter().map(|frame| frame.rgba.len()).sum()
+    }
+
+    fn refresh_current(&mut self) {
+        self.current_frame = self.current_frame.min(self.frames.len().saturating_sub(1));
+        self.rgba = Arc::clone(&self.frames[self.current_frame].rgba);
+    }
+
+    fn animation_duration(&self) -> u64 {
+        self.frames
+            .iter()
+            .map(|frame| u64::from(frame.gap_ms))
+            .sum()
+    }
 }
 
 #[derive(Debug)]
@@ -816,6 +979,16 @@ struct PlacementRecord {
     placement_id: u32,
     z_index: i32,
     allocated_bytes: usize,
+    command: Command,
+}
+
+/// Result of sampling Kitty image animations from a monotonic frontend clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GraphicsAnimationTick {
+    /// At least one visible frame changed and the frontend should redraw.
+    pub changed: bool,
+    /// Absolute monotonic millisecond deadline for the next frame.
+    pub next_wake_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -899,6 +1072,22 @@ impl KittyGraphics {
                 ),
             },
             Action::Delete => self.delete(&command, screen),
+            Action::TransmitFrame => {
+                let frame = command.image.take().expect("decoded animation frame");
+                match self.store_frame(&command, frame, screen) {
+                    Ok(image_id) => queue_success(screen, &command, Some(image_id), false),
+                    Err(error) => queue_error(screen, &error),
+                }
+            }
+            Action::ControlAnimation => {
+                if let Err(error) = self.control_animation(&command, screen) {
+                    queue_error(screen, &error);
+                }
+            }
+            Action::ComposeFrame => match self.compose_frame(&command, screen) {
+                Ok(image_id) => queue_success(screen, &command, Some(image_id), false),
+                Err(error) => queue_error(screen, &error),
+            },
         }
     }
 
@@ -930,17 +1119,283 @@ impl KittyGraphics {
         }
         self.next_lru = self.next_lru.saturating_add(1);
         self.total_bytes += size;
+        let rgba = Arc::new(image.rgba);
         self.images.insert(
             image_id,
             StoredImage {
-                rgba: Arc::new(image.rgba),
+                rgba: Arc::clone(&rgba),
                 width: image.width,
                 height: image.height,
+                frames: vec![AnimationFrame { rgba, gap_ms: 0 }],
+                current_frame: 0,
+                animation_state: AnimationState::Stopped,
+                max_loops: 0,
+                current_loop: 0,
+                shown_at_ms: None,
                 lru: self.next_lru,
             },
         );
         if let Some(number) = command.image_number {
             self.image_numbers.entry(number).or_default().push(image_id);
+        }
+        Ok(image_id)
+    }
+
+    fn store_frame(
+        &mut self,
+        command: &Command,
+        frame_data: DecodedImage,
+        screen: &mut Screen,
+    ) -> Result<u32, ProtocolError> {
+        let image_id = self.resolve_animation_image_id(command)?;
+        let image = self.images.get(&image_id).expect("resolved image exists");
+        let fits = command
+            .source_x
+            .checked_add(frame_data.width)
+            .zip(command.source_y.checked_add(frame_data.height))
+            .is_some_and(|(right, bottom)| right <= image.width && bottom <= image.height);
+        if !fits {
+            return Err(command
+                .echo()
+                .error(ErrorCode::Invalid, "frame data rectangle is out of bounds"));
+        }
+
+        let edit_index = command
+            .frame_number
+            .checked_sub(1)
+            .map(|index| index as usize);
+        if edit_index.is_some_and(|index| index >= image.frames.len()) {
+            return Err(command
+                .echo()
+                .error(ErrorCode::Invalid, "frame to edit does not exist"));
+        }
+        let canvas_bytes = image.rgba.len();
+        if edit_index.is_none() {
+            self.evict_additional_to_fit(canvas_bytes, image_id, screen);
+            if self
+                .total_bytes
+                .saturating_add(self.placement_bytes)
+                .saturating_add(canvas_bytes)
+                > STORE_QUOTA_BYTES
+            {
+                return Err(command.echo().error(
+                    ErrorCode::NoSpace,
+                    "animation frame storage quota exhausted",
+                ));
+            }
+        }
+
+        let image = self.images.get(&image_id).expect("resolved image exists");
+        let mut canvas = if let Some(index) = edit_index {
+            image.frames[index].rgba.as_ref().clone()
+        } else if let Some(index) = command.other_frame_number.checked_sub(1) {
+            image
+                .frames
+                .get(index as usize)
+                .ok_or_else(|| {
+                    command
+                        .echo()
+                        .error(ErrorCode::Invalid, "base frame does not exist")
+                })?
+                .rgba
+                .as_ref()
+                .clone()
+        } else {
+            let color = command.frame_background.to_be_bytes();
+            color
+                .into_iter()
+                .cycle()
+                .take(canvas_bytes)
+                .collect::<Vec<_>>()
+        };
+        composite_rgba_rect(
+            &mut canvas,
+            image.width,
+            &frame_data.rgba,
+            frame_data.width,
+            frame_data.height,
+            command.source_x,
+            command.source_y,
+            command.frame_composition,
+        );
+
+        let mut refresh_placements = false;
+        let image = self
+            .images
+            .get_mut(&image_id)
+            .expect("resolved image exists");
+        if let Some(index) = edit_index {
+            let gap_ms = command
+                .frame_gap
+                .filter(|gap| *gap != 0)
+                .map(normalize_frame_gap)
+                .unwrap_or(image.frames[index].gap_ms);
+            image.frames[index] = AnimationFrame {
+                rgba: Arc::new(canvas),
+                gap_ms,
+            };
+            if index == image.current_frame {
+                image.refresh_current();
+                refresh_placements = true;
+            }
+        } else {
+            let gap_ms = command
+                .frame_gap
+                .filter(|gap| *gap != 0)
+                .map_or(40, normalize_frame_gap);
+            image.frames.push(AnimationFrame {
+                rgba: Arc::new(canvas),
+                gap_ms,
+            });
+            self.total_bytes = self.total_bytes.saturating_add(canvas_bytes);
+        }
+        self.touch_image(image_id);
+        if refresh_placements {
+            self.refresh_placements(image_id, screen);
+        }
+        Ok(image_id)
+    }
+
+    fn control_animation(
+        &mut self,
+        command: &Command,
+        screen: &mut Screen,
+    ) -> Result<(), ProtocolError> {
+        let image_id = self.resolve_animation_image_id(command)?;
+        let image = self
+            .images
+            .get_mut(&image_id)
+            .expect("resolved image exists");
+        if let (Some(gap), Some(index)) = (
+            command.frame_gap.filter(|gap| *gap != 0),
+            command.frame_number.checked_sub(1),
+        ) {
+            if let Some(frame) = image.frames.get_mut(index as usize) {
+                frame.gap_ms = normalize_frame_gap(gap);
+            }
+        }
+        let mut refresh_placements = false;
+        if let Some(index) = command.other_frame_number.checked_sub(1) {
+            if (index as usize) < image.frames.len() && index as usize != image.current_frame {
+                image.current_frame = index as usize;
+                image.shown_at_ms = None;
+                image.refresh_current();
+                refresh_placements = true;
+            }
+        }
+        if let Some(state) = command.animation_state {
+            image.animation_state = state;
+            image.current_loop = 0;
+            image.shown_at_ms = None;
+        }
+        match command.loop_count {
+            Some(0) | None => {}
+            Some(1) => image.max_loops = 0,
+            Some(count) => image.max_loops = count - 1,
+        }
+        self.touch_image(image_id);
+        if refresh_placements {
+            self.refresh_placements(image_id, screen);
+        }
+        Ok(())
+    }
+
+    fn compose_frame(
+        &mut self,
+        command: &Command,
+        screen: &mut Screen,
+    ) -> Result<u32, ProtocolError> {
+        let image_id = self.resolve_animation_image_id(command)?;
+        let source_index = command.frame_number.checked_sub(1).ok_or_else(|| {
+            command
+                .echo()
+                .error(ErrorCode::NotFound, "source frame does not exist")
+        })? as usize;
+        let destination_index = command.other_frame_number.checked_sub(1).ok_or_else(|| {
+            command
+                .echo()
+                .error(ErrorCode::NotFound, "destination frame does not exist")
+        })? as usize;
+        let image = self.images.get(&image_id).expect("resolved image exists");
+        if source_index >= image.frames.len() || destination_index >= image.frames.len() {
+            return Err(command
+                .echo()
+                .error(ErrorCode::NotFound, "animation frame does not exist"));
+        }
+        let width = if command.source_w == 0 {
+            image.width
+        } else {
+            command.source_w
+        };
+        let height = if command.source_h == 0 {
+            image.height
+        } else {
+            command.source_h
+        };
+        let source_fits = rect_fits(
+            command.frame_source_x,
+            command.frame_source_y,
+            width,
+            height,
+            image.width,
+            image.height,
+        );
+        let destination_fits = rect_fits(
+            command.source_x,
+            command.source_y,
+            width,
+            height,
+            image.width,
+            image.height,
+        );
+        if !source_fits || !destination_fits || width == 0 || height == 0 {
+            return Err(command
+                .echo()
+                .error(ErrorCode::Invalid, "composition rectangle is out of bounds"));
+        }
+        if source_index == destination_index
+            && rectangles_overlap(
+                command.frame_source_x,
+                command.frame_source_y,
+                command.source_x,
+                command.source_y,
+                width,
+                height,
+            )
+        {
+            return Err(command.echo().error(
+                ErrorCode::Invalid,
+                "overlapping composition rectangles use the same frame",
+            ));
+        }
+
+        let source = Arc::clone(&image.frames[source_index].rgba);
+        let mut destination = image.frames[destination_index].rgba.as_ref().clone();
+        composite_rgba_region(
+            &mut destination,
+            image.width,
+            &source,
+            image.width,
+            command.frame_source_x,
+            command.frame_source_y,
+            command.source_x,
+            command.source_y,
+            width,
+            height,
+            command.frame_composition,
+        );
+        let image = self
+            .images
+            .get_mut(&image_id)
+            .expect("resolved image exists");
+        image.frames[destination_index].rgba = Arc::new(destination);
+        let refresh_placements = destination_index == image.current_frame;
+        if refresh_placements {
+            image.refresh_current();
+        }
+        self.touch_image(image_id);
+        if refresh_placements {
+            self.refresh_placements(image_id, screen);
         }
         Ok(image_id)
     }
@@ -952,6 +1407,140 @@ impl KittyGraphics {
             if !self.images.contains_key(&candidate) {
                 return candidate;
             }
+        }
+    }
+
+    fn resolve_animation_image_id(&self, command: &Command) -> Result<u32, ProtocolError> {
+        let image_id = command
+            .image_id
+            .filter(|id| *id != 0)
+            .or_else(|| {
+                command
+                    .image_number
+                    .and_then(|number| self.image_numbers.get(&number)?.last().copied())
+            })
+            .filter(|id| self.images.contains_key(id));
+        image_id.ok_or_else(|| {
+            command
+                .echo()
+                .error(ErrorCode::NotFound, "animation image not found")
+        })
+    }
+
+    fn touch_image(&mut self, image_id: u32) {
+        self.next_lru = self.next_lru.saturating_add(1);
+        if let Some(image) = self.images.get_mut(&image_id) {
+            image.lru = self.next_lru;
+        }
+    }
+
+    fn refresh_placements(&mut self, image_id: u32, screen: &mut Screen) {
+        let Some(image) = self.images.get(&image_id).cloned() else {
+            return;
+        };
+        let placements: Vec<(u64, Command)> = self
+            .placements
+            .iter()
+            .filter(|(_, placement)| placement.image_id == image_id)
+            .map(|(screen_id, placement)| (*screen_id, placement.command.clone()))
+            .collect();
+        for (screen_id, command) in placements {
+            let Ok(prepared) = prepare_placement(&image, &command, screen) else {
+                continue;
+            };
+            let allocated_bytes = if Arc::ptr_eq(&prepared.pixels, &image.rgba) {
+                0
+            } else {
+                prepared.pixels.len()
+            };
+            if screen.update_rgba_image(
+                screen_id,
+                DecodedRgbaImage {
+                    data: prepared.pixels,
+                    width: prepared.pixel_width,
+                    height: prepared.pixel_height,
+                    z_index: command.z_index,
+                    protocol_image_id: image_id,
+                    clear_cells: false,
+                },
+            ) {
+                if let Some(placement) = self.placements.get_mut(&screen_id) {
+                    self.placement_bytes = self
+                        .placement_bytes
+                        .saturating_sub(placement.allocated_bytes)
+                        .saturating_add(allocated_bytes);
+                    placement.allocated_bytes = allocated_bytes;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn advance_animations(
+        &mut self,
+        now_ms: u64,
+        screen: &mut Screen,
+    ) -> GraphicsAnimationTick {
+        let mut changed_images = Vec::new();
+        let mut next_wake_ms: Option<u64> = None;
+        for (image_id, image) in &mut self.images {
+            if image.animation_state == AnimationState::Stopped
+                || image.frames.len() < 2
+                || image.animation_duration() == 0
+            {
+                continue;
+            }
+            let shown_at = *image.shown_at_ms.get_or_insert(now_ms);
+            let due = shown_at.saturating_add(u64::from(image.frames[image.current_frame].gap_ms));
+            if now_ms < due {
+                next_wake_ms = Some(next_wake_ms.map_or(due, |next| next.min(due)));
+                continue;
+            }
+
+            let mut advanced = false;
+            let mut inspected = 0usize;
+            while inspected < image.frames.len() {
+                inspected += 1;
+                if image.current_frame + 1 == image.frames.len() {
+                    if image.animation_state == AnimationState::Loading {
+                        break;
+                    }
+                    if image.max_loops != 0 {
+                        image.current_loop = image.current_loop.saturating_add(1);
+                        if image.current_loop >= image.max_loops {
+                            image.animation_state = AnimationState::Stopped;
+                            image.shown_at_ms = None;
+                            break;
+                        }
+                    }
+                    image.current_frame = 0;
+                } else {
+                    image.current_frame += 1;
+                }
+                advanced = true;
+                if image.frames[image.current_frame].gap_ms != 0 {
+                    break;
+                }
+            }
+            if advanced {
+                image.refresh_current();
+                image.shown_at_ms = Some(now_ms);
+                changed_images.push(*image_id);
+            }
+            if image.animation_state != AnimationState::Stopped
+                && !(image.animation_state == AnimationState::Loading
+                    && image.current_frame + 1 == image.frames.len())
+            {
+                let next =
+                    now_ms.saturating_add(u64::from(image.frames[image.current_frame].gap_ms));
+                next_wake_ms = Some(next_wake_ms.map_or(next, |deadline| deadline.min(next)));
+            }
+        }
+        for image_id in &changed_images {
+            self.refresh_placements(*image_id, screen);
+        }
+        GraphicsAnimationTick {
+            changed: !changed_images.is_empty(),
+            next_wake_ms,
         }
     }
 
@@ -1029,6 +1618,7 @@ impl KittyGraphics {
                 placement_id,
                 z_index: command.z_index,
                 allocated_bytes,
+                command: command.clone(),
             },
         );
         self.next_lru = self.next_lru.saturating_add(1);
@@ -1153,7 +1743,7 @@ impl KittyGraphics {
     fn remove_image_data(&mut self, image_id: u32, screen: &mut Screen) {
         self.remove_placements_for_image(image_id, screen);
         if let Some(image) = self.images.remove(&image_id) {
-            self.total_bytes = self.total_bytes.saturating_sub(image.rgba.len());
+            self.total_bytes = self.total_bytes.saturating_sub(image.allocated_bytes());
         }
         for ids in self.image_numbers.values_mut() {
             ids.retain(|id| *id != image_id);
@@ -1192,7 +1782,7 @@ impl KittyGraphics {
         let reclaimed = replacement_id.map_or(0, |image_id| {
             self.images
                 .get(&image_id)
-                .map_or(0, |image| image.rgba.len())
+                .map_or(0, StoredImage::allocated_bytes)
                 .saturating_add(self.placement_bytes_for_image(image_id))
         });
         self.total_bytes
@@ -1216,6 +1806,32 @@ impl KittyGraphics {
             self.remove_image_data(image_id, screen);
         }
     }
+
+    fn evict_additional_to_fit(
+        &mut self,
+        incoming: usize,
+        protected_image_id: u32,
+        screen: &mut Screen,
+    ) {
+        self.sync_placements(screen);
+        while self
+            .total_bytes
+            .saturating_add(self.placement_bytes)
+            .saturating_add(incoming)
+            > STORE_QUOTA_BYTES
+        {
+            let Some(image_id) = self
+                .images
+                .iter()
+                .filter(|(id, _)| **id != protected_image_id && !self.image_has_placements(**id))
+                .min_by_key(|(_, image)| image.lru)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.remove_image_data(image_id, screen);
+        }
+    }
 }
 
 struct PreparedPlacement {
@@ -1224,6 +1840,107 @@ struct PreparedPlacement {
     pixel_height: usize,
     cell_width: usize,
     cell_height: usize,
+}
+
+fn normalize_frame_gap(gap: i32) -> u32 {
+    u32::try_from(gap).unwrap_or(0)
+}
+
+fn rect_fits(
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> bool {
+    x.checked_add(width)
+        .is_some_and(|right| right <= canvas_width)
+        && y.checked_add(height)
+            .is_some_and(|bottom| bottom <= canvas_height)
+}
+
+fn rectangles_overlap(
+    source_x: u32,
+    source_y: u32,
+    destination_x: u32,
+    destination_y: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    source_x < destination_x.saturating_add(width)
+        && source_x.saturating_add(width) > destination_x
+        && source_y < destination_y.saturating_add(height)
+        && source_y.saturating_add(height) > destination_y
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_rgba_rect(
+    destination: &mut [u8],
+    destination_width: u32,
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    destination_x: u32,
+    destination_y: u32,
+    mode: FrameComposition,
+) {
+    composite_rgba_region(
+        destination,
+        destination_width,
+        source,
+        source_width,
+        0,
+        0,
+        destination_x,
+        destination_y,
+        source_width,
+        source_height,
+        mode,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_rgba_region(
+    destination: &mut [u8],
+    canvas_width: u32,
+    source: &[u8],
+    source_stride: u32,
+    source_x: u32,
+    source_y: u32,
+    destination_x: u32,
+    destination_y: u32,
+    width: u32,
+    height: u32,
+    mode: FrameComposition,
+) {
+    let destination_stride = canvas_width as usize;
+    let source_stride = source_stride as usize;
+    for row in 0..height as usize {
+        for column in 0..width as usize {
+            let source_pixel =
+                ((source_y as usize + row) * source_stride + source_x as usize + column) * 4;
+            let destination_pixel = ((destination_y as usize + row) * destination_stride
+                + destination_x as usize
+                + column)
+                * 4;
+            let source_rgba: [u8; 4] = source[source_pixel..source_pixel + 4]
+                .try_into()
+                .expect("validated source rectangle");
+            if mode == FrameComposition::Overwrite {
+                destination[destination_pixel..destination_pixel + 4].copy_from_slice(&source_rgba);
+            } else {
+                let mut destination_rgba = Rgba(
+                    destination[destination_pixel..destination_pixel + 4]
+                        .try_into()
+                        .expect("validated destination rectangle"),
+                );
+                destination_rgba.blend(&Rgba(source_rgba));
+                destination[destination_pixel..destination_pixel + 4]
+                    .copy_from_slice(&destination_rgba.0);
+            }
+        }
+    }
 }
 
 fn prepare_placement(
@@ -1447,7 +2164,52 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::{Builder, NamedTempFile};
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    fn create_test_shared_memory(bytes: &[u8]) -> (String, std::fs::File) {
+        static NEXT_NAME: AtomicU64 = AtomicU64::new(1);
+        let name = format!(
+            "/cterm-kitty-{}-{}",
+            std::process::id(),
+            NEXT_NAME.fetch_add(1, Ordering::Relaxed)
+        );
+        let descriptor = nix::sys::mman::shm_open(
+            name.as_str(),
+            nix::fcntl::OFlag::O_CREAT | nix::fcntl::OFlag::O_EXCL | nix::fcntl::OFlag::O_RDWR,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        nix::unistd::ftruncate(&descriptor, bytes.len() as i64).unwrap();
+        let mut file = std::fs::File::from(descriptor);
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        (name, file)
+    }
+
+    #[cfg(windows)]
+    fn create_test_shared_memory(bytes: &[u8]) -> (String, shared_memory::Shmem) {
+        let mut mapping = shared_memory::ShmemConf::new()
+            .size(bytes.len())
+            .create()
+            .unwrap();
+        let name = mapping.get_os_id().to_owned();
+        // SAFETY: this helper created and exclusively owns the mapping.
+        unsafe { mapping.as_slice_mut().copy_from_slice(bytes) };
+        (name, mapping)
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+    fn test_shared_memory_exists(name: &str) -> bool {
+        nix::sys::mman::shm_open(
+            name,
+            nix::fcntl::OFlag::O_RDONLY,
+            nix::sys::stat::Mode::empty(),
+        )
+        .is_ok()
+    }
 
     fn sequence(control: &str, payload: &[u8]) -> Vec<u8> {
         format!("\x1b_G{control};{}\x1b\\", STANDARD.encode(payload)).into_bytes()
@@ -1566,15 +2328,7 @@ mod tests {
     fn shared_memory_transfer_obeys_range_and_cleanup_semantics() {
         let mut graphics = KittyGraphics::default();
         let mut screen = Screen::new(10, 5, ScreenConfig::default());
-        let mut mapping = shared_memory::ShmemConf::new().size(7).create().unwrap();
-        let name = mapping.get_os_id().to_owned();
-        // SAFETY: this test created and exclusively owns the mapping, and the
-        // terminal is not asked to open it until after the write completes.
-        unsafe {
-            mapping
-                .as_slice_mut()
-                .copy_from_slice(&[99, 98, 1, 2, 3, 4, 97]);
-        }
+        let (name, _mapping) = create_test_shared_memory(&[99, 98, 1, 2, 3, 4, 97]);
 
         feed(
             &mut graphics,
@@ -1587,22 +2341,24 @@ mod tests {
             screen.take_pending_responses(),
             vec![b"\x1b_Gi=14;OK\x1b\\".to_vec()]
         );
-        #[cfg(unix)]
-        assert!(shared_memory::ShmemConf::new().os_id(name).open().is_err());
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
+        assert!(!test_shared_memory_exists(&name));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))]
     #[test]
     fn shared_memory_errors_still_unlink_the_posix_object() {
         let mut graphics = KittyGraphics::default();
         let mut screen = Screen::new(10, 5, ScreenConfig::default());
-        let mapping = shared_memory::ShmemConf::new().size(4).create().unwrap();
-        let name = mapping.get_os_id().to_owned();
+        let (name, _mapping) = create_test_shared_memory(&[1, 2, 3, 4]);
 
         feed(
             &mut graphics,
             &mut screen,
-            &sequence("a=T,t=s,f=32,s=1,v=1,O=5,i=15,C=1", name.as_bytes()),
+            &sequence(
+                "a=T,t=s,f=32,s=1,v=1,O=4294967295,i=15,C=1",
+                name.as_bytes(),
+            ),
         );
 
         assert!(screen.images().is_empty());
@@ -1610,7 +2366,7 @@ mod tests {
             screen.take_pending_responses(),
             vec![b"\x1b_Gi=15;EBADF:shared memory offset is out of range\x1b\\".to_vec()]
         );
-        assert!(shared_memory::ShmemConf::new().os_id(name).open().is_err());
+        assert!(!test_shared_memory_exists(&name));
     }
 
     #[test]
@@ -1698,6 +2454,181 @@ mod tests {
         feed(&mut graphics, &mut screen, b"\x1b_Ga=p,i=9,p=4,C=1\x1b\\");
         assert_eq!(screen.images().len(), 1);
         assert_eq!(screen.take_pending_responses().len(), 2);
+    }
+
+    #[test]
+    fn animation_frame_uses_contextual_fields_and_preserves_existing_placement() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        let root = [10, 20, 30, 255, 40, 50, 60, 255];
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=2,v=1,i=71,C=1", &root),
+        );
+
+        // The action deliberately follows z=: parsing must still interpret z
+        // as a frame gap, X as overwrite, and Y as an RGBA background.
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence(
+                "z=75,a=f,i=71,f=32,s=1,v=1,x=1,y=0,X=1,Y=4278190335",
+                &[1, 2, 3, 255],
+            ),
+        );
+        let image = graphics.images.get(&71).unwrap();
+        assert_eq!(image.frames.len(), 2);
+        assert_eq!(image.frames[1].gap_ms, 75);
+        assert_eq!(
+            image.frames[1].rgba.as_slice(),
+            [255, 0, 0, 255, 1, 2, 3, 255]
+        );
+        assert_eq!(image.animation_state, AnimationState::Stopped);
+        let second_frame = Arc::clone(&image.frames[1].rgba);
+
+        // Client-driven frame selection updates the existing screen placement,
+        // rather than creating a second image or requiring renderer knowledge.
+        feed(&mut graphics, &mut screen, b"\x1b_Ga=a,i=71,c=2\x1b\\");
+        assert_eq!(screen.images().len(), 1);
+        assert_eq!(screen.images()[0].data.as_slice(), second_frame.as_slice());
+        assert_eq!(screen.take_pending_responses().len(), 2);
+    }
+
+    #[test]
+    fn frame_edit_and_composition_follow_kitty_r_c_and_offset_semantics() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=2,v=1,i=72", &[10, 20, 30, 255, 40, 50, 60, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=f,i=72,f=32,s=2,v=1,X=1", &[1, 2, 3, 255, 4, 5, 6, 255]),
+        );
+
+        // r= is the source frame, c= the destination; X/Y are source
+        // offsets, x/y destination offsets, and C=1 means overwrite.
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=c,i=72,r=2,c=1,X=1,Y=0,x=0,y=0,w=1,h=1,C=1\x1b\\",
+        );
+        assert_eq!(
+            graphics.images[&72].frames[0].rgba.as_slice(),
+            [4, 5, 6, 255, 40, 50, 60, 255]
+        );
+
+        // r=2 edits frame 2 on its own canvas; z=0 is ignored and retains
+        // the existing default 40ms gap.
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=f,i=72,r=2,f=32,s=1,v=1,x=1,X=1,z=0", &[9, 8, 7, 255]),
+        );
+        let edited = &graphics.images[&72].frames[1];
+        assert_eq!(edited.rgba.as_slice(), [1, 2, 3, 255, 9, 8, 7, 255]);
+        assert_eq!(edited.gap_ms, 40);
+    }
+
+    #[test]
+    fn composition_rejects_missing_frames_bounds_and_same_frame_overlap() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=t,f=32,s=1,v=1,i=73", &[1, 2, 3, 255]),
+        );
+        screen.take_pending_responses();
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=c,i=73,r=2,c=1,w=1,h=1\x1b\\",
+        );
+        assert!(
+            String::from_utf8(screen.take_pending_responses()[0].clone())
+                .unwrap()
+                .contains("ENOENT")
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=c,i=73,r=1,c=1,w=1,h=1\x1b\\",
+        );
+        assert!(
+            String::from_utf8(screen.take_pending_responses()[0].clone())
+                .unwrap()
+                .contains("EINVAL")
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=c,i=73,r=1,c=1,x=4294967295,w=1,h=1\x1b\\",
+        );
+        assert!(
+            String::from_utf8(screen.take_pending_responses()[0].clone())
+                .unwrap()
+                .contains("EINVAL")
+        );
+    }
+
+    #[test]
+    fn terminal_driven_animation_honors_gaps_loading_and_loop_limits() {
+        let mut graphics = KittyGraphics::default();
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=T,f=32,s=1,v=1,i=74,C=1", &[10, 20, 30, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            &sequence("a=f,i=74,f=32,s=1,v=1,X=1,z=40", &[1, 2, 3, 255]),
+        );
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=a,i=74,r=1,z=10,s=3,v=2\x1b\\",
+        );
+
+        assert_eq!(
+            graphics.advance_animations(0, &mut screen).next_wake_ms,
+            Some(10)
+        );
+        let second = graphics.advance_animations(10, &mut screen);
+        assert!(second.changed);
+        assert_eq!(second.next_wake_ms, Some(50));
+        assert_eq!(screen.images()[0].data.as_slice(), [1, 2, 3, 255]);
+        let stopped = graphics.advance_animations(50, &mut screen);
+        assert!(!stopped.changed);
+        assert_eq!(stopped.next_wake_ms, None);
+        assert_eq!(
+            graphics.images[&74].animation_state,
+            AnimationState::Stopped
+        );
+
+        feed(
+            &mut graphics,
+            &mut screen,
+            b"\x1b_Ga=a,i=74,c=2,s=2,v=1\x1b\\",
+        );
+        let waiting = graphics.advance_animations(100, &mut screen);
+        assert!(!waiting.changed);
+        assert_eq!(waiting.next_wake_ms, Some(140));
+        assert_eq!(
+            graphics.advance_animations(140, &mut screen).next_wake_ms,
+            None
+        );
+        assert_eq!(
+            graphics.images[&74].animation_state,
+            AnimationState::Loading
+        );
     }
 
     #[test]

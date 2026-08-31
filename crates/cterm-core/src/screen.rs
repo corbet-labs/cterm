@@ -2960,6 +2960,20 @@ impl Screen {
         removed
     }
 
+    /// Replace only the decoded pixels for an existing protocol placement.
+    pub(crate) fn update_rgba_image(&mut self, id: u64, pixels: DecodedRgbaImage) -> bool {
+        let Some(image) = self.images.get_mut(&id) else {
+            return false;
+        };
+        image.data = pixels.data;
+        image.pixel_width = pixels.width;
+        image.pixel_height = pixels.height;
+        image.z_index = pixels.z_index;
+        image.protocol_image_id = pixels.protocol_image_id;
+        self.dirty = true;
+        true
+    }
+
     /// Set the cell height hint (call from UI layer when font metrics are known)
     pub fn set_cell_height_hint(&mut self, height: f64) {
         self.cell_height_hint = height;

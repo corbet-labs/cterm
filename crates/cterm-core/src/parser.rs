@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use vte::Params;
 
 use crate::cell::{CellAttrs, Hyperlink};
@@ -16,7 +17,9 @@ use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
-use crate::kitty_graphics::{InterceptorResult as KittyInterceptorResult, KittyGraphics};
+use crate::kitty_graphics::{
+    GraphicsAnimationTick, InterceptorResult as KittyInterceptorResult, KittyGraphics,
+};
 use crate::osc1337::{InterceptorResult, Osc1337Interceptor};
 #[cfg(test)]
 use crate::screen::DesktopNotificationAction;
@@ -193,6 +196,16 @@ impl Parser {
                 }
             }
         }
+    }
+
+    /// Sample terminal-driven Kitty animations from a monotonic clock.
+    pub fn advance_graphics_animations(
+        &mut self,
+        screen: &mut Screen,
+        now: Duration,
+    ) -> GraphicsAnimationTick {
+        let now_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+        self.kitty_graphics.advance_animations(now_ms, screen)
     }
 
     fn advance_after_osc1337(&mut self, screen: &mut Screen, bytes: &[u8]) {

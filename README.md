@@ -475,8 +475,11 @@ delete selectors. Signed z-ordering is shared by Cocoa, GTK, and Direct2D,
 including Kitty's below-background and below-text layers; image identifiers and
 z-indices also survive daemon snapshots. POSIX and Windows named shared-memory
 transport supports bounded size/offset reads and protocol-required cleanup.
-Animation and Unicode placeholders remain staged follow-up work rather than
-silently advertised capabilities.
+Animation frame loading, partial-frame edits, alpha/overwrite composition,
+client-driven frame selection, and terminal-driven loading/loop playback share
+one quota-aware Rust frame store and the existing native event-loop clocks.
+Unicode placeholders remain staged follow-up work rather than silently
+advertised capabilities.
 
 Test with:
 ```bash
