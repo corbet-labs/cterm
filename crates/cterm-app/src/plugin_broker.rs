@@ -198,6 +198,15 @@ impl PluginBroker {
                         .expect("a canonical executable always has a parent"),
                 )
                 .env_clear()
+                // Production HostCommand values keep this empty. Windows unit
+                // tests add only SystemRoot because Windows PowerShell 5.1
+                // cannot initialize its managed runtime without it.
+                .envs(
+                    self.host
+                        .required_environment
+                        .iter()
+                        .map(|(key, value)| (key, value)),
+                )
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -292,6 +301,7 @@ impl PluginBroker {
 struct HostCommand {
     executable: PathBuf,
     prefix_arguments: Vec<OsString>,
+    required_environment: Vec<(OsString, OsString)>,
 }
 
 impl HostCommand {
@@ -299,6 +309,7 @@ impl HostCommand {
         Self {
             executable,
             prefix_arguments: Vec::new(),
+            required_environment: Vec::new(),
         }
     }
 }
@@ -600,8 +611,9 @@ allow = ["cterm:new-tab"]
 
     #[cfg(windows)]
     fn scripted_host(script: impl Into<OsString>) -> HostCommand {
-        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
-        let powershell = system_root
+        let system_root = std::env::var_os("SystemRoot").unwrap();
+        let system_root_path = PathBuf::from(&system_root);
+        let powershell = system_root_path
             .join("System32")
             .join("WindowsPowerShell")
             .join("v1.0")
@@ -614,6 +626,7 @@ allow = ["cterm:new-tab"]
             "-Command".into(),
             script.into(),
         ];
+        host.required_environment = vec![("SystemRoot".into(), system_root)];
         host
     }
 
