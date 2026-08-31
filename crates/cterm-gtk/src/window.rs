@@ -286,6 +286,7 @@ fn show_upgrade_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::D
 }
 
 fn show_plugin_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::Display) {
+    log::error!("Plugin command failed: {error}");
     let dialog = gtk4::MessageDialog::new(
         Some(window),
         gtk4::DialogFlags::MODAL,
@@ -298,6 +299,7 @@ fn show_plugin_error_dialog(window: &ApplicationWindow, error: &dyn std::fmt::Di
 }
 
 fn run_plugin_invocation(window: &ApplicationWindow, invocation: PluginInvocation) {
+    log::debug!("Starting isolated plugin invocation");
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(invocation.execute_blocking());
@@ -1875,17 +1877,22 @@ impl CtermWindow {
                         let pending_for_response = Rc::clone(&pending);
                         let window_for_response = window_clone.clone();
                         dialog.connect_response(move |dialog, response| {
-                            dialog.close();
+                            log::debug!("Native plugin approval response: {response:?}");
                             let Some((mut runtime, prompt)) =
                                 pending_for_response.borrow_mut().take()
                             else {
                                 return;
                             };
+                            // Closing emits a nested DeleteEvent response on GTK.
+                            // Consume the pending approval first so that nested
+                            // response cannot discard the user's Yes decision.
+                            dialog.close();
                             if response != gtk4::ResponseType::Yes {
                                 return;
                             }
                             match runtime.approve(prompt) {
                                 Ok(invocation) => {
+                                    log::debug!("Persisted plugin grant after native approval");
                                     run_plugin_invocation(&window_for_response, invocation);
                                 }
                                 Err(error) => {
@@ -2622,8 +2629,11 @@ impl CtermWindow {
                     *step.borrow_mut() = PaneCiStep::WaitPluginPrompt;
                 }
                 PaneCiStep::WaitPluginPrompt => {
-                    let Some(dialog) = application
-                        .windows()
+                    // Transient dialogs are GTK toplevels, but unlike the main
+                    // ApplicationWindow they are not necessarily registered in
+                    // Application::windows(). Inspect all GTK toplevels so this
+                    // exercises the real native approval dialog.
+                    let Some(dialog) = gtk4::Window::list_toplevels()
                         .into_iter()
                         .find_map(|candidate| candidate.downcast::<gtk4::MessageDialog>().ok())
                     else {
