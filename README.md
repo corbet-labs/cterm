@@ -106,6 +106,15 @@ uses Chocolatey).
 
 #### Build
 
+With Nix, the repository's pinned development shell supplies Rust, `protoc`,
+and the native Linux UI dependencies:
+
+```bash
+nix develop
+```
+
+Otherwise, install the platform prerequisites above, then build normally:
+
 ```bash
 # Development build
 cargo build
