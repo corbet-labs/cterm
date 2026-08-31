@@ -325,8 +325,9 @@ impl Updater {
 
     /// Extract a Linux client release and return the actual UI binary.
     ///
-    /// The daemon remains next to the UI binary so the relaunched process can
-    /// resolve the matching release daemon before consulting `PATH`.
+    /// The daemon and isolated plugin host remain next to the UI binary so the
+    /// relaunched process can resolve matching release components before
+    /// consulting `PATH`.
     #[cfg(target_os = "linux")]
     pub fn prepare_linux_update(archive_path: &Path) -> Result<PathBuf, UpdateError> {
         let asset_name = Self::client_asset_name()?;
@@ -347,14 +348,16 @@ impl Updater {
         let bundle_dir = extracted_dir.join(bundle_name);
         let cterm = bundle_dir.join("cterm");
         let ctermd = bundle_dir.join("ctermd");
+        let plugin_host = bundle_dir.join("cterm-plugin-host");
 
         Self::require_regular_file(&cterm, "cterm")?;
         Self::require_regular_file(&ctermd, "ctermd")?;
+        Self::require_regular_file(&plugin_host, "cterm-plugin-host")?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for binary in [&cterm, &ctermd] {
+            for binary in [&cterm, &ctermd, &plugin_host] {
                 let mut permissions = std::fs::metadata(binary)?.permissions();
                 permissions.set_mode(permissions.mode() | 0o700);
                 std::fs::set_permissions(binary, permissions)?;
@@ -690,17 +693,39 @@ mod tests {
         assert!(!result);
     }
 
-    fn write_linux_update_archive(path: &Path, include_daemon: bool) {
+    #[derive(Clone, Copy)]
+    enum PluginHostArchiveEntry {
+        Regular,
+        Missing,
+        Directory,
+    }
+
+    fn write_linux_update_archive(
+        path: &Path,
+        include_daemon: bool,
+        plugin_host: PluginHostArchiveEntry,
+    ) {
         use flate2::write::GzEncoder;
         use flate2::Compression;
-        use tar::{Builder, Header};
+        use tar::{Builder, EntryType, Header};
 
         fn append(builder: &mut Builder<GzEncoder<std::fs::File>>, path: &str, contents: &[u8]) {
             let mut header = Header::new_gnu();
-            header.set_mode(0o755);
+            header.set_mode(0o600);
             header.set_size(contents.len() as u64);
             header.set_cksum();
             builder.append_data(&mut header, path, contents).unwrap();
+        }
+
+        fn append_directory(builder: &mut Builder<GzEncoder<std::fs::File>>, path: &str) {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Directory);
+            header.set_mode(0o755);
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, std::io::empty())
+                .unwrap();
         }
 
         let file = std::fs::File::create(path).unwrap();
@@ -710,15 +735,26 @@ mod tests {
         if include_daemon {
             append(&mut builder, "cterm-linux-x86_64/ctermd", b"daemon binary");
         }
+        match plugin_host {
+            PluginHostArchiveEntry::Regular => append(
+                &mut builder,
+                "cterm-linux-x86_64/cterm-plugin-host",
+                b"plugin host binary",
+            ),
+            PluginHostArchiveEntry::Missing => {}
+            PluginHostArchiveEntry::Directory => {
+                append_directory(&mut builder, "cterm-linux-x86_64/cterm-plugin-host")
+            }
+        }
         let encoder = builder.into_inner().unwrap();
         encoder.finish().unwrap();
     }
 
     #[test]
-    fn linux_update_preparation_returns_client_with_daemon_beside_it() {
+    fn linux_update_preparation_returns_all_release_binaries_with_executable_permissions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let archive = temp_dir.path().join("cterm-linux-x86_64.tar.gz");
-        write_linux_update_archive(&archive, true);
+        write_linux_update_archive(&archive, true, PluginHostArchiveEntry::Regular);
 
         let binary =
             Updater::prepare_linux_update_for_asset(&archive, "cterm-linux-x86_64.tar.gz").unwrap();
@@ -727,22 +763,24 @@ mod tests {
             std::fs::read(binary.with_file_name("ctermd")).unwrap(),
             b"daemon binary"
         );
+        assert_eq!(
+            std::fs::read(binary.with_file_name("cterm-plugin-host")).unwrap(),
+            b"plugin host binary"
+        );
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_ne!(
-                std::fs::metadata(&binary).unwrap().permissions().mode() & 0o100,
-                0
-            );
-            assert_ne!(
-                std::fs::metadata(binary.with_file_name("ctermd"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o100,
-                0
-            );
+            for path in [
+                binary.clone(),
+                binary.with_file_name("ctermd"),
+                binary.with_file_name("cterm-plugin-host"),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o700,
+                    0o700
+                );
+            }
         }
     }
 
@@ -750,10 +788,34 @@ mod tests {
     fn linux_update_preparation_rejects_archive_without_daemon() {
         let temp_dir = tempfile::tempdir().unwrap();
         let archive = temp_dir.path().join("cterm-linux-x86_64.tar.gz");
-        write_linux_update_archive(&archive, false);
+        write_linux_update_archive(&archive, false, PluginHostArchiveEntry::Regular);
 
         let error = Updater::prepare_linux_update_for_asset(&archive, "cterm-linux-x86_64.tar.gz")
             .unwrap_err();
         assert!(error.to_string().contains("ctermd missing"));
+    }
+
+    #[test]
+    fn linux_update_preparation_rejects_archive_without_plugin_host() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let archive = temp_dir.path().join("cterm-linux-x86_64.tar.gz");
+        write_linux_update_archive(&archive, true, PluginHostArchiveEntry::Missing);
+
+        let error = Updater::prepare_linux_update_for_asset(&archive, "cterm-linux-x86_64.tar.gz")
+            .unwrap_err();
+        assert!(error.to_string().contains("cterm-plugin-host missing"));
+    }
+
+    #[test]
+    fn linux_update_preparation_rejects_non_regular_plugin_host() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let archive = temp_dir.path().join("cterm-linux-x86_64.tar.gz");
+        write_linux_update_archive(&archive, true, PluginHostArchiveEntry::Directory);
+
+        let error = Updater::prepare_linux_update_for_asset(&archive, "cterm-linux-x86_64.tar.gz")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cterm-plugin-host in update archive is not a regular file"));
     }
 }
