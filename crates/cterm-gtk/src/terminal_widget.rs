@@ -27,6 +27,9 @@ use cterm_ui::blink::{
 };
 use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::sprite::{Sprite, SpriteCache};
+use cterm_ui::text_sizing::{
+    is_multicell_render_anchor, multicell_is_selected, multicell_render_metrics,
+};
 use cterm_ui::theme::Theme;
 
 use crate::keyboard::{
@@ -2288,6 +2291,7 @@ fn draw_terminal(
     let scroll_offset = screen.scroll_offset;
     let rows = grid.height();
     let cols = grid.width();
+    let visible_top = screen.visible_row_to_absolute_line(0);
 
     draw_terminal_images(
         cr,
@@ -2309,7 +2313,7 @@ fn draw_terminal(
         }
 
         for row_idx in 0..rows {
-            let y = row_idx as f64 * cell_height;
+            let cell_y = row_idx as f64 * cell_height;
             let absolute_line = screen.visible_row_to_absolute_line(row_idx);
 
             for col_idx in 0..cols {
@@ -2319,33 +2323,50 @@ fn draw_terminal(
                 } else {
                     continue;
                 };
-                let x = col_idx as f64 * cell_width;
+                let cell_x = col_idx as f64 * cell_width;
                 let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
 
-                // Skip wide char spacers
-                if cell.attrs.contains(CellAttrs::WIDE_SPACER) || cell.is_multicell_spacer() {
+                if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
                     continue;
                 }
+                let multicell = cell.multicell.as_ref();
+                if multicell.is_some_and(|multicell| {
+                    !is_multicell_render_anchor(multicell, absolute_line, visible_top)
+                }) {
+                    continue;
+                }
+                let metrics = multicell.map(multicell_render_metrics);
+                let x = cell_x;
+                let y = metrics.map_or(cell_y, |_| {
+                    cell_y
+                        - cell_height
+                            * f64::from(multicell.expect("metrics require metadata").row_offset)
+                });
+                let text_x =
+                    x + metrics.map_or(0.0, |metrics| metrics.horizontal_offset * cell_width);
+                let text_y =
+                    y + metrics.map_or(0.0, |metrics| metrics.vertical_offset * cell_height);
+                let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
 
                 // Check if this cell is selected
-                let span_columns = cell
-                    .multicell
-                    .as_ref()
-                    .map_or(1, |multicell| usize::from(multicell.columns));
-                let is_selected = (col_idx..col_idx.saturating_add(span_columns).min(cols))
-                    .any(|col| screen.is_selected(absolute_line, col));
+                let is_selected = multicell.map_or_else(
+                    || screen.is_selected(absolute_line, col_idx),
+                    |multicell| multicell_is_selected(screen, absolute_line, col_idx, multicell),
+                );
 
                 // Determine if cell has INVERSE attribute (XOR with selection)
                 let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
                     ^ is_selected
                     ^ screen.modes.reverse_video;
-                let char_width = if let Some(multicell) = cell.multicell.as_ref() {
+                let char_width = if let Some(multicell) = multicell {
                     cell_width * f64::from(multicell.columns)
                 } else if cell.attrs.contains(CellAttrs::WIDE) {
                     cell_width * 2.0
                 } else {
                     cell_width
                 };
+                let char_height =
+                    metrics.map_or(cell_height, |metrics| cell_height * metrics.rows as f64);
 
                 let fg_color = if is_inverted {
                     if cell.bg == Color::Default {
@@ -2389,21 +2410,23 @@ fn draw_terminal(
                     let (r, g, b) = bg_color.to_f64();
                     cr.set_source_rgb(r, g, b);
 
-                    cr.rectangle(x, y, char_width, cell_height);
+                    cr.rectangle(x, y, char_width, char_height);
                     cr.fill().ok();
                 }
 
                 // Draw character
                 if render_foreground
                     && foreground_visible
-                    && cell.text() != " "
+                    && text != " "
                     && !cell.is_kitty_image_placeholder()
                     && !cell.attrs.contains(CellAttrs::HIDDEN)
                 {
                     let sprite_width = cell_width.round().max(1.0) as u32;
                     let sprite_height = cell_height.round().max(1.0) as u32;
-                    if let Some(sprite) = cell
-                        .single_char()
+                    if let Some(sprite) = multicell
+                        .is_none()
+                        .then(|| cell.single_char())
+                        .flatten()
                         .and_then(|c| sprite_cache.get(c as u32, sprite_width, sprite_height))
                     {
                         draw_sprite(cr, sprite, x, y, cell_width, cell_height, &fg_color);
@@ -2425,15 +2448,29 @@ fn draw_terminal(
                         }
 
                         layout.set_attributes(Some(&attrs));
-                        layout.set_text(cell.text());
-                        layout.set_width((char_width * f64::from(pango::SCALE)) as i32);
+                        layout.set_text(text);
+                        layout.set_width(
+                            ((char_width - (text_x - x)).max(cell_width) * f64::from(pango::SCALE))
+                                as i32,
+                        );
+                        if let Some(metrics) = metrics {
+                            let scaled_font = pango::FontDescription::from_string(&format!(
+                                "{} {}",
+                                config.font_family,
+                                config.font_size * metrics.font_scale
+                            ));
+                            layout.set_font_description(Some(&scaled_font));
+                        }
 
-                        cr.move_to(x, y);
+                        cr.move_to(text_x, text_y);
                         pangocairo::functions::show_layout(cr, &layout);
 
                         // Reset attributes
                         layout.set_attributes(None::<&pango::AttrList>);
                         layout.set_width(-1);
+                        if metrics.is_some() {
+                            layout.set_font_description(Some(&font_desc));
+                        }
                     }
                 }
 
@@ -2445,7 +2482,7 @@ fn draw_terminal(
                         cr,
                         cell,
                         (x, y),
-                        (char_width, cell_height),
+                        (char_width, char_height),
                         &fg_color,
                         palette,
                         screen,
@@ -2485,6 +2522,8 @@ fn draw_terminal(
                 colors.text,
                 cell_width,
                 cell_height,
+                config.font_family,
+                config.font_size,
             );
         }
     }
@@ -2503,6 +2542,8 @@ fn draw_terminal(
             theme.cursor.text_color,
             cell_width,
             cell_height,
+            config.font_family,
+            config.font_size,
         );
     }
 
@@ -2603,6 +2644,8 @@ fn draw_cursor_cell(
     text_color: Rgb,
     cell_width: f64,
     cell_height: f64,
+    font_family: &str,
+    font_size: f64,
 ) {
     let footprint = cursor_footprint(screen, row, col);
     let x = footprint.col as f64 * cell_width;
@@ -2617,17 +2660,41 @@ fn draw_cursor_cell(
             cr.rectangle(x, y, width, height);
             cr.fill().ok();
             if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
-                if cell.text() != " "
+                let multicell = cell.multicell.as_ref();
+                let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
+                if text != " "
                     && !cell.is_kitty_image_placeholder()
                     && !cell.attrs.contains(CellAttrs::HIDDEN)
                 {
+                    let metrics = multicell.map(multicell_render_metrics);
+                    let text_x =
+                        x + metrics.map_or(0.0, |metrics| metrics.horizontal_offset * cell_width);
+                    let text_y =
+                        y + metrics.map_or(0.0, |metrics| metrics.vertical_offset * cell_height);
                     let (red, green, blue) = text_color.to_f64();
                     cr.set_source_rgb(red, green, blue);
-                    layout.set_text(cell.text());
-                    layout.set_width((width * f64::from(pango::SCALE)) as i32);
-                    cr.move_to(x, y);
+                    layout.set_text(text);
+                    layout.set_width(
+                        ((width - (text_x - x)).max(cell_width) * f64::from(pango::SCALE)) as i32,
+                    );
+                    if let Some(metrics) = metrics {
+                        let scaled_font = pango::FontDescription::from_string(&format!(
+                            "{} {}",
+                            font_family,
+                            font_size * metrics.font_scale
+                        ));
+                        layout.set_font_description(Some(&scaled_font));
+                    }
+                    cr.move_to(text_x, text_y);
                     pangocairo::functions::show_layout(cr, layout);
                     layout.set_width(-1);
+                    if metrics.is_some() {
+                        let font = pango::FontDescription::from_string(&format!(
+                            "{} {}",
+                            font_family, font_size
+                        ));
+                        layout.set_font_description(Some(&font));
+                    }
                 }
             }
         }

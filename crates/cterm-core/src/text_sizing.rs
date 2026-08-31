@@ -84,22 +84,29 @@ impl Multicell {
         })
     }
 
-    pub(crate) fn new_width_span(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_block(
         text: Arc<str>,
         columns: u8,
+        rows: u8,
         column_offset: u8,
+        row_offset: u8,
+        scale: u8,
+        fractional_scale: Option<(u8, u8)>,
+        vertical_alignment: TextSizeAlignment,
+        horizontal_alignment: TextSizeAlignment,
         natural_width: bool,
     ) -> Self {
         Self {
             text,
             columns,
-            rows: 1,
+            rows,
             column_offset,
-            row_offset: 0,
-            scale: 1,
-            fractional_scale: None,
-            vertical_alignment: TextSizeAlignment::Start,
-            horizontal_alignment: TextSizeAlignment::Start,
+            row_offset,
+            scale,
+            fractional_scale,
+            vertical_alignment,
+            horizontal_alignment,
             natural_width,
         }
     }

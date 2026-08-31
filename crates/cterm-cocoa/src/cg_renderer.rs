@@ -16,6 +16,9 @@ use cterm_core::TerminalImage;
 use cterm_core::{CursorStyle, Terminal};
 use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
 use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
+use cterm_ui::text_sizing::{
+    is_multicell_render_anchor, multicell_is_selected, multicell_render_metrics,
+};
 use cterm_ui::theme::Theme;
 
 /// CoreGraphics renderer for terminal display
@@ -169,6 +172,7 @@ impl CGRenderer {
         }
         let palette = screen.resolved_palette(&base_palette);
         let normal_background = &palette.background;
+        let visible_top = screen.visible_row_to_absolute_line(0);
 
         // Draw background
         self.draw_background(bounds, screen.modes.reverse_video, &palette);
@@ -188,22 +192,41 @@ impl CGRenderer {
 
                 for col in 0..cols {
                     if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
-                        // Skip wide char spacers - background handled by the wide cell
-                        if cell.is_wide_spacer() || cell.is_multicell_spacer() {
+                        if cell.is_wide_spacer() {
                             continue;
                         }
+                        let multicell = cell.multicell.as_ref();
+                        if multicell.is_some_and(|multicell| {
+                            !is_multicell_render_anchor(multicell, absolute_line, visible_top)
+                        }) {
+                            continue;
+                        }
+                        let metrics = multicell.map(multicell_render_metrics);
 
                         let x = col as f64 * self.cell_width;
-                        let y = row as f64 * self.cell_height;
+                        let cell_y = row as f64 * self.cell_height;
+                        let y = metrics.map_or(cell_y, |_| {
+                            cell_y
+                                - self.cell_height
+                                    * f64::from(
+                                        multicell.expect("metrics require metadata").row_offset,
+                                    )
+                        });
+                        let text_x = x + metrics
+                            .map_or(0.0, |metrics| metrics.horizontal_offset * self.cell_width);
+                        let text_y = y + metrics
+                            .map_or(0.0, |metrics| metrics.vertical_offset * self.cell_height);
+                        let text =
+                            multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
                         let foreground_visible = cell_foreground_visible(cell.attrs, blink_phase);
 
                         // Check if cell is selected
-                        let span_columns = cell
-                            .multicell
-                            .as_ref()
-                            .map_or(1, |multicell| usize::from(multicell.columns));
-                        let is_selected = (col..col.saturating_add(span_columns).min(cols))
-                            .any(|column| screen.is_selected(absolute_line, column));
+                        let is_selected = multicell.map_or_else(
+                            || screen.is_selected(absolute_line, col),
+                            |multicell| {
+                                multicell_is_selected(screen, absolute_line, col, multicell)
+                            },
+                        );
 
                         // XOR selection with INVERSE attribute to determine if colors should be inverted
                         let is_inverted = cell.attrs.contains(CellAttrs::INVERSE)
@@ -264,13 +287,16 @@ impl CGRenderer {
                             };
 
                         // Use double width for wide characters
-                        let char_width = if let Some(multicell) = cell.multicell.as_ref() {
+                        let char_width = if let Some(multicell) = multicell {
                             self.cell_width * f64::from(multicell.columns)
                         } else if cell.is_wide() {
                             self.cell_width * 2.0
                         } else {
                             self.cell_width
                         };
+                        let char_height = metrics.map_or(self.cell_height, |metrics| {
+                            self.cell_height * metrics.rows as f64
+                        });
 
                         // Draw cell background if not default or if selected/inverted
                         if !render_foreground
@@ -279,24 +305,43 @@ impl CGRenderer {
                                 || is_selected
                                 || screen.modes.reverse_video)
                         {
-                            self.draw_cell_background_sized(x, y, char_width, &bg_color);
+                            self.draw_cell_background_sized(
+                                x,
+                                y,
+                                char_width,
+                                char_height,
+                                &bg_color,
+                            );
                         }
 
                         // Draw character
                         if render_foreground
                             && foreground_visible
-                            && cell.text() != " "
-                            && cell.text() != "\0"
+                            && text != " "
+                            && text != "\0"
                             && !cell.is_kitty_image_placeholder()
                             && !cell.attrs.contains(CellAttrs::HIDDEN)
                         {
                             // DRCS is defined for individual character positions,
                             // while normal text may be a full grapheme cluster.
-                            let drcs = cell.single_char().and_then(|c| screen.get_drcs_for_char(c));
+                            let drcs = multicell
+                                .is_none()
+                                .then(|| cell.single_char())
+                                .flatten()
+                                .and_then(|c| screen.get_drcs_for_char(c));
                             if let Some(glyph) = drcs {
                                 self.draw_drcs_glyph(glyph, x, y, &fg_color);
                             } else {
-                                self.draw_text_rgb(cell.text(), x, y, &fg_color, cell.attrs);
+                                self.draw_text_rgb(
+                                    text,
+                                    text_x,
+                                    text_y,
+                                    (char_width - (text_x - x)).max(self.cell_width),
+                                    (char_height - (text_y - y)).max(self.cell_height),
+                                    &fg_color,
+                                    cell.attrs,
+                                    metrics.map_or(1.0, |metrics| metrics.font_scale),
+                                );
                             }
                         }
 
@@ -324,6 +369,7 @@ impl CGRenderer {
                                 x,
                                 y,
                                 char_width,
+                                char_height,
                                 &underline_color,
                                 &cell.attrs,
                                 has_hyperlink,
@@ -335,13 +381,13 @@ impl CGRenderer {
                             && visible
                             && cell.attrs.contains(CellAttrs::STRIKETHROUGH)
                         {
-                            self.draw_strikethrough(x, y, char_width, &fg_color);
+                            self.draw_strikethrough(x, y, char_width, char_height, &fg_color);
                         }
 
                         // Draw overline
                         if render_foreground && visible && cell.attrs.contains(CellAttrs::OVERLINE)
                         {
-                            self.draw_overline(x, y, char_width, &fg_color);
+                            self.draw_overline(x, y, char_width, char_height, &fg_color);
                         }
                     }
                 }
@@ -662,8 +708,8 @@ impl CGRenderer {
         }
     }
 
-    fn draw_cell_background_sized(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
-        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height));
+    fn draw_cell_background_sized(&self, x: f64, y: f64, width: f64, height: f64, rgb: &Rgb) {
+        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
         unsafe {
             let ns_color = Self::ns_color(rgb.r, rgb.g, rgb.b);
             let _: () = msg_send![&*ns_color, setFill];
@@ -671,10 +717,21 @@ impl CGRenderer {
         }
     }
 
-    fn draw_text_rgb(&self, value: &str, x: f64, y: f64, rgb: &Rgb, attrs: CellAttrs) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_rgb(
+        &self,
+        value: &str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        rgb: &Rgb,
+        attrs: CellAttrs,
+        font_scale: f64,
+    ) {
         let text = NSString::from_str(value);
 
-        let font = match (
+        let base_font = match (
             attrs.contains(CellAttrs::BOLD),
             attrs.contains(CellAttrs::ITALIC),
         ) {
@@ -683,6 +740,25 @@ impl CGRenderer {
             (false, true) => &self.italic_font,
             (false, false) => &self.font,
         };
+        let scaled_font = (font_scale != 1.0).then(|| {
+            let font = Self::load_font(&self.font_name, self.font.pointSize() * font_scale);
+            let fm = NSFontManager::sharedFontManager(
+                MainThreadMarker::new().expect("CoreGraphics rendering is main-thread only"),
+            );
+            match (
+                attrs.contains(CellAttrs::BOLD),
+                attrs.contains(CellAttrs::ITALIC),
+            ) {
+                (true, true) => {
+                    let bold = fm.convertFont_toHaveTrait(&font, NSFontTraitMask::BoldFontMask);
+                    fm.convertFont_toHaveTrait(&bold, NSFontTraitMask::ItalicFontMask)
+                }
+                (true, false) => fm.convertFont_toHaveTrait(&font, NSFontTraitMask::BoldFontMask),
+                (false, true) => fm.convertFont_toHaveTrait(&font, NSFontTraitMask::ItalicFontMask),
+                (false, false) => font,
+            }
+        });
+        let font: &NSFont = scaled_font.as_deref().unwrap_or(base_font);
 
         unsafe {
             let ns_color = Self::ns_color(rgb.r, rgb.g, rgb.b);
@@ -695,7 +771,8 @@ impl CGRenderer {
                 std::mem::transmute::<&NSString, &AnyObject>(&font_key),
                 std::mem::transmute::<&NSString, &AnyObject>(&color_key),
             ];
-            let values: [&AnyObject; 2] = [&**font, &*ns_color];
+            let values: [&AnyObject; 2] =
+                [std::mem::transmute::<&NSFont, &AnyObject>(font), &*ns_color];
 
             let dict: Retained<AnyObject> = msg_send![
                 class!(NSDictionary),
@@ -704,9 +781,16 @@ impl CGRenderer {
                 count: 2usize
             ];
 
-            // In a flipped view, drawAtPoint places text with point as top-left of the text
+            let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
+            let _: () = msg_send![class!(NSGraphicsContext), saveGraphicsState];
+            let clip: Retained<AnyObject> =
+                msg_send![class!(NSBezierPath), bezierPathWithRect: rect];
+            let _: () = msg_send![&*clip, addClip];
+            // Keep OSC 66 payloads on one line. The block is a clipping area,
+            // not a request for AppKit paragraph wrapping.
             let point = NSPoint::new(x, y);
             let _: () = msg_send![&*text, drawAtPoint: point, withAttributes: &*dict];
+            let _: () = msg_send![class!(NSGraphicsContext), restoreGraphicsState];
         }
     }
 
@@ -737,16 +821,21 @@ impl CGRenderer {
         }
     }
 
-    fn draw_cursor(&self, x: f64, y: f64, width: f64, style: CursorStyle, cursor_color: &Rgb) {
+    fn draw_cursor(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        style: CursorStyle,
+        cursor_color: &Rgb,
+    ) {
         let rect = match style {
-            CursorStyle::Block => {
-                NSRect::new(NSPoint::new(x, y), NSSize::new(width, self.cell_height))
+            CursorStyle::Block => NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)),
+            CursorStyle::Underline => {
+                NSRect::new(NSPoint::new(x, y + height - 2.0), NSSize::new(width, 2.0))
             }
-            CursorStyle::Underline => NSRect::new(
-                NSPoint::new(x, y + self.cell_height - 2.0),
-                NSSize::new(width, 2.0),
-            ),
-            CursorStyle::Bar => NSRect::new(NSPoint::new(x, y), NSSize::new(2.0, self.cell_height)),
+            CursorStyle::Bar => NSRect::new(NSPoint::new(x, y), NSSize::new(2.0, height)),
         };
         unsafe {
             let color = Self::ns_color_alpha(cursor_color.r, cursor_color.g, cursor_color.b, 0.7);
@@ -768,16 +857,33 @@ impl CGRenderer {
         let x = footprint.col as f64 * self.cell_width;
         let y = footprint.row as f64 * self.cell_height;
         let width = footprint.columns as f64 * self.cell_width;
-        self.draw_cursor(x, y, width, style, cursor_color);
+        let height = footprint.rows as f64 * self.cell_height;
+        self.draw_cursor(x, y, width, height, style, cursor_color);
 
         if style == CursorStyle::Block {
             if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
-                if cell.text() != " "
-                    && cell.text() != "\0"
+                let multicell = cell.multicell.as_ref();
+                let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
+                if text != " "
+                    && text != "\0"
                     && !cell.is_kitty_image_placeholder()
                     && !cell.attrs.contains(CellAttrs::HIDDEN)
                 {
-                    self.draw_text_rgb(cell.text(), x, y, text_color, cell.attrs);
+                    let metrics = multicell.map(multicell_render_metrics);
+                    let text_x = x + metrics
+                        .map_or(0.0, |metrics| metrics.horizontal_offset * self.cell_width);
+                    let text_y = y + metrics
+                        .map_or(0.0, |metrics| metrics.vertical_offset * self.cell_height);
+                    self.draw_text_rgb(
+                        text,
+                        text_x,
+                        text_y,
+                        (width - (text_x - x)).max(self.cell_width),
+                        (height - (text_y - y)).max(self.cell_height),
+                        text_color,
+                        cell.attrs,
+                        metrics.map_or(1.0, |metrics| metrics.font_scale),
+                    );
                 }
             }
         }
@@ -789,11 +895,12 @@ impl CGRenderer {
         x: f64,
         y: f64,
         width: f64,
+        height: f64,
         rgb: &Rgb,
         attrs: &CellAttrs,
         is_hyperlink: bool,
     ) {
-        let underline_y = y + self.cell_height - 2.0;
+        let underline_y = y + height - 2.0;
         let thickness = 1.0;
 
         unsafe {
@@ -864,8 +971,8 @@ impl CGRenderer {
     }
 
     /// Draw strikethrough for a cell
-    fn draw_strikethrough(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
-        let strike_y = y + self.cell_height * 0.5;
+    fn draw_strikethrough(&self, x: f64, y: f64, width: f64, height: f64, rgb: &Rgb) {
+        let strike_y = y + height * 0.5;
         unsafe {
             let color = Self::ns_color(rgb.r, rgb.g, rgb.b);
             let _: () = msg_send![&*color, setStroke];
@@ -878,7 +985,7 @@ impl CGRenderer {
     }
 
     /// Draw overline for a cell
-    fn draw_overline(&self, x: f64, y: f64, width: f64, rgb: &Rgb) {
+    fn draw_overline(&self, x: f64, y: f64, width: f64, _height: f64, rgb: &Rgb) {
         let overline_y = y + 1.0;
         unsafe {
             let color = Self::ns_color(rgb.r, rgb.g, rgb.b);

@@ -42,11 +42,15 @@ pub fn cursor_footprint(screen: &Screen, row: usize, col: usize) -> CursorFootpr
             rows: 1,
             columns: usize::from(cell.is_wide() || cell.is_wide_spacer()) + 1,
         },
-        |multicell| CursorFootprint {
-            row: row.saturating_sub(usize::from(multicell.row_offset)),
-            col: col.saturating_sub(usize::from(multicell.column_offset)),
-            rows: usize::from(multicell.rows),
-            columns: usize::from(multicell.columns),
+        |multicell| {
+            let row_offset = usize::from(multicell.row_offset);
+            let missing_rows = row_offset.saturating_sub(row);
+            CursorFootprint {
+                row: row.saturating_sub(row_offset),
+                col: col.saturating_sub(usize::from(multicell.column_offset)),
+                rows: usize::from(multicell.rows).saturating_sub(missing_rows),
+                columns: usize::from(multicell.columns),
+            }
         },
     )
 }
@@ -149,6 +153,29 @@ mod tests {
                 col: 0,
                 rows: 1,
                 columns: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn cursor_clips_a_scaled_block_after_its_anchor_is_evicted() {
+        let mut screen = Screen::new(
+            5,
+            2,
+            ScreenConfig {
+                scrollback_lines: 0,
+            },
+        );
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=1;A\x07\x1b[2;1H\n");
+
+        assert_eq!(
+            cursor_footprint(&screen, 0, 0),
+            CursorFootprint {
+                row: 0,
+                col: 0,
+                rows: 1,
+                columns: 2,
             }
         );
     }

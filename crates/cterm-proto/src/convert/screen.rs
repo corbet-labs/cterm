@@ -827,6 +827,31 @@ mod tests {
     }
 
     #[test]
+    fn scaled_text_block_roundtrips_through_screen_snapshot() {
+        let mut source = Terminal::new(8, 3, ScreenConfig::default());
+        source.process(b"\x1b]66;s=2:w=2:n=1:d=2:v=1:h=2;Title\x07");
+        let snapshot = screen_to_proto(source.screen(), false);
+        let mut restored = Terminal::new(8, 3, ScreenConfig::default());
+
+        apply_screen_snapshot(&mut restored, &snapshot);
+
+        for row in 0..2 {
+            for col in 0..4 {
+                let source_cell = source.screen().get_cell(row, col).unwrap();
+                let restored_cell = restored.screen().get_cell(row, col).unwrap();
+                assert_eq!(restored_cell, source_cell);
+                let multicell = restored_cell.multicell.as_ref().unwrap();
+                assert_eq!((multicell.rows, multicell.columns), (2, 4));
+                assert_eq!(
+                    (multicell.row_offset, multicell.column_offset),
+                    (row as u8, col as u8)
+                );
+                assert_eq!(multicell.fractional_scale, Some((1, 2)));
+            }
+        }
+    }
+
+    #[test]
     fn cursor_snapshot_preserves_protocol_sources_and_native_defaults() {
         let source = Terminal::new(8, 2, ScreenConfig::default());
         let snapshot = screen_to_proto(source.screen(), false);

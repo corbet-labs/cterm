@@ -9,6 +9,9 @@ use cterm_core::{Cell, CellAttrs, CursorStyle, Screen};
 use cterm_ui::blink::{cell_foreground_visible, cursor_visible, BlinkPhase};
 use cterm_ui::cursor::{cursor_footprint, extra_cursors_visible, resolve_extra_cursor_colors};
 use cterm_ui::pane::PaneRect;
+use cterm_ui::text_sizing::{
+    is_multicell_render_anchor, multicell_is_selected, multicell_render_metrics,
+};
 use cterm_ui::theme::Theme;
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -29,7 +32,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -544,13 +547,18 @@ impl TerminalRenderer {
         let grid = screen.grid();
         let rows = grid.height();
         let cols = grid.width();
+        let visible_top = screen.visible_row_to_absolute_line(0);
 
         for row in 0..rows {
             let absolute_line = screen.visible_row_to_absolute_line(row);
 
             for col in 0..cols {
                 if let Some(cell) = screen.get_cell_with_scrollback(absolute_line, col) {
-                    if cell.is_wide_spacer() || cell.is_multicell_spacer() {
+                    if cell.is_wide_spacer()
+                        || cell.multicell.as_ref().is_some_and(|multicell| {
+                            !is_multicell_render_anchor(multicell, absolute_line, visible_top)
+                        })
+                    {
                         continue;
                     }
                     self.draw_cell(
@@ -580,30 +588,42 @@ impl TerminalRenderer {
         blink_phase: BlinkPhase,
         pass: GridPass,
     ) -> windows::core::Result<()> {
+        let multicell = cell.multicell.as_ref();
+        let metrics = multicell.map(multicell_render_metrics);
         let x = self.origin_x + position.col as f32 * self.cell_dims.width;
-        let y = self.origin_y + position.row as f32 * self.cell_dims.height;
+        let cell_y = self.origin_y + position.row as f32 * self.cell_dims.height;
+        let y = metrics.map_or(cell_y, |_| {
+            cell_y
+                - self.cell_dims.height
+                    * f32::from(multicell.expect("metrics require metadata").row_offset)
+        });
+        let text_x = x + metrics.map_or(0.0, |metrics| {
+            metrics.horizontal_offset as f32 * self.cell_dims.width
+        });
+        let text_y = y + metrics.map_or(0.0, |metrics| {
+            metrics.vertical_offset as f32 * self.cell_dims.height
+        });
 
         let attrs = cell.attrs;
         let foreground_visible = cell_foreground_visible(attrs, blink_phase);
-        let span_columns = cell
-            .multicell
-            .as_ref()
-            .map_or(1, |multicell| usize::from(multicell.columns));
-        let is_selected = (position.col
-            ..position
-                .col
-                .saturating_add(span_columns)
-                .min(screen.width()))
-            .any(|col| screen.is_selected(position.absolute_line, col));
+        let is_selected = multicell.map_or_else(
+            || screen.is_selected(position.absolute_line, position.col),
+            |multicell| {
+                multicell_is_selected(screen, position.absolute_line, position.col, multicell)
+            },
+        );
         let (fg, bg) = self.resolve_colors(cell, screen, screen.modes.reverse_video, is_selected);
         let palette = self.resolved_palette(screen);
-        let cell_width = if let Some(multicell) = cell.multicell.as_ref() {
+        let cell_width = if let Some(multicell) = multicell {
             self.cell_dims.width * f32::from(multicell.columns)
         } else if cell.is_wide() {
             self.cell_dims.width * 2.0
         } else {
             self.cell_dims.width
         };
+        let cell_height = metrics.map_or(self.cell_dims.height, |metrics| {
+            self.cell_dims.height * metrics.rows as f32
+        });
 
         // Get brushes first (this mutably borrows self temporarily)
         let canvas_background = if screen.modes.reverse_video {
@@ -617,7 +637,7 @@ impl TerminalRenderer {
             None
         };
 
-        let text = cell.text();
+        let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
         let has_hyperlink = cell.hyperlink.is_some();
         let needs_fg = pass == GridPass::Foreground
             && foreground_visible
@@ -657,7 +677,7 @@ impl TerminalRenderer {
                 left: x,
                 top: y,
                 right: x + cell_width,
-                bottom: y + self.cell_dims.height,
+                bottom: y + cell_height,
             };
             unsafe { base.FillRectangle(&rect, brush) };
         }
@@ -686,12 +706,27 @@ impl TerminalRenderer {
                 self.dwrite_factory.CreateTextLayout(
                     &utf16,
                     text_format,
-                    cell_width,
-                    self.cell_dims.height,
+                    (cell_width - (text_x - x)).max(self.cell_dims.width),
+                    (cell_height - (text_y - y)).max(self.cell_dims.height),
                 )?
             };
 
-            let origin = D2D_POINT_2F { x, y };
+            if let Some(metrics) = metrics {
+                unsafe {
+                    layout.SetFontSize(
+                        self.dpi.scale_f32(self.font_size) * metrics.font_scale as f32,
+                        DWRITE_TEXT_RANGE {
+                            startPosition: 0,
+                            length: utf16.len() as u32,
+                        },
+                    )?;
+                }
+            }
+
+            let origin = D2D_POINT_2F {
+                x: text_x,
+                y: text_y,
+            };
             unsafe {
                 base.DrawTextLayout(
                     origin,
@@ -705,7 +740,8 @@ impl TerminalRenderer {
         // Draw underline (also for hyperlinks)
         let visible = foreground_visible && !attrs.contains(CellAttrs::HIDDEN);
         if pass == GridPass::Foreground && visible && (attrs.has_underline() || has_hyperlink) {
-            let underline_y = y + self.cell_dims.baseline + 2.0;
+            let underline_y =
+                y + cell_height - (self.cell_dims.height - self.cell_dims.baseline) + 2.0;
             self.draw_underline_pattern(
                 &base,
                 underline_brush.as_ref().unwrap(),
@@ -718,7 +754,7 @@ impl TerminalRenderer {
 
         // Draw strikethrough
         if pass == GridPass::Foreground && visible && attrs.contains(CellAttrs::STRIKETHROUGH) {
-            let strike_y = y + self.cell_dims.height / 2.0;
+            let strike_y = y + cell_height / 2.0;
             unsafe {
                 base.DrawLine(
                     D2D_POINT_2F { x, y: strike_y },
@@ -944,7 +980,9 @@ impl TerminalRenderer {
 
         // Draw the character under a block cursor with inverted color.
         if let Some(cell) = screen.get_cell(footprint.row, footprint.col) {
-            let text = cell.text();
+            let multicell = cell.multicell.as_ref();
+            let metrics = multicell.map(multicell_render_metrics);
+            let text = multicell.map_or_else(|| cell.text(), |multicell| multicell.text());
 
             if text != " "
                 && text != "\0"
@@ -952,16 +990,41 @@ impl TerminalRenderer {
                 && !cell.attrs.contains(CellAttrs::HIDDEN)
             {
                 let text_brush = self.get_brush(text_color)?;
+                let text_x = x + metrics.map_or(0.0, |metrics| {
+                    metrics.horizontal_offset as f32 * self.cell_dims.width
+                });
+                let text_y = y + metrics.map_or(0.0, |metrics| {
+                    metrics.vertical_offset as f32 * self.cell_dims.height
+                });
 
                 let text_format = self.text_format.as_ref().unwrap();
                 let utf16: Vec<u16> = text.encode_utf16().collect();
 
                 let layout: IDWriteTextLayout = unsafe {
-                    self.dwrite_factory
-                        .CreateTextLayout(&utf16, text_format, width, height)?
+                    self.dwrite_factory.CreateTextLayout(
+                        &utf16,
+                        text_format,
+                        (width - (text_x - x)).max(self.cell_dims.width),
+                        (height - (text_y - y)).max(self.cell_dims.height),
+                    )?
                 };
 
-                let origin = D2D_POINT_2F { x, y };
+                if let Some(metrics) = metrics {
+                    unsafe {
+                        layout.SetFontSize(
+                            self.dpi.scale_f32(self.font_size) * metrics.font_scale as f32,
+                            DWRITE_TEXT_RANGE {
+                                startPosition: 0,
+                                length: utf16.len() as u32,
+                            },
+                        )?;
+                    }
+                }
+
+                let origin = D2D_POINT_2F {
+                    x: text_x,
+                    y: text_y,
+                };
                 unsafe {
                     base.DrawTextLayout(origin, &layout, &text_brush, Default::default());
                 }

@@ -3000,7 +3000,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kitty_text_sizing_capability_is_honestly_width_only() {
+    fn test_kitty_text_sizing_capability_reports_width_and_scale() {
         let mut screen = Screen::new(8, 3, ScreenConfig::default());
         let mut parser = Parser::new();
 
@@ -3013,9 +3013,183 @@ mod tests {
             vec![
                 b"\x1b[1;1R".to_vec(),
                 b"\x1b[1;3R".to_vec(),
-                b"\x1b[1;4R".to_vec(),
+                b"\x1b[1;5R".to_vec(),
             ]
         );
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_places_scaled_blocks_and_preserves_metadata() {
+        let mut screen = Screen::new(10, 5, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=2:n=1:d=2:v=1:h=2;Title\x07");
+
+        assert_eq!((screen.cursor.row, screen.cursor.col), (0, 4));
+        for row in 0..2 {
+            for col in 0..4 {
+                let cell = screen.get_cell(row, col).expect("scaled cell");
+                let multicell = cell.multicell.as_ref().expect("scaled metadata");
+                assert_eq!((multicell.columns, multicell.rows), (4, 2));
+                assert_eq!(
+                    (multicell.column_offset, multicell.row_offset),
+                    (col as u8, row as u8)
+                );
+                assert_eq!(multicell.scale, 2);
+                assert_eq!(multicell.fractional_scale, Some((1, 2)));
+                assert_eq!(multicell.vertical_alignment, crate::TextSizeAlignment::End);
+                assert_eq!(
+                    multicell.horizontal_alignment,
+                    crate::TextSizeAlignment::Center
+                );
+                assert_eq!(multicell.text(), "Title");
+            }
+        }
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "Title");
+        assert_eq!(screen.get_cell(1, 0).unwrap().text(), " ");
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_skips_lower_rows_and_erases_intersections() {
+        let mut screen = Screen::new(8, 4, ScreenConfig::default());
+        let mut parser = Parser::new();
+
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=2;A\x07");
+        screen.move_cursor(1, 1);
+        parser.parse(&mut screen, b"X");
+        assert_eq!((screen.cursor.row, screen.cursor.col), (1, 5));
+        assert_eq!(screen.get_cell(1, 4).unwrap().text(), "X");
+        assert_eq!(screen.get_cell(0, 0).unwrap().text(), "A");
+
+        screen.move_cursor(1, 2);
+        parser.parse(&mut screen, b"\x1b[X");
+        assert!(screen
+            .grid()
+            .iter()
+            .flat_map(|row| row.iter())
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_selection_emits_a_scaled_block_once() {
+        let mut screen = Screen::new(6, 3, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b[1m\x1b]66;s=2:w=2;Heading\x07");
+
+        screen.start_selection(0, 0, crate::screen::SelectionMode::Char);
+        screen.extend_selection(1, 3);
+        assert_eq!(screen.get_selected_text().as_deref(), Some("Heading"));
+        let html = screen
+            .get_selected_html(&crate::ColorPalette::default())
+            .expect("selected HTML");
+        assert_eq!(html.matches("Heading").count(), 1);
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_reflows_scaled_blocks_atomically() {
+        let mut screen = Screen::new(8, 4, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"a\x1b]66;s=2:w=2;B\x07");
+
+        screen.resize(5, 4);
+        for row in 0..2 {
+            for col in 1..5 {
+                let multicell = screen
+                    .get_cell(row, col)
+                    .and_then(|cell| cell.multicell.as_ref())
+                    .expect("reflowed scaled block");
+                assert_eq!(usize::from(multicell.row_offset), row);
+                assert_eq!(usize::from(multicell.column_offset), col - 1);
+            }
+        }
+
+        screen.resize(3, 4);
+        assert!(screen
+            .grid()
+            .iter()
+            .flat_map(|row| row.iter())
+            .all(|cell| cell.multicell.is_none()));
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_history_rows_remain_one_clearable_block() {
+        let mut screen = Screen::new(5, 2, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=1;A\x07\x1b[2;1H\n");
+
+        assert_eq!(screen.scrollback().len(), 1);
+        assert_eq!(
+            screen
+                .get_cell_with_scrollback(0, 0)
+                .unwrap()
+                .multicell
+                .as_ref()
+                .unwrap()
+                .row_offset,
+            0
+        );
+        assert_eq!(
+            screen
+                .get_cell(0, 0)
+                .unwrap()
+                .multicell
+                .as_ref()
+                .unwrap()
+                .row_offset,
+            1
+        );
+
+        screen.move_cursor(0, 0);
+        parser.parse(&mut screen, b"\x1b[X");
+        assert!(screen
+            .get_cell_with_scrollback(0, 0)
+            .unwrap()
+            .multicell
+            .is_none());
+        assert!(screen.get_cell(0, 0).unwrap().multicell.is_none());
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_character_and_line_edits_do_not_split_blocks() {
+        let mut parser = Parser::new();
+
+        for edit in [b"\x1b[@".as_slice(), b"\x1b[P".as_slice()] {
+            let mut screen = Screen::new(8, 4, ScreenConfig::default());
+            parser.parse(&mut screen, b"\x1b]66;s=2:w=2;A\x07");
+            screen.move_cursor(1, 1);
+            parser.parse(&mut screen, edit);
+            assert!(screen
+                .grid()
+                .iter()
+                .flat_map(|row| row.iter())
+                .all(|cell| cell.multicell.is_none()));
+        }
+
+        for edit in [b"\x1b[L".as_slice(), b"\x1b[M".as_slice()] {
+            let mut screen = Screen::new(8, 5, ScreenConfig::default());
+            parser.parse(&mut screen, b"\x1b[2;1H\x1b]66;s=2:w=2;A\x07");
+            screen.move_cursor(2, 0);
+            parser.parse(&mut screen, edit);
+            assert!(screen
+                .grid()
+                .iter()
+                .flat_map(|row| row.iter())
+                .all(|cell| cell.multicell.is_none()));
+        }
+    }
+
+    #[test]
+    fn test_kitty_text_sizing_top_row_overwrite_erases_the_full_block() {
+        let mut screen = Screen::new(8, 4, ScreenConfig::default());
+        let mut parser = Parser::new();
+        parser.parse(&mut screen, b"\x1b]66;s=2:w=2;A\x07\x1b[1;3HX");
+
+        assert_eq!(screen.get_cell(0, 2).unwrap().text(), "X");
+        assert!(screen
+            .grid()
+            .iter()
+            .flat_map(|row| row.iter())
+            .all(|cell| cell.multicell.is_none()));
     }
 
     #[test]

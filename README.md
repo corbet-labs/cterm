@@ -506,13 +506,15 @@ also survives daemon snapshots and incremental screen updates.
 
 ### Kitty Text Sizing
 
-The width-control part of Kitty OSC 66 is supported. Fixed-width payloads and
-natural-width grapheme chunks occupy an atomic cell span across overwriting,
-ICH, DCH, ECH, selection, resize/reflow, scrollback, daemon snapshots, and
-incremental screen updates. GTK/Wayland, Cocoa, and Direct2D render the same
-span and expand a cursor placed anywhere inside it. Integer and fractional font
-scaling are not yet advertised; Kitty's CPR probe therefore distinguishes this
-honest width-only implementation from full text scaling.
+Kitty OSC 66 width and scale control are supported. Fixed-width payloads and
+natural-width grapheme chunks occupy atomic multi-row cell blocks with integer
+and fractional font scaling plus horizontal and vertical alignment. Overwrite,
+ICH, DCH, ECH, IL, DL, ED, EL, rectangular erase/fill/copy, selection,
+resize/reflow, scrollback, daemon snapshots, and incremental screen updates do
+not leave split blocks behind. GTK/Wayland, Cocoa, and Direct2D share the same
+Rust layout policy, render blocks whose anchor has entered scrollback, and
+expand block, bar, and underline cursors across the occupied cells. Kitty's CPR
+probe reports both width and scale support.
 
 Test with:
 ```bash

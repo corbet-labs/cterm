@@ -814,6 +814,21 @@ impl ReflowedRows {
 
 fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows {
     let new_width = new_width.max(1);
+    let multiline_blocks = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(row, cells)| {
+            cells
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| {
+                    cell.multicell
+                        .as_ref()
+                        .is_some_and(|multicell| multicell.is_anchor() && multicell.rows > 1)
+                })
+                .map(move |(col, cell)| (row, col, cell.clone()))
+        })
+        .collect::<Vec<_>>();
     let mut output = Vec::new();
     let mut old_row_origins = vec![(0, 0); rows.len()];
     let mut logical_boundaries = Vec::new();
@@ -847,13 +862,23 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
                 text_end.max(marker_end).min(rows[row_index].len())
             };
 
-            cells.extend(
-                rows[row_index]
-                    .iter()
-                    .take(used)
-                    .filter(|cell| !cell.is_wide_spacer() && !cell.is_multicell_spacer())
-                    .cloned(),
-            );
+            cells.extend(rows[row_index].iter().take(used).filter_map(|cell| {
+                if cell.is_wide_spacer() {
+                    return None;
+                }
+                if let Some(multicell) = cell.multicell.as_ref() {
+                    if multicell.row_offset > 0 {
+                        // Reserve the lower rows of a scaled block while the
+                        // anchor is reflowed as one horizontal unit. The block
+                        // metadata is restored after coordinate mapping.
+                        return Some(Cell::default());
+                    }
+                    if multicell.column_offset > 0 {
+                        return None;
+                    }
+                }
+                Some(cell.clone())
+            }));
         }
 
         let first_row_index = output.len();
@@ -930,6 +955,37 @@ fn reflow_rows(rows: &[Row], old_width: usize, new_width: usize) -> ReflowedRows
         logical_boundaries,
         new_width,
     };
+
+    // Rebuild every scaled block from its mapped anchor. Lower rows carry a
+    // complete copy of the metadata so rendering and selection still work if
+    // the anchor later scrolls into history.
+    for (old_row, old_col, anchor_cell) in multiline_blocks {
+        let Some(multicell) = anchor_cell.multicell.as_ref() else {
+            continue;
+        };
+        let columns = usize::from(multicell.columns);
+        let block_rows = usize::from(multicell.rows);
+        let (new_row, new_col) = reflowed.map_position(old_row, old_col);
+        if columns > new_width || new_col + columns > new_width {
+            continue;
+        }
+        while reflowed.rows.len() < new_row + block_rows {
+            reflowed.rows.push(Row::new(new_width));
+        }
+        for row_offset in 0..block_rows {
+            for column_offset in 0..columns {
+                let mut cell = anchor_cell.clone();
+                if row_offset != 0 || column_offset != 0 {
+                    cell.set_char(' ');
+                }
+                if let Some(metadata) = cell.multicell.as_mut() {
+                    metadata.row_offset = row_offset as u8;
+                    metadata.column_offset = column_offset as u8;
+                }
+                reflowed.rows[new_row + row_offset][new_col + column_offset] = cell;
+            }
+        }
+    }
 
     // Shell markers refer to positions in the old grid. Remap them through
     // the same boundary table as cursors, selections and image anchors.
@@ -1834,6 +1890,10 @@ impl Screen {
             return;
         }
 
+        if !self.move_cursor_past_multicell(width) {
+            return;
+        }
+
         // Handle auto-wrap
         if self.cursor.col >= self.width() || (width > 1 && self.cursor.col + width > self.width())
         {
@@ -1975,9 +2035,13 @@ impl Screen {
 
     /// Insert blank cells at cursor, shifting existing cells right
     fn insert_cells(&mut self, count: usize) {
-        let cursor_row = self.cursor.row;
-        let cursor_col = self.cursor.col;
+        self.insert_cells_at(self.cursor.row, self.cursor.col, count);
+    }
+
+    fn insert_cells_at(&mut self, cursor_row: usize, cursor_col: usize, count: usize) {
         let width = self.width();
+
+        self.clear_multiline_multicells_intersecting_row_range(cursor_row, cursor_col, width);
 
         if let Some(row) = self.grid.row_mut(cursor_row) {
             for i in (cursor_col + count..width).rev() {
@@ -2011,6 +2075,17 @@ impl Screen {
 
     /// Scroll up within scroll region
     pub fn scroll_up(&mut self, count: usize) {
+        let full_viewport_to_history = !self.modes.alternate_screen
+            && self.scroll_region.top == 0
+            && self.scroll_region.bottom == self.height();
+        if !full_viewport_to_history {
+            self.clear_multicells_crossing_row_boundary(self.scroll_region.top);
+            self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+            self.clear_multicells_intersecting_rows(
+                self.scroll_region.top,
+                (self.scroll_region.top + count).min(self.scroll_region.bottom),
+            );
+        }
         let scrolled =
             self.grid
                 .scroll_up(count, self.scroll_region.top, self.scroll_region.bottom);
@@ -2081,6 +2156,12 @@ impl Screen {
 
     /// Scroll down within scroll region
     pub fn scroll_down(&mut self, count: usize) {
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.top);
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+        self.clear_multicells_intersecting_rows(
+            self.scroll_region.bottom.saturating_sub(count),
+            self.scroll_region.bottom,
+        );
         self.grid
             .scroll_down(count, self.scroll_region.top, self.scroll_region.bottom);
         self.dirty = true;
@@ -2428,6 +2509,16 @@ impl Screen {
                         // Foot copies cell contents and SGR attributes, but
                         // deliberately does not copy OSC 8 URI ranges.
                         cell.hyperlink = None;
+                        if cell
+                            .multicell
+                            .as_ref()
+                            .is_some_and(|multicell| !multicell.is_anchor())
+                        {
+                            cell.set_char(' ');
+                        }
+                        // DECCRA has no multicell semantics. Copy the visible
+                        // content without manufacturing a partial OSC 66 block.
+                        cell.multicell = None;
                         cell
                     })
                     .collect::<Vec<_>>(),
@@ -2441,6 +2532,7 @@ impl Screen {
 
         for row_offset in 0..row_count {
             for col_offset in 0..col_count {
+                self.clear_multicell_span_at(dst_top + row_offset, dst_left + col_offset);
                 self.clear_wide_cell_at(dst_top + row_offset, dst_left + col_offset);
             }
         }
@@ -2477,6 +2569,9 @@ impl Screen {
         fill.hyperlink = None;
 
         for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            self.clear_multicells_intersecting_row_range(row_index, left, right.saturating_add(1));
+        }
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
             for col in left..=right.min(self.width().saturating_sub(1)) {
                 self.clear_wide_cell_at(row_index, col);
                 if let Some(cell) = self.grid.get_mut(row_index, col) {
@@ -2504,6 +2599,9 @@ impl Screen {
         let mut blank = Cell::default();
         blank.bg = self.style.bg;
 
+        for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
+            self.clear_multicells_intersecting_row_range(row_index, left, right.saturating_add(1));
+        }
         for row_index in top..=bottom.min(self.height().saturating_sub(1)) {
             for col in left..=right.min(self.width().saturating_sub(1)) {
                 self.clear_wide_cell_at(row_index, col);
@@ -2565,6 +2663,7 @@ impl Screen {
 
         // Clear selection if it overlaps with the modified row
         self.clear_selection_if_row_selected(cursor_row);
+        self.clear_multiline_multicells_intersecting_row_range(cursor_row, cursor_col, width);
 
         if let Some(row) = self.grid.row_mut(cursor_row) {
             // Shift characters left
@@ -2618,6 +2717,13 @@ impl Screen {
         // Clear selection if it overlaps with the affected region
         self.clear_selection_if_rows_selected(self.cursor.row, self.scroll_region.bottom);
 
+        self.clear_multicells_crossing_row_boundary(self.cursor.row);
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+        self.clear_multicells_intersecting_rows(
+            self.scroll_region.bottom.saturating_sub(count),
+            self.scroll_region.bottom,
+        );
+
         // Scroll the region below cursor down
         let region_bottom = self.scroll_region.bottom;
         self.grid.scroll_down(count, self.cursor.row, region_bottom);
@@ -2633,6 +2739,12 @@ impl Screen {
 
         // Clear selection if it overlaps with the affected region
         self.clear_selection_if_rows_selected(self.cursor.row, self.scroll_region.bottom);
+
+        self.clear_multicells_crossing_row_boundary(self.scroll_region.bottom);
+        self.clear_multicells_intersecting_rows(
+            self.cursor.row,
+            (self.cursor.row + count).min(self.scroll_region.bottom),
+        );
 
         // Scroll the region from cursor up
         let region_bottom = self.scroll_region.bottom;
@@ -3656,6 +3768,7 @@ impl Screen {
             (0, 0) // Not used for non-block selection
         };
 
+        let mut emitted_multicells = HashSet::new();
         for line_idx in start.line..=end_line {
             let row = self.get_row_by_absolute_line(line_idx)?;
 
@@ -3678,11 +3791,13 @@ impl Screen {
 
             // Extract characters from this row. Selecting any occupied cell
             // includes an OSC 66 span once, rather than exposing its spacers.
-            let mut emitted_multicells = HashSet::new();
             for col in start_col..=end_col {
                 if let Some(cell) = row.get(col) {
                     if let Some(multicell) = cell.multicell.as_ref() {
-                        let anchor = col.saturating_sub(usize::from(multicell.column_offset));
+                        let anchor = (
+                            line_idx.saturating_sub(usize::from(multicell.row_offset)),
+                            col.saturating_sub(usize::from(multicell.column_offset)),
+                        );
                         if emitted_multicells.insert(anchor) {
                             result.push_str(multicell.text());
                         }
@@ -3771,6 +3886,7 @@ impl Screen {
         let mut last_attrs: Option<CellAttrs> = None;
         let mut current_span_open = false;
 
+        let mut emitted_multicells = HashSet::new();
         for line_idx in start.line..=end_line {
             let row = match self.get_row_by_absolute_line(line_idx) {
                 Some(r) => r,
@@ -3792,17 +3908,19 @@ impl Screen {
                 (sc, ec)
             };
 
-            let mut emitted_multicells = HashSet::new();
             for col in start_col..=end_col {
                 if let Some(selected_cell) = row.get(col) {
-                    let cell = if let Some(multicell) = selected_cell.multicell.as_ref() {
-                        let anchor = col.saturating_sub(usize::from(multicell.column_offset));
+                    let (cell, text) = if let Some(multicell) = selected_cell.multicell.as_ref() {
+                        let anchor = (
+                            line_idx.saturating_sub(usize::from(multicell.row_offset)),
+                            col.saturating_sub(usize::from(multicell.column_offset)),
+                        );
                         if !emitted_multicells.insert(anchor) {
                             continue;
                         }
-                        row.get(anchor).unwrap_or(selected_cell)
+                        (selected_cell, multicell.text())
                     } else {
-                        selected_cell
+                        (selected_cell, selected_cell.text())
                     };
                     // Skip wide character spacers
                     if cell.attrs.contains(CellAttrs::WIDE_SPACER) {
@@ -3886,7 +4004,7 @@ impl Screen {
                     }
 
                     // Append character (HTML-escaped)
-                    for c in cell.text().chars() {
+                    for c in text.chars() {
                         match c {
                             '<' => result.push_str("&lt;"),
                             '>' => result.push_str("&gt;"),
