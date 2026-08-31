@@ -1,6 +1,7 @@
 use super::*;
 use crate::screen::ScreenConfig;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::Write;
