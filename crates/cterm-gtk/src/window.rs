@@ -12,6 +12,7 @@ use gtk4::{
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
+use cterm_app::{TemplateDaemonTarget, TemplateInstancePolicy, TemplateLaunchPlan};
 use cterm_ui::events::{Action, KeyCode, Modifiers, Shortcut};
 use cterm_ui::theme::Theme;
 use cterm_ui::{
@@ -312,6 +313,113 @@ fn reject_managed_action(action: &Action) -> bool {
     } else {
         false
     }
+}
+
+fn template_remote_details(plan: &TemplateLaunchPlan) -> Option<(&str, &str, bool)> {
+    match &plan.daemon {
+        TemplateDaemonTarget::Local => None,
+        TemplateDaemonTarget::Named(remote) => Some((
+            remote.name.as_str(),
+            remote.host.as_str(),
+            remote.ssh_compression,
+        )),
+    }
+}
+
+fn theme_name_matches(requested: &str, resolved: &str) -> bool {
+    requested.eq_ignore_ascii_case(resolved)
+        || matches!(
+            (requested.to_ascii_lowercase().as_str(), resolved),
+            ("dark", "Default Dark")
+                | ("light", "Default Light")
+                | ("tokyo_night" | "tokyo-night", "Tokyo Night")
+                | ("dracula", "Dracula")
+                | ("nord", "Nord")
+        )
+}
+
+/// Resolve a template theme without changing the window-wide UI theme.
+///
+/// `resolve_theme` intentionally prefers a configured custom theme globally,
+/// so a named per-template built-in must temporarily ignore that global custom
+/// value. Unknown names stay on the window theme instead of silently becoming
+/// Default Dark.
+fn resolve_template_theme(config: &Config, window_theme: &Theme, requested: Option<&str>) -> Theme {
+    let Some(requested) = requested.map(str::trim).filter(|name| !name.is_empty()) else {
+        return window_theme.clone();
+    };
+
+    if let Some(custom) = config.appearance.custom_theme.as_ref() {
+        if requested.eq_ignore_ascii_case("custom") || requested.eq_ignore_ascii_case(&custom.name)
+        {
+            return custom.clone();
+        }
+    }
+
+    let mut themed_config = config.clone();
+    themed_config.appearance.custom_theme = None;
+    themed_config.appearance.theme = requested.to_string();
+    let resolved = cterm_app::resolve_theme(&themed_config);
+    if theme_name_matches(requested, &resolved.name) {
+        resolved
+    } else {
+        log::warn!("Unknown template theme '{requested}', using the window theme");
+        window_theme.clone()
+    }
+}
+
+fn reusable_template_location<'a, P: Copy>(
+    policy: TemplateInstancePolicy,
+    template_name: &str,
+    candidates: impl IntoIterator<Item = (usize, P, Option<&'a str>)>,
+) -> Option<(usize, P)> {
+    if policy != TemplateInstancePolicy::ReuseExisting {
+        return None;
+    }
+
+    candidates
+        .into_iter()
+        .find(|(_, _, candidate)| candidate.is_some_and(|name| name == template_name))
+        .map(|(tab_index, pane_id, _)| (tab_index, pane_id))
+}
+
+fn focus_reusable_template(
+    notebook: &Notebook,
+    tabs: &Rc<RefCell<Vec<TabEntry>>>,
+    tab_bar: &TabBar,
+    plan: &TemplateLaunchPlan,
+) -> bool {
+    let location = {
+        let tabs = tabs.borrow();
+        reusable_template_location(
+            plan.instance_policy,
+            &plan.template_name,
+            tabs.iter().enumerate().flat_map(|(tab_index, tab)| {
+                tab.panes
+                    .iter()
+                    .map(move |(pane_id, pane)| (tab_index, pane_id, pane.template_name.as_deref()))
+            }),
+        )
+    };
+    let Some((tab_index, pane_id)) = location else {
+        return false;
+    };
+
+    let tab_id = {
+        let mut tabs = tabs.borrow_mut();
+        let Some(tab) = tabs.get_mut(tab_index) else {
+            return false;
+        };
+        if !tab.activate_pane(pane_id) {
+            return false;
+        }
+        tab.id
+    };
+
+    notebook.set_current_page(Some(tab_index as u32));
+    tab_bar.set_active(tab_id);
+    focus_current_terminal(notebook, tabs);
+    true
 }
 
 fn perform_pane_action(context: &PaneActionContext, action: Action) {
@@ -3912,98 +4020,74 @@ fn create_tab_from_template(
     template: &cterm_app::config::StickyTabConfig,
     remote_manager: &cterm_client::RemoteManager,
 ) {
-    // Prepare working directory (clone from git if needed)
-    if let Some(ref working_dir) = template.working_directory {
-        if let Err(e) =
-            cterm_app::prepare_working_directory(working_dir, template.git_remote.as_deref())
-        {
-            log::error!("Failed to prepare working directory: {}", e);
+    // This is the canonical GTK template-launch ingress. Keep the policy here
+    // as well as at menu/shortcut actions so dialog and overlay callbacks can
+    // never bypass managed mode.
+    if reject_managed_secondary_action("template launch") {
+        return;
+    }
+
+    let (plan, launch_theme) = {
+        let cfg = config.borrow();
+        let plan = match TemplateLaunchPlan::build(template, &cfg) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::error!("Cannot launch template '{}': {error}", template.name);
+                return;
+            }
+        };
+        let launch_theme = resolve_template_theme(&cfg, theme, plan.appearance.theme.as_deref());
+        (plan, launch_theme)
+    };
+
+    if focus_reusable_template(notebook, tabs, tab_bar, &plan) {
+        log::info!("Focused existing template tab: {}", plan.template_name);
+        return;
+    }
+
+    // Only an explicit template workspace owned by the local daemon is ever
+    // prepared here. Named-remote paths belong to that daemon host.
+    if let Some((working_directory, git_remote)) = plan.local_workspace_preparation() {
+        if let Err(error) = cterm_app::prepare_working_directory(working_directory, git_remote) {
+            log::error!(
+                "Failed to prepare workspace for template '{}': {error}",
+                plan.template_name
+            );
+            return;
         }
     }
 
-    let cfg = config.borrow();
+    let opts = plan.session_options(80, 24);
+    let remote = template_remote_details(&plan).map(|(name, host, compression)| {
+        (
+            remote_manager.clone(),
+            name.to_string(),
+            host.to_string(),
+            compression,
+        )
+    });
 
-    // Build daemon session options from template
-    let remote_daemon = template.remote.is_some();
-    let opts = cterm_client::CreateSessionOpts {
-        cols: 80,
-        rows: 24,
-        shell: if remote_daemon {
-            template.command.clone()
-        } else {
-            template
-                .command
-                .clone()
-                .or_else(|| cfg.general.default_shell.clone())
-        },
-        args: if !remote_daemon && template.args.is_empty() && template.command.is_none() {
-            cfg.general.shell_args.clone()
-        } else {
-            template.args.clone()
-        },
-        cwd: template
-            .working_directory
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
-        env: template
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        // SSH tabs open a native puressh connection on the daemon.
-        ssh: template.ssh.as_ref().map(|s| s.to_ssh_params()),
-        ..Default::default()
-    };
-
-    // Resolve remote from template
-    let remote_cfg = match template.remote.as_ref() {
-        Some(name) => match cfg.remotes.iter().find(|remote| remote.name == *name) {
-            Some(remote) => Some(remote.clone()),
-            None => {
-                log::error!(
-                    "Template '{}' references unknown remote '{}'",
-                    template.name,
-                    name
-                );
-                return;
-            }
-        },
-        None => None,
-    };
-
-    {
-        let remote = remote_cfg.map(|r| {
-            (
-                remote_manager.clone(),
-                r.name.clone(),
-                r.host.clone(),
-                r.ssh_compression,
-            )
-        });
-        drop(cfg);
-
-        spawn_daemon_tab(
-            notebook,
-            tabs,
-            next_tab_id,
-            config,
-            theme,
-            tab_bar,
-            window,
-            has_bell,
-            file_manager,
-            notification_bar,
-            opts,
-            template.name.clone(),
-            Some(template.name.clone()),
-            template.color.clone(),
-            template.background_color.clone(),
-            template.keep_open,
-            false,
-            remote,
-            None,
-        );
-    }
+    spawn_daemon_tab(
+        notebook,
+        tabs,
+        next_tab_id,
+        config,
+        &launch_theme,
+        tab_bar,
+        window,
+        has_bell,
+        file_manager,
+        notification_bar,
+        opts,
+        plan.template_name.clone(),
+        Some(plan.template_name.clone()),
+        plan.appearance.tab_color.clone(),
+        plan.appearance.background_color.clone(),
+        plan.keep_open,
+        false,
+        remote,
+        None,
+    );
 }
 
 /// Close current tab (with confirmation if process is running)
@@ -4849,6 +4933,113 @@ mod tests {
         ] {
             assert!(!is_managed_restricted_action(&action), "{action:?}");
         }
+    }
+
+    #[test]
+    fn template_adapter_preserves_local_ssh_and_named_daemon_intent() {
+        use cterm_app::config::{RemoteConfig, SshTabConfig, StickyTabConfig};
+
+        let ssh_template = StickyTabConfig {
+            name: "Production shell".into(),
+            ssh: Some(SshTabConfig {
+                host: "shell.example".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let local_plan = TemplateLaunchPlan::build(&ssh_template, &Config::default()).unwrap();
+        let local_options = local_plan.session_options(80, 24);
+        assert!(template_remote_details(&local_plan).is_none());
+        assert_eq!(
+            local_options.ssh.as_ref().map(|ssh| ssh.host.as_str()),
+            Some("shell.example")
+        );
+
+        let mut config = Config::default();
+        config.remotes.push(RemoteConfig {
+            name: "build".into(),
+            host: "dev@build.example".into(),
+            ssh_compression: false,
+        });
+        let remote_template = StickyTabConfig {
+            name: "Remote build".into(),
+            command: Some("just".into()),
+            args: vec!["test".into()],
+            working_directory: Some("/srv/project".into()),
+            remote: Some("build".into()),
+            ..Default::default()
+        };
+        let remote_plan = TemplateLaunchPlan::build(&remote_template, &config).unwrap();
+        assert_eq!(
+            template_remote_details(&remote_plan),
+            Some(("build", "dev@build.example", false))
+        );
+        assert!(remote_plan.local_workspace_preparation().is_none());
+        let remote_options = remote_plan.session_options(80, 24);
+        assert_eq!(remote_options.shell.as_deref(), Some("just"));
+        assert_eq!(remote_options.args, ["test"]);
+        assert_eq!(remote_options.cwd.as_deref(), Some("/srv/project"));
+    }
+
+    #[test]
+    fn template_adapter_uses_docker_argv_and_plan_metadata() {
+        use cterm_app::config::{DockerMode, DockerTabConfig, StickyTabConfig};
+
+        let template = StickyTabConfig {
+            name: "Alpine".into(),
+            color: Some("#0db7ed".into()),
+            keep_open: true,
+            docker: Some(DockerTabConfig {
+                mode: DockerMode::Run,
+                image: Some("alpine:latest".into()),
+                shell: Some("/bin/ash".into()),
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let plan = TemplateLaunchPlan::build(&template, &Config::default()).unwrap();
+        let options = plan.session_options(80, 24);
+        assert_eq!(options.shell.as_deref(), Some("docker"));
+        assert_eq!(
+            options.args,
+            ["run", "-it", "--rm", "alpine:latest", "/bin/ash"]
+        );
+        assert_eq!(plan.appearance.tab_color.as_deref(), Some("#0db7ed"));
+        assert!(plan.keep_open);
+    }
+
+    #[test]
+    fn unique_template_policy_reuses_only_matching_template_identity() {
+        let candidates = [
+            (0, 11, Some("Editor")),
+            (1, 22, Some("Logs")),
+            (2, 33, None),
+        ];
+        assert_eq!(
+            reusable_template_location(TemplateInstancePolicy::ReuseExisting, "Logs", candidates),
+            Some((1, 22))
+        );
+        assert_eq!(
+            reusable_template_location(TemplateInstancePolicy::AlwaysCreate, "Logs", candidates),
+            None
+        );
+    }
+
+    #[test]
+    fn template_theme_override_is_scoped_and_unknown_names_fall_back() {
+        let mut config = Config::default();
+        config.appearance.custom_theme = Some(Theme::light());
+        let window_theme = Theme::tokyo_night();
+
+        let nord = resolve_template_theme(&config, &window_theme, Some("nord"));
+        assert_eq!(nord.name, "Nord");
+        let custom = resolve_template_theme(&config, &window_theme, Some("custom"));
+        assert_eq!(custom.name, "Default Light");
+        let unknown = resolve_template_theme(&config, &window_theme, Some("does-not-exist"));
+        assert_eq!(unknown.name, "Tokyo Night");
+        assert_eq!(window_theme.name, "Tokyo Night");
     }
 
     #[test]
