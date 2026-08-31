@@ -5,15 +5,18 @@
 
 use crate::iterm2::Iterm2FileParams;
 use base64::Engine;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Threshold for switching from memory buffer to temp file (1 MB)
 const MEMORY_THRESHOLD: usize = 1024 * 1024;
 
 /// Base64 decode chunk size (must be multiple of 4 for base64)
 const BASE64_CHUNK_SIZE: usize = 4096;
+
+static NEXT_TRANSFER_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// State of the streaming file receiver
 #[derive(Debug)]
@@ -214,18 +217,17 @@ impl StreamingFileReceiver {
 
     /// Spill memory buffer to a temp file
     fn spill_to_disk(&mut self, existing_data: &[u8], new_data: &[u8]) -> io::Result<()> {
-        // Create temp file
-        let temp_dir = std::env::temp_dir();
-        let temp_path = temp_dir.join(format!("cterm_transfer_{}", std::process::id()));
-
-        let file = File::create(&temp_path)?;
+        let (temp_path, file) = create_transfer_file()?;
         let mut writer = BufWriter::new(file);
 
-        // Write existing memory data
-        writer.write_all(existing_data)?;
-
-        // Write new data
-        writer.write_all(new_data)?;
+        if let Err(error) = writer
+            .write_all(existing_data)
+            .and_then(|()| writer.write_all(new_data))
+        {
+            drop(writer);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
 
         let size = existing_data.len() + new_data.len();
 
@@ -255,15 +257,19 @@ impl StreamingFileReceiver {
                 self.base64_buffer.push(b'=');
             }
             if !self.decode_chunk() {
-                return Err(self.error.unwrap_or_else(|| "Unknown error".to_string()));
+                return Err(self
+                    .error
+                    .take()
+                    .unwrap_or_else(|| "Unknown error".to_string()));
             }
         }
 
-        if let Some(error) = self.error {
+        if let Some(error) = self.error.take() {
             return Err(error);
         }
 
-        let data = match self.storage {
+        let storage = std::mem::replace(&mut self.storage, StorageState::Memory(Vec::new()));
+        let data = match storage {
             StorageState::Memory(buffer) => StreamingFileData::Memory(buffer),
             StorageState::File {
                 path,
@@ -272,6 +278,8 @@ impl StreamingFileReceiver {
             } => {
                 // Flush the writer
                 if let Err(e) = writer.flush() {
+                    drop(writer);
+                    let _ = std::fs::remove_file(path);
                     return Err(format!("Failed to flush temp file: {}", e));
                 }
                 drop(writer);
@@ -280,7 +288,7 @@ impl StreamingFileReceiver {
         };
 
         Ok(StreamingFileResult {
-            params: self.params,
+            params: std::mem::take(&mut self.params),
             data,
             total_bytes: self.total_bytes,
         })
@@ -290,6 +298,37 @@ impl StreamingFileReceiver {
     pub fn is_on_disk(&self) -> bool {
         matches!(self.storage, StorageState::File { .. })
     }
+}
+
+impl Drop for StreamingFileReceiver {
+    fn drop(&mut self) {
+        if let StorageState::File { path, .. } = &self.storage {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn create_transfer_file() -> io::Result<(PathBuf, File)> {
+    for _ in 0..100 {
+        let id = NEXT_TRANSFER_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("cterm-transfer-{}-{id}", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique OSC 1337 transfer file",
+    ))
 }
 
 /// Result of a completed streaming file transfer
@@ -410,5 +449,40 @@ mod tests {
         let result = receiver.finish().unwrap();
         let bytes = result.data.take().unwrap();
         assert_eq!(bytes, b"Hello, World!");
+    }
+
+    #[test]
+    fn spill_files_are_unique_and_cleaned_after_take() {
+        let mut first = StreamingFileReceiver::new(Iterm2FileParams::default());
+        first.spill_to_disk(b"first", b" file").unwrap();
+        let first = first.finish().unwrap();
+
+        let mut second = StreamingFileReceiver::new(Iterm2FileParams::default());
+        second.spill_to_disk(b"second", b" file").unwrap();
+        let second = second.finish().unwrap();
+
+        let first_path = first.data.temp_path().unwrap().clone();
+        let second_path = second.data.temp_path().unwrap().clone();
+        assert_ne!(first_path, second_path);
+        assert_eq!(first.data.take().unwrap(), b"first file");
+        assert_eq!(second.data.take().unwrap(), b"second file");
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut receiver = StreamingFileReceiver::new(Iterm2FileParams::default());
+        receiver.spill_to_disk(b"private", b" data").unwrap();
+        let result = receiver.finish().unwrap();
+        let mode = std::fs::metadata(result.data.temp_path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        result.data.take().unwrap();
     }
 }

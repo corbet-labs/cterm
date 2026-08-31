@@ -16,6 +16,7 @@ use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::osc1337::{InterceptorResult, Osc1337Interceptor};
 #[cfg(test)]
 use crate::screen::DesktopNotificationAction;
 use crate::screen::{
@@ -26,7 +27,6 @@ use crate::sixel::{
     SixelDecoder, SixelDecoderConfig, SixelImage, DEFAULT_SIXEL_MAX_BYTES, MAX_SIXEL_COLORS,
     MAX_SIXEL_DIMENSION,
 };
-use crate::streaming_file::StreamingFileReceiver;
 
 /// DCS (Device Control String) state for handling multi-byte sequences
 enum DcsState {
@@ -128,24 +128,6 @@ enum KittyPayloadType {
     Capabilities,
 }
 
-/// State for intercepting OSC 1337 File transfers before VTE buffers them
-#[derive(Debug, Default)]
-enum Osc1337State {
-    /// Not in an OSC 1337 sequence
-    #[default]
-    None,
-    /// Saw ESC, waiting for ]
-    Escape,
-    /// Inside OSC, collecting command number
-    OscCommand(Vec<u8>),
-    /// Inside OSC 1337, collecting content after the semicolon
-    Osc1337Content(Vec<u8>),
-    /// Inside OSC 1337 File=, collecting parameters before ':'
-    Osc1337Params(String),
-    /// Inside OSC 1337 File= base64 data, streaming to receiver
-    Osc1337Data(StreamingFileReceiver),
-}
-
 /// Parser wraps the vte parser and applies actions to a Screen
 pub struct Parser {
     state_machine: vte::Parser,
@@ -154,10 +136,8 @@ pub struct Parser {
     last_printed: Option<char>,
     /// Saved DEC private modes for xterm XTSAVE/XTRESTORE.
     saved_dec_modes: HashMap<usize, bool>,
-    /// State for intercepting OSC 1337 File sequences
-    osc_1337_state: Osc1337State,
-    /// Whether an OSC 1337 string terminator (BEL or ESC \) was seen
-    osc_1337_terminated: bool,
+    /// Bounded, all-or-none interceptor for streaming OSC 1337 File sequences.
+    osc_1337: Osc1337Interceptor,
     /// In-progress chunked Kitty OSC 99 notification.
     kitty_notification: KittyNotificationBuilder,
     /// Optimistically active Kitty notification identifiers for p=alive.
@@ -179,8 +159,7 @@ impl Parser {
             dcs_state: DcsState::None,
             last_printed: None,
             saved_dec_modes: HashMap::new(),
-            osc_1337_state: Osc1337State::None,
-            osc_1337_terminated: false,
+            osc_1337: Osc1337Interceptor::new(),
             kitty_notification: KittyNotificationBuilder::default(),
             active_notification_ids: HashSet::new(),
             sixel: SixelSessionState::default(),
@@ -193,216 +172,53 @@ impl Parser {
     /// enabling streaming of large files without exhausting memory.
     pub fn parse(&mut self, screen: &mut Screen, bytes: &[u8]) {
         for &byte in bytes {
-            // Check if we should intercept this byte for OSC 1337 streaming
-            // We need to handle this before creating the performer to avoid borrow conflicts
-            let consumed = self.handle_osc_1337_byte_pre(byte);
-
-            if consumed {
-                // Check if we need to finish the streaming transfer
-                self.check_osc_1337_finish(screen);
-                continue;
+            match self.osc_1337.advance(byte) {
+                InterceptorResult::Forward(bytes) => {
+                    self.advance_vte(screen, bytes.as_slice());
+                }
+                InterceptorResult::Replay(bytes) => {
+                    if let Err(error) = bytes.replay(|chunk| self.advance_vte(screen, chunk)) {
+                        log::warn!("Failed to replay OSC 1337 through VTE: {error}");
+                    }
+                }
+                InterceptorResult::Swallow => {}
+                InterceptorResult::Finished(result) => {
+                    self.finish_streaming_file_direct(result, screen);
+                }
             }
+        }
+    }
 
-            // Normal VTE processing
-            let mut performer = ScreenPerformer {
-                screen,
-                dcs_state: &mut self.dcs_state,
-                last_printed: &mut self.last_printed,
-                saved_dec_modes: &mut self.saved_dec_modes,
-                kitty_notification: &mut self.kitty_notification,
-                active_notification_ids: &mut self.active_notification_ids,
-                sixel: &mut self.sixel,
-            };
+    fn advance_vte(&mut self, screen: &mut Screen, bytes: &[u8]) {
+        let mut performer = ScreenPerformer {
+            screen,
+            dcs_state: &mut self.dcs_state,
+            last_printed: &mut self.last_printed,
+            saved_dec_modes: &mut self.saved_dec_modes,
+            kitty_notification: &mut self.kitty_notification,
+            active_notification_ids: &mut self.active_notification_ids,
+            sixel: &mut self.sixel,
+        };
+        for &byte in bytes {
             self.state_machine.advance(&mut performer, byte);
         }
     }
 
-    /// Pre-check a byte for OSC 1337 interception (before performer is created)
-    ///
-    /// Returns true if the byte was consumed
-    fn handle_osc_1337_byte_pre(&mut self, byte: u8) -> bool {
-        match &mut self.osc_1337_state {
-            Osc1337State::None => {
-                // Look for ESC to start potential OSC sequence
-                if byte == 0x1b {
-                    self.osc_1337_state = Osc1337State::Escape;
-                }
-                false
-            }
+    fn finish_streaming_file_direct(
+        &mut self,
+        result: crate::streaming_file::StreamingFileResult,
+        screen: &mut Screen,
+    ) {
+        log::debug!(
+            "OSC 1337 File streaming complete: {} bytes, name={:?}",
+            result.total_bytes,
+            result.params.name
+        );
 
-            Osc1337State::Escape => {
-                if byte == b']' {
-                    // This is an OSC start - start collecting command number
-                    self.osc_1337_state = Osc1337State::OscCommand(Vec::new());
-                } else {
-                    // Not an OSC, reset
-                    self.osc_1337_state = Osc1337State::None;
-                }
-                false
-            }
-
-            Osc1337State::OscCommand(cmd) => {
-                if byte == b';' {
-                    // End of command number
-                    let cmd_str = String::from_utf8_lossy(cmd);
-                    if cmd_str == "1337" {
-                        // This is OSC 1337! Start collecting content
-                        self.osc_1337_state = Osc1337State::Osc1337Content(Vec::new());
-                        // We're now committed - need to intercept everything
-                        return true;
-                    } else {
-                        // Not 1337, let VTE handle normally
-                        self.osc_1337_state = Osc1337State::None;
-                    }
-                } else if byte.is_ascii_digit() {
-                    cmd.push(byte);
-                } else {
-                    // Invalid command number, reset
-                    self.osc_1337_state = Osc1337State::None;
-                }
-                false
-            }
-
-            Osc1337State::Osc1337Content(content) => {
-                // Check for string terminator (ST = ESC \, or BEL)
-                if byte == 0x07 || (content.last() == Some(&0x1b) && byte == b'\\') {
-                    // End of OSC - will be handled by check_osc_1337_finish
-                    if byte == b'\\' {
-                        // Remove the ESC we added
-                        content.pop();
-                    }
-                    self.osc_1337_terminated = true;
-                    return true;
-                }
-
-                // Cap buffer to prevent unbounded growth from malicious input
-                if content.len() > 1024 {
-                    self.osc_1337_state = Osc1337State::None;
-                    return false;
-                }
-
-                // Check if this starts "File="
-                const FILE_PREFIX: &[u8] = b"File=";
-                if content.len() < FILE_PREFIX.len()
-                    && FILE_PREFIX.get(content.len()) == Some(&byte)
-                {
-                    content.push(byte);
-
-                    // If we've matched the full "File=" prefix, switch to params mode
-                    if content.len() == FILE_PREFIX.len() {
-                        self.osc_1337_state = Osc1337State::Osc1337Params(String::new());
-                    }
-                    return true;
-                }
-
-                content.push(byte);
-                true
-            }
-
-            Osc1337State::Osc1337Params(params) => {
-                // Check for string terminator
-                if byte == 0x07 || (params.ends_with('\x1b') && byte == b'\\') {
-                    // Terminator without data - will be handled by check_osc_1337_finish
-                    self.osc_1337_terminated = true;
-                    return true;
-                }
-
-                // Cap params to prevent unbounded growth from malicious input
-                if params.len() > 65536 {
-                    self.osc_1337_state = Osc1337State::None;
-                    return false;
-                }
-
-                if byte == b':' {
-                    // End of params, start of base64 data
-                    let param_str = std::mem::take(params);
-                    let file_params = Iterm2FileParams::parse(&param_str);
-
-                    log::debug!(
-                        "OSC 1337 File streaming: name={:?}, size={:?}, inline={}",
-                        file_params.name,
-                        file_params.size,
-                        file_params.inline
-                    );
-
-                    let receiver = StreamingFileReceiver::new(file_params);
-                    self.osc_1337_state = Osc1337State::Osc1337Data(receiver);
-                    return true;
-                }
-
-                params.push(byte as char);
-                true
-            }
-
-            Osc1337State::Osc1337Data(receiver) => {
-                // Check for string terminator (BEL or ESC \)
-                if byte == 0x07 || byte == b'\\' {
-                    // Terminator - mark as terminated for check_osc_1337_finish
-                    self.osc_1337_terminated = true;
-                    return true;
-                }
-
-                if byte == 0x1b {
-                    // Might be start of ESC \ - don't feed to receiver yet
-                    return true;
-                }
-
-                // Feed to streaming receiver
-                if !receiver.put(byte) {
-                    // Error occurred
-                    log::warn!("OSC 1337 streaming error: {:?}", receiver.error());
-                    self.osc_1337_state = Osc1337State::None;
-                }
-                true
-            }
-        }
-    }
-
-    /// Check if OSC 1337 streaming needs to be finished
-    fn check_osc_1337_finish(&mut self, screen: &mut Screen) {
-        if !self.osc_1337_terminated {
-            return;
-        }
-        self.osc_1337_terminated = false;
-
-        match &self.osc_1337_state {
-            Osc1337State::Osc1337Content(_) | Osc1337State::Osc1337Params(_) => {
-                // Non-File content or terminated params without data - just reset
-                self.osc_1337_state = Osc1337State::None;
-            }
-            Osc1337State::Osc1337Data(_) => {
-                // Streaming data terminated - finish the transfer
-                self.finish_streaming_file_direct(screen);
-            }
-            _ => {}
-        }
-    }
-
-    /// Finish streaming a file directly (called from check_osc_1337_finish)
-    fn finish_streaming_file_direct(&mut self, screen: &mut Screen) {
-        let state = std::mem::replace(&mut self.osc_1337_state, Osc1337State::None);
-
-        if let Osc1337State::Osc1337Data(receiver) = state {
-            match receiver.finish() {
-                Ok(result) => {
-                    log::debug!(
-                        "OSC 1337 File streaming complete: {} bytes, name={:?}",
-                        result.total_bytes,
-                        result.params.name
-                    );
-
-                    if result.params.inline {
-                        // Inline image - decode and display
-                        self.handle_streaming_inline_image_direct(result, screen);
-                    } else {
-                        // File transfer - queue for UI
-                        screen.queue_streaming_file_transfer(result);
-                    }
-                }
-                Err(e) => {
-                    log::warn!("OSC 1337 File streaming failed: {}", e);
-                }
-            }
+        if result.params.inline {
+            self.handle_streaming_inline_image_direct(result, screen);
+        } else {
+            screen.queue_streaming_file_transfer(result);
         }
     }
 
@@ -3336,48 +3152,52 @@ mod tests {
         let mut screen = make_screen();
         let mut parser = Parser::new();
 
-        // Feed a complete OSC 1337 File= sequence with multi-byte base64 data
-        // This is: ESC ] 1337 ; File=inline=1;size=4: AQAAAA== BEL
-        // "AQAAAA==" is base64 for 4 bytes (0x01, 0x00, 0x00, 0x00)
-        // We use a tiny 1x1 image won't decode, but we can verify the streaming
-        // doesn't terminate prematurely by checking the state machine handles
-        // multi-byte data correctly.
-
-        // Build the sequence byte by byte to test streaming
         let prefix = b"\x1b]1337;File=inline=0;size=4:";
         let data = b"AQAAAA==";
-        let terminator = b"\x07";
-
-        // Feed prefix - should be consumed by the state machine
         parser.parse(&mut screen, prefix);
-        // At this point we should be in Osc1337Data state
-        assert!(
-            matches!(parser.osc_1337_state, Osc1337State::Osc1337Data(_)),
-            "Should be in Osc1337Data state after prefix, got {:?}",
-            std::mem::discriminant(&parser.osc_1337_state)
-        );
 
-        // Feed data bytes one at a time - should NOT terminate early
-        for &byte in data.iter() {
+        for &byte in data {
             parser.parse(&mut screen, &[byte]);
-            assert!(
-                matches!(parser.osc_1337_state, Osc1337State::Osc1337Data(_)),
-                "Should still be in Osc1337Data state during data"
-            );
         }
 
-        // Feed terminator - should finish
-        parser.parse(&mut screen, terminator);
-        assert!(
-            matches!(parser.osc_1337_state, Osc1337State::None),
-            "Should be in None state after terminator"
-        );
+        parser.parse(&mut screen, b"\x07ordinary text");
 
-        // Verify a file transfer was queued (inline=0 means file transfer, not inline image)
-        assert!(
-            screen.has_file_transfers(),
-            "Should have a pending file transfer"
+        assert_eq!(
+            screen.grid().row(0).unwrap().text().trim_end(),
+            "ordinary text"
         );
+        let transfers = screen.take_file_transfers();
+        let [crate::screen::FileTransferOperation::StreamingFileReceived { result, .. }] =
+            transfers.as_slice()
+        else {
+            panic!("expected one streaming file transfer, got {transfers:?}");
+        };
+        assert_eq!(result.data.to_bytes().unwrap(), [1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_osc_1337_cancel_and_malformed_payload_recover() {
+        for abort in [0x18, 0x1a] {
+            let mut screen = make_screen();
+            let mut parser = Parser::new();
+            let mut input = b"\x1b]1337;File=inline=0;size=4:AQ".to_vec();
+            input.extend_from_slice(&[abort]);
+            input.extend_from_slice(b"OK");
+
+            parser.parse(&mut screen, &input);
+
+            assert_eq!(screen.grid().row(0).unwrap().text().trim_end(), "OK");
+            assert!(!screen.has_file_transfers());
+        }
+
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        parser.parse(
+            &mut screen,
+            b"\x1b]1337;File=inline=0;size=4:!!!!\x07recovered",
+        );
+        assert_eq!(screen.grid().row(0).unwrap().text().trim_end(), "recovered");
+        assert!(!screen.has_file_transfers());
     }
 
     #[test]
