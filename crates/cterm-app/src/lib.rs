@@ -14,6 +14,7 @@ pub mod file_transfer;
 pub mod git_sync;
 pub mod log_capture;
 pub mod plugin_broker;
+pub mod plugin_runtime;
 pub mod plugins;
 pub mod quick_open;
 pub mod session;
@@ -37,6 +38,10 @@ pub use git_sync::{
     PullResult, SyncStatus,
 };
 pub use plugin_broker::{PluginBroker, PluginBrokerError, PluginBrokerOutput, PluginBrokerTimeout};
+pub use plugin_runtime::{
+    PluginApprovalPrompt, PluginAuthorization, PluginExecution, PluginInvocation, PluginRuntime,
+    PluginRuntimeError,
+};
 pub use plugins::{
     PluginCatalog, PluginCatalogError, PluginCommandDescriptor, PluginDataPaths,
     PluginDiscoveryError, PluginDiscoveryFailure, PluginGrantFile, PluginStorageError,

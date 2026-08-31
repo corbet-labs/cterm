@@ -179,9 +179,9 @@ Configuration files are stored in platform-specific locations:
 See [docs/configuration.md](docs/configuration.md) for detailed configuration options.
 
 The fail-closed command-plugin package, ABI, isolated runner, deterministic
-discovery, and machine-local grant foundation are documented in
-[docs/plugins.md](docs/plugins.md). Native permission prompts and UI command
-integration are not enabled yet.
+discovery, machine-local grants, and shared authorization/execution bridge are
+documented in [docs/plugins.md](docs/plugins.md). Native permission prompts
+and UI command integration are not enabled yet.
 
 ## Keyboard Shortcuts
 

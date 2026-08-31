@@ -72,6 +72,10 @@ impl PluginBrokerOutput {
     pub fn host_stderr(&self) -> &[u8] {
         &self.host_stderr
     }
+
+    pub fn into_parts(self) -> (proto::PluginResponse, Vec<u8>) {
+        (self.response, self.host_stderr)
+    }
 }
 
 /// Resolves, authorizes, launches, and validates one-shot plugin runners.

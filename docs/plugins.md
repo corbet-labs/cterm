@@ -2,11 +2,11 @@
 
 cterm's plugin work currently provides a fail-closed package and ABI
 foundation, an isolated one-shot runner, an application-side broker,
-deterministic package discovery, and bounded machine-local grant persistence.
-It does **not** yet expose or execute plugin commands in released UI builds.
-Native permission prompts and frontend command integration are the next
-implementation stage. Release packages already include the runner as a
-verified sibling executable.
+deterministic package discovery, bounded machine-local grant persistence, and
+a frontend-neutral authorization/execution bridge. It does **not** yet expose
+plugin commands in released UI builds. Native permission prompts and command
+palette integration are the next implementation stage. Release packages
+already include the runner as a verified sibling executable.
 
 ## Version 1 package
 
@@ -50,9 +50,9 @@ network, environment, daemon, or native UI access.
 
 The ABI is intentionally independent of cterm's Rust UI enum layout. The
 application broker verifies each wire action against the exact manifest and
-grant before a future frontend converts it and passes it through the same
-native action policy used by shortcuts. Managed mode will initially disable
-plugins.
+grant. The shared application runtime then converts it to the same typed
+action used by shortcuts; unknown actions and parameter-kind mismatches are
+rejected before native dispatch. Managed mode will initially disable plugins.
 
 ## Package identity and grants
 
@@ -95,6 +95,22 @@ manifest ID. Valid commands are returned in stable plugin-ID/command-ID order.
 Malformed packages are reported individually and cannot hide valid neighbors;
 ordinary non-directory files are ignored.
 
+## Frontend runtime
+
+Selecting a catalog command re-loads its package and compares the canonical
+root, plugin ID, command ID, and exact digest with the discovered descriptor.
+A changed package cannot reach a prompt or inherit stale catalog state; the UI
+must refresh discovery first. The runtime returns either an immutable
+invocation or a native approval request containing the missing exact scopes
+and whether previously approved content changed.
+
+Accepted prompts are revalidated once more before the grant file is replaced.
+The resulting invocation owns a grant snapshot and can move to a worker thread
+without exposing mutable runtime state. After the broker returns, protobuf
+parameters are converted to typed tab, split, and pane values and then checked
+against the stable built-in action contract. Native frontends still apply
+their existing action policy when dispatching the returned actions.
+
 ## Application broker
 
 `cterm-app` resolves the canonical `cterm-plugin-host` sibling next to the
@@ -136,9 +152,9 @@ malformed protobuf, undeclared actions, digest mismatches, unsupported imports,
 and ambient environment/filesystem state.
 
 Fuel is not a wall-clock deadline, so the application broker independently
-enforces the process deadline and tree termination. Future frontend work must
-apply managed-mode and native action policy after the broker returns. The
-runner deliberately contains no downloader, grant storage, permission UI,
+enforces the process deadline and tree termination. Frontend integration must
+apply managed-mode and native action policy after the shared runtime returns.
+The runner deliberately contains no downloader, grant storage, permission UI,
 daemon dependency, or frontend dependency.
 
 Keeping that runtime out of the UI process limits the effect of guest bugs. It

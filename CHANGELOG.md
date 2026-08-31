@@ -16,10 +16,11 @@ is omitted for readability.
   with digest revalidation, fuel, memory, stack, table, input, and output
   limits. The application-side broker adds canonical package-relative host and
   plugin resolution, deterministic command discovery, atomic machine-local
-  grant persistence, exact pre/post-execution grant enforcement, bounded
-  framed process I/O, a strict wall timeout, and Unix process-group / Windows
-  Job Object termination. Release packages include the runner; native grant
-  prompts and UI command integration remain a subsequent stage.
+  grant persistence, stale-descriptor rejection, exact pre/post-execution
+  grant enforcement, typed native-action conversion, bounded framed process
+  I/O, a strict wall timeout, and Unix process-group / Windows Job Object
+  termination. Release packages include the runner; native grant prompts and
+  UI command integration remain a subsequent stage.
 - Native FreeBSD builds now compile the GTK4/Wayland client and daemon and run
   their portable library and daemon-integration tests in a FreeBSD 14.4 VM.
 - Foot-compatible independent cursor blink sources and native cursor/text
