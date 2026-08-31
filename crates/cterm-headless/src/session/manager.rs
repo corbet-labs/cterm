@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(any(unix, test))]
 fn apply_relaunch_terminal_state(
     terminal: &mut cterm_core::Terminal,
     cursor_style: cterm_core::CursorStyle,
