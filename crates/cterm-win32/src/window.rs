@@ -20,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
 use cterm_app::shortcuts::ShortcutManager;
+use cterm_app::{TemplateDaemonTarget, TemplateInstancePolicy, TemplateLaunchPlan};
 use cterm_core::color::{ColorPalette, Rgb};
 use cterm_core::mouse::{
     encode_mouse_event, MouseButton as ReportButton, MouseEvent as ReportMouseEvent,
@@ -156,6 +157,7 @@ struct DaemonTabMetadata {
     title: String,
     color: Option<String>,
     background_color: Option<String>,
+    theme: Option<Theme>,
     title_locked: bool,
     template_name: Option<String>,
     keep_open: bool,
@@ -325,6 +327,7 @@ pub struct TabEntry {
     pub title: String,
     pub color: Option<String>,
     pub background_color: Option<String>,
+    pub theme: Theme,
     pub has_bell: bool,
     /// Whether title was explicitly set (locks out OSC updates)
     pub title_locked: bool,
@@ -338,6 +341,7 @@ impl TabEntry {
         title: String,
         color: Option<String>,
         background_color: Option<String>,
+        theme: Theme,
         title_locked: bool,
         pane: PaneEntry,
     ) -> Self {
@@ -348,6 +352,7 @@ impl TabEntry {
             title,
             color,
             background_color,
+            theme,
             has_bell: false,
             title_locked,
             pane_layout,
@@ -594,6 +599,7 @@ impl WindowState {
                 title: initial_title,
                 color: None,
                 background_color: None,
+                theme: None,
                 title_locked,
                 template_name: None,
                 keep_open: false,
@@ -613,48 +619,39 @@ impl WindowState {
                 std::io::Error::other("secondary sessions are disabled in managed mode").into(),
             );
         }
+
+        let plan = TemplateLaunchPlan::build(template, &self.config)?;
+        if let Some(tab_id) = self.focus_template(plan.instance_policy, &plan.template_name) {
+            return Ok(tab_id);
+        }
+
+        if let Some((working_directory, git_remote)) = plan.local_workspace_preparation() {
+            cterm_app::prepare_working_directory(working_directory, git_remote)?;
+        }
+
+        let remote = template_remote_endpoint(&plan.daemon, &self.remote_manager);
         #[cfg(not(unix))]
-        if template.remote.is_some() {
+        if remote.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "remote daemon templates are not supported by the Windows transport",
             )
             .into());
         }
-        let remote = if let Some(ref remote_name) = template.remote {
-            let remote_config = self
-                .config
-                .remotes
-                .iter()
-                .find(|r| r.name == *remote_name)
-                .cloned()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("remote '{remote_name}' is not configured"),
-                    )
-                })?;
-
-            Some((
-                self.remote_manager.clone(),
-                remote_config.name,
-                remote_config.host,
-                remote_config.ssh_compression,
-            ))
-        } else {
-            None
-        };
         let (cols, rows) = self.terminal_size();
-        let options = template_session_options(template, &self.config, cols as u32, rows as u32);
+        let options = plan.session_options(cols as u32, rows as u32);
+        let theme =
+            resolve_template_theme(&self.config, &self.theme, plan.appearance.theme.as_deref());
         Ok(self.spawn_daemon_tab_configured(
             options,
             DaemonTabMetadata {
-                title: template.name.clone(),
-                color: template.color.clone(),
-                background_color: template.background_color.clone(),
+                title: plan.template_name.clone(),
+                color: plan.appearance.tab_color,
+                background_color: plan.appearance.background_color,
+                theme: Some(theme),
                 title_locked: true,
-                template_name: Some(template.name.clone()),
-                keep_open: template.keep_open,
+                template_name: Some(plan.template_name),
+                keep_open: plan.keep_open,
             },
             remote,
         ))
@@ -727,6 +724,7 @@ impl WindowState {
                 title,
                 color: None,
                 background_color: None,
+                theme: None,
                 title_locked: true,
                 template_name: None,
                 keep_open: false,
@@ -756,6 +754,7 @@ impl WindowState {
                 title,
                 color,
                 background_color,
+                theme: None,
                 title_locked: true,
                 template_name: None,
                 keep_open,
@@ -774,10 +773,12 @@ impl WindowState {
             title,
             color,
             background_color,
+            theme,
             title_locked,
             template_name,
             keep_open,
         } = metadata;
+        let tab_theme = theme.unwrap_or_else(|| self.theme.clone());
         let tab_id = self.next_tab_id.fetch_add(1, Ordering::SeqCst);
         let (cols, rows) = self.terminal_size();
         let (pixel_width, pixel_height) = self.terminal_pixel_size();
@@ -797,8 +798,8 @@ impl WindowState {
         if opts.pixel_height == 0 {
             opts.pixel_height = pixel_height;
         }
-        opts.base_palette = Some(terminal_palette(&self.theme, background_color.as_deref()));
-        opts.frontend_state.appearance = self.theme.appearance();
+        opts.base_palette = Some(terminal_palette(&tab_theme, background_color.as_deref()));
+        opts.frontend_state.appearance = tab_theme.appearance();
         opts.frontend_state.visibility = self.window_visibility;
         let backend = PaneBackendContext::Daemon(Box::new(DaemonPaneContext::from_options(
             &opts,
@@ -809,7 +810,7 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
-        terminal.set_base_palette(terminal_palette(&self.theme, background_color.as_deref()));
+        terminal.set_base_palette(terminal_palette(&tab_theme, background_color.as_deref()));
         terminal.set_frontend_state(opts.frontend_state);
         terminal.resize_with_pixels(
             cols,
@@ -838,6 +839,7 @@ impl WindowState {
             title.clone(),
             color.clone(),
             background_color.clone(),
+            tab_theme.clone(),
             title_locked,
             PaneEntry {
                 source_id,
@@ -876,10 +878,9 @@ impl WindowState {
             self.tab_bar.set_color(tab_id, rgb);
         }
 
-        if let Some(ref bg) = background_color {
-            if let Some(ref mut renderer) = self.renderer {
-                renderer.set_background_override(Some(bg));
-            }
+        if let Some(ref mut renderer) = self.renderer {
+            renderer.set_theme(&tab_theme);
+            renderer.set_background_override(background_color.as_deref());
         }
 
         let hwnd = self.hwnd.0 as usize;
@@ -995,6 +996,7 @@ impl WindowState {
             display_title.clone(),
             color.clone(),
             None,
+            self.theme.clone(),
             title_locked,
             PaneEntry {
                 source_id,
@@ -1100,13 +1102,23 @@ impl WindowState {
                 .iter()
                 .find(|template| template.name == *name)
         }) {
-            let options =
-                template_session_options(template, &self.config, cols as u32, rows as u32);
-            context.shell = options.shell;
-            context.args = options.args;
-            context.env = options.env;
-            context.term = options.term;
-            context.ssh = options.ssh;
+            match TemplateLaunchPlan::build(template, &self.config) {
+                Ok(plan) => {
+                    let options = plan.session_options(cols as u32, rows as u32);
+                    context.shell = options.shell;
+                    context.args = options.args;
+                    context.env = options.env;
+                    context.term = options.term;
+                    context.ssh = options.ssh;
+                    context.remote = template_remote_endpoint(&plan.daemon, &self.remote_manager);
+                    context.remote_name =
+                        context.remote.as_ref().map(|(_, name, _, _)| name.clone());
+                }
+                Err(error) => log::warn!(
+                    "Could not restore template launch context for '{}': {error}",
+                    template.name
+                ),
+            }
         }
         if let Some(launch) = pane_state.launch_context.as_ref() {
             context.apply_launch_context(launch);
@@ -1120,6 +1132,8 @@ impl WindowState {
         screen_snapshot: Option<cterm_proto::proto::GetScreenResponse>,
         daemon_socket: Option<std::path::PathBuf>,
         alerted: bool,
+        theme: &Theme,
+        background_color: Option<&str>,
     ) -> Option<PaneEntry> {
         let session_id = pane_state.session_id.as_ref()?;
         let (cols, rows) = self.terminal_size();
@@ -1127,9 +1141,9 @@ impl WindowState {
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
-        let base_palette = terminal_palette(&self.theme, None);
+        let base_palette = terminal_palette(theme, background_color);
         let frontend_state = cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
+            appearance: theme.appearance(),
             visibility: self.window_visibility,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
@@ -1188,6 +1202,8 @@ impl WindowState {
         &self,
         pane_state: &cterm_app::upgrade::PaneUpgradeState,
         reason: &str,
+        theme: &Theme,
+        background_color: Option<&str>,
     ) -> Option<PaneEntry> {
         let session_id = pane_state.session_id.clone()?;
         let (cols, rows) = self.terminal_size();
@@ -1195,9 +1211,9 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
-        terminal.set_base_palette(terminal_palette(&self.theme, None));
+        terminal.set_base_palette(terminal_palette(theme, background_color));
         terminal.set_frontend_state(cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
+            appearance: theme.appearance(),
             visibility: self.window_visibility,
         });
         let message = format!(
@@ -1537,14 +1553,15 @@ impl WindowState {
         let screen_config = ScreenConfig {
             scrollback_lines: self.config.general.scrollback_lines,
         };
+        let theme = self.active_theme();
         let background = self
             .tabs
             .get(self.active_tab_index)
             .and_then(|tab| tab.background_color.as_deref());
         let mut terminal = Terminal::with_shell(cols, rows, screen_config, &pty_config)?;
-        terminal.set_base_palette(terminal_palette(&self.theme, background));
+        terminal.set_base_palette(terminal_palette(theme, background));
         terminal.set_frontend_state(cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
+            appearance: theme.appearance(),
             visibility: self.window_visibility,
         });
         let terminal = Arc::new(Mutex::new(terminal));
@@ -1573,12 +1590,13 @@ impl WindowState {
     ) -> Result<PaneEntry, Box<dyn std::error::Error>> {
         let (cols, rows) = self.terminal_size();
         let (pixel_width, pixel_height) = self.terminal_pixel_size();
+        let theme = self.active_theme();
         let background = self
             .tabs
             .get(self.active_tab_index)
             .and_then(|tab| tab.background_color.as_deref());
         let frontend_state = cterm_core::FrontendState {
-            appearance: self.theme.appearance(),
+            appearance: theme.appearance(),
             visibility: self.window_visibility,
         };
         let options = cterm_client::CreateSessionOpts {
@@ -1592,7 +1610,7 @@ impl WindowState {
             env: context.env.clone(),
             term: context.term.clone(),
             ssh: context.ssh.clone(),
-            base_palette: Some(terminal_palette(&self.theme, background)),
+            base_palette: Some(terminal_palette(theme, background)),
             frontend_state,
         };
 
@@ -1600,7 +1618,7 @@ impl WindowState {
             scrollback_lines: self.config.general.scrollback_lines,
         };
         let mut terminal = Terminal::new(cols, rows, screen_config);
-        terminal.set_base_palette(terminal_palette(&self.theme, background));
+        terminal.set_base_palette(terminal_palette(theme, background));
         terminal.set_frontend_state(frontend_state);
         terminal.resize_with_pixels(
             cols,
@@ -1984,6 +2002,7 @@ impl WindowState {
                 }
                 self.refresh_active_tab_title();
                 if let Some(ref mut renderer) = self.renderer {
+                    renderer.set_theme(&self.tabs[self.active_tab_index].theme);
                     renderer.set_background_override(
                         self.tabs[self.active_tab_index].background_color.as_deref(),
                     );
@@ -2018,11 +2037,43 @@ impl WindowState {
 
             // Apply per-tab background color override
             if let Some(ref mut renderer) = self.renderer {
+                renderer.set_theme(&self.tabs[index].theme);
                 renderer.set_background_override(self.tabs[index].background_color.as_deref());
             }
 
             self.invalidate();
         }
+    }
+
+    /// Focus a tab or pane previously launched from the named template.
+    fn focus_template(
+        &mut self,
+        policy: TemplateInstancePolicy,
+        template_name: &str,
+    ) -> Option<u64> {
+        let (tab_index, pane_id) = reusable_template_location(policy, &self.tabs, template_name)?;
+        self.switch_to_tab(tab_index);
+
+        let previous_pane = self.tabs[tab_index].pane_layout.active();
+        if previous_pane != pane_id {
+            let had_focus = self.window_has_focus();
+            if had_focus {
+                self.send_pane_focus_event(previous_pane, false);
+            }
+            if let Err(error) = self.tabs[tab_index].pane_layout.set_active(pane_id) {
+                log::error!("Failed to focus existing template pane: {error}");
+                return None;
+            }
+            if had_focus {
+                self.send_pane_focus_event(pane_id, true);
+                self.clear_active_pane_bell();
+            }
+            self.refresh_active_tab_title();
+            self.resize_tab_panes(tab_index);
+            self.invalidate();
+        }
+
+        Some(self.tabs[tab_index].id)
     }
 
     /// Switch to next tab
@@ -2066,6 +2117,13 @@ impl WindowState {
         self.tabs
             .get(self.active_tab_index)
             .and_then(TabEntry::active_terminal)
+    }
+
+    fn active_theme(&self) -> &Theme {
+        self.tabs
+            .get(self.active_tab_index)
+            .map(|tab| &tab.theme)
+            .unwrap_or(&self.theme)
     }
 
     fn source_location(&self, source_id: u64) -> Option<(usize, PaneId)> {
@@ -2992,7 +3050,7 @@ impl WindowState {
     fn copy_selection_as_html(&mut self) {
         if let Some(terminal) = self.active_terminal() {
             let term = terminal.lock().unwrap();
-            if let Some(html) = term.screen().get_selected_html(&self.theme.colors) {
+            if let Some(html) = term.screen().get_selected_html(&self.active_theme().colors) {
                 // Copy HTML to clipboard
                 clipboard::copy_to_clipboard(&html).ok();
                 log::debug!("Copied {} chars as HTML to clipboard", html.len());
@@ -4184,6 +4242,13 @@ pub fn create_window_from_upgrade(
             windows::core::Error::from_win32()
         })?;
 
+    let templates = match cterm_app::load_sticky_tabs() {
+        Ok(templates) => templates,
+        Err(error) => {
+            log::warn!("Could not load templates while restoring tab appearance: {error}");
+            Vec::new()
+        }
+    };
     let mut any_restored = false;
     for tab_state in &window_state.tabs {
         let (layout, pane_states) = match upgrade_pane_records(tab_state) {
@@ -4194,6 +4259,19 @@ pub fn create_window_from_upgrade(
             }
         };
         let pane_ids = layout.pane_ids();
+        let template_name = tab_state.template_name.as_deref().or_else(|| {
+            pane_states
+                .iter()
+                .find_map(|pane| pane.template_name.as_deref())
+        });
+        let template =
+            template_name.and_then(|name| templates.iter().find(|template| template.name == name));
+        let restored_theme = resolve_template_theme(
+            config,
+            theme,
+            template.and_then(|template| template.theme.as_deref()),
+        );
+        let background_color = template.and_then(|template| template.background_color.clone());
 
         let mut restored = Vec::with_capacity(pane_states.len());
         for pane_state in &pane_states {
@@ -4211,7 +4289,12 @@ pub fn create_window_from_upgrade(
                     "remote '{remote_name}' requires a transport that is currently unavailable on Windows"
                 );
                 log::error!("Failed to reconnect session {session_id}: {reason}");
-                if let Some(pane) = state.make_unavailable_remote_pane(pane_state, &reason) {
+                if let Some(pane) = state.make_unavailable_remote_pane(
+                    pane_state,
+                    &reason,
+                    &restored_theme,
+                    background_color.as_deref(),
+                ) {
                     restored.push(pane);
                     continue;
                 }
@@ -4258,9 +4341,14 @@ pub fn create_window_from_upgrade(
                         .socket_path()
                         .map(std::path::Path::to_path_buf)
                         .or_else(|| pane_state.daemon_socket.clone());
-                    if let Some(pane) =
-                        state.make_attached_pane(pane_state, screen, socket, alerted)
-                    {
+                    if let Some(pane) = state.make_attached_pane(
+                        pane_state,
+                        screen,
+                        socket,
+                        alerted,
+                        &restored_theme,
+                        background_color.as_deref(),
+                    ) {
                         restored.push(pane);
                     }
                     // attach_session fetched the snapshot and incremented the
@@ -4290,7 +4378,8 @@ pub fn create_window_from_upgrade(
             id: tab_state.id,
             title: tab_state.title.clone(),
             color: tab_state.color.clone(),
-            background_color: None,
+            background_color,
+            theme: restored_theme,
             has_bell,
             title_locked,
             pane_layout: layout,
@@ -5300,48 +5389,74 @@ fn terminal_palette(theme: &Theme, background: Option<&str>) -> ColorPalette {
     palette
 }
 
-fn template_session_options(
-    template: &cterm_app::config::StickyTabConfig,
-    config: &Config,
-    cols: u32,
-    rows: u32,
-) -> cterm_client::CreateSessionOpts {
-    let (configured_shell, configured_args) = template.get_command_args();
-    let shell = configured_shell.or_else(|| config.general.default_shell.clone());
-    let args = if template.docker.is_none() && template.command.is_none() {
-        config.general.shell_args.clone()
-    } else {
-        configured_args
-    };
-    cterm_client::CreateSessionOpts {
-        cols,
-        rows,
-        shell,
-        args,
-        cwd: template
-            .working_directory
-            .as_ref()
-            .or(config.general.working_directory.as_ref())
-            .map(|path| path.to_string_lossy().into_owned()),
-        // Preserve the existing Win32 template environment order. The daemon
-        // collects this into a map, so configured defaults replace duplicate
-        // template entries exactly as the former local PTY path did.
-        env: template
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .chain(
-                config
-                    .general
-                    .env
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            )
-            .collect(),
-        term: config.general.term.clone(),
-        ssh: template.ssh.as_ref().map(|ssh| ssh.to_ssh_params()),
-        ..Default::default()
+fn template_remote_endpoint(
+    daemon: &TemplateDaemonTarget,
+    remote_manager: &cterm_client::RemoteManager,
+) -> Option<RemoteDaemonEndpoint> {
+    match daemon {
+        TemplateDaemonTarget::Local => None,
+        TemplateDaemonTarget::Named(remote) => Some((
+            remote_manager.clone(),
+            remote.name.clone(),
+            remote.host.clone(),
+            remote.ssh_compression,
+        )),
     }
+}
+
+fn theme_name_matches(requested: &str, resolved: &str) -> bool {
+    requested.eq_ignore_ascii_case(resolved)
+        || matches!(
+            (requested.to_ascii_lowercase().as_str(), resolved),
+            ("dark", "Default Dark")
+                | ("light", "Default Light")
+                | ("tokyo_night" | "tokyo-night", "Tokyo Night")
+                | ("dracula", "Dracula")
+                | ("nord", "Nord")
+        )
+}
+
+fn resolve_template_theme(
+    config: &Config,
+    default_theme: &Theme,
+    requested: Option<&str>,
+) -> Theme {
+    let Some(requested) = requested.map(str::trim).filter(|name| !name.is_empty()) else {
+        return default_theme.clone();
+    };
+
+    if let Some(custom) = config.appearance.custom_theme.as_ref() {
+        if requested.eq_ignore_ascii_case("custom") || requested.eq_ignore_ascii_case(&custom.name)
+        {
+            return custom.clone();
+        }
+    }
+
+    let mut themed_config = config.clone();
+    themed_config.appearance.custom_theme = None;
+    themed_config.appearance.theme = requested.to_string();
+    let resolved = cterm_app::resolve_theme(&themed_config);
+    if theme_name_matches(requested, &resolved.name) {
+        resolved
+    } else {
+        log::warn!("Unknown template theme '{requested}', using the window theme");
+        default_theme.clone()
+    }
+}
+
+fn reusable_template_location(
+    policy: TemplateInstancePolicy,
+    tabs: &[TabEntry],
+    template_name: &str,
+) -> Option<(usize, PaneId)> {
+    if policy != TemplateInstancePolicy::ReuseExisting {
+        return None;
+    }
+    tabs.iter().enumerate().find_map(|(tab_index, tab)| {
+        tab.panes.iter().find_map(|(pane_id, pane)| {
+            (pane.template_name.as_deref() == Some(template_name)).then_some((tab_index, *pane_id))
+        })
+    })
 }
 
 #[cfg(test)]
@@ -5640,7 +5755,9 @@ mod tests {
             ..Default::default()
         };
 
-        let options = template_session_options(&template, &config, 132, 43);
+        let options = TemplateLaunchPlan::build(&template, &config)
+            .unwrap()
+            .session_options(132, 43);
         assert_eq!(options.cols, 132);
         assert_eq!(options.rows, 43);
         assert_eq!(options.shell.as_deref(), Some("program.exe"));
@@ -5662,15 +5779,171 @@ mod tests {
         config.general.shell_args = vec!["-NoLogo".to_string()];
         config.general.working_directory = Some(std::path::PathBuf::from(r"C:\work"));
 
-        let options = template_session_options(
-            &cterm_app::config::StickyTabConfig::default(),
-            &config,
-            80,
-            24,
-        );
+        let options =
+            TemplateLaunchPlan::build(&cterm_app::config::StickyTabConfig::default(), &config)
+                .unwrap()
+                .session_options(80, 24);
         assert_eq!(options.shell.as_deref(), Some("pwsh.exe"));
         assert_eq!(options.args, ["-NoLogo"]);
         assert_eq!(options.cwd.as_deref(), Some(r"C:\work"));
+    }
+
+    #[test]
+    fn template_adapter_preserves_docker_argv_and_native_ssh() {
+        let docker = cterm_app::config::StickyTabConfig {
+            docker: Some(cterm_app::config::DockerTabConfig {
+                mode: cterm_app::config::DockerMode::Run,
+                image: Some("alpine:latest".to_string()),
+                shell: Some("/bin/ash".to_string()),
+                docker_args: vec!["--pull=never".to_string()],
+                auto_remove: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let docker_options = TemplateLaunchPlan::build(&docker, &Config::default())
+            .unwrap()
+            .session_options(80, 24);
+        assert_eq!(docker_options.shell.as_deref(), Some("docker"));
+        assert_eq!(
+            docker_options.args,
+            [
+                "run",
+                "-it",
+                "--rm",
+                "--pull=never",
+                "alpine:latest",
+                "/bin/ash"
+            ]
+        );
+
+        let ssh = cterm_app::config::StickyTabConfig {
+            ssh: Some(cterm_app::config::SshTabConfig {
+                host: "server.example".to_string(),
+                port: Some(2222),
+                username: Some("dev".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ssh_plan = TemplateLaunchPlan::build(&ssh, &Config::default()).unwrap();
+        let ssh_options = ssh_plan.session_options(80, 24);
+        assert!(ssh_options.shell.is_none());
+        assert!(ssh_options.args.is_empty());
+        assert_eq!(
+            ssh_options
+                .ssh
+                .as_ref()
+                .map(|parameters| parameters.host.as_str()),
+            Some("server.example")
+        );
+        assert!(
+            template_remote_endpoint(&ssh_plan.daemon, &cterm_client::RemoteManager::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn named_remote_maps_to_manager_without_local_workspace_preparation() {
+        let remote_path = std::path::PathBuf::from("/srv/remote-project");
+        let mut config = Config::default();
+        config.remotes.push(cterm_app::config::RemoteConfig {
+            name: "build".to_string(),
+            host: "dev@build.example".to_string(),
+            ssh_compression: false,
+        });
+        let template = cterm_app::config::StickyTabConfig {
+            remote: Some("build".to_string()),
+            working_directory: Some(remote_path),
+            git_remote: Some("https://example.test/project.git".to_string()),
+            ..Default::default()
+        };
+        let plan = TemplateLaunchPlan::build(&template, &config).unwrap();
+
+        assert!(plan.local_workspace_preparation().is_none());
+        let (_, name, host, compression) =
+            template_remote_endpoint(&plan.daemon, &cterm_client::RemoteManager::new()).unwrap();
+        assert_eq!(name, "build");
+        assert_eq!(host, "dev@build.example");
+        assert!(!compression);
+    }
+
+    #[test]
+    fn local_template_workspace_is_prepared_before_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("created-by-template-launch");
+        let template = cterm_app::config::StickyTabConfig {
+            working_directory: Some(workspace.clone()),
+            ..Default::default()
+        };
+        let plan = TemplateLaunchPlan::build(&template, &Config::default()).unwrap();
+        let (directory, git_remote) = plan.local_workspace_preparation().unwrap();
+
+        assert!(!workspace.exists());
+        assert!(!cterm_app::prepare_working_directory(directory, git_remote).unwrap());
+        assert!(workspace.is_dir());
+    }
+
+    #[test]
+    fn template_theme_uses_builtin_aliases_and_preserves_unknown_fallback() {
+        let default = Theme::nord();
+        let mut config = Config::default();
+        config.appearance.custom_theme = Some(Theme::dracula());
+
+        assert_eq!(
+            resolve_template_theme(&config, &default, Some("tokyo-night")).name,
+            "Tokyo Night"
+        );
+        assert_eq!(
+            resolve_template_theme(&config, &default, Some("custom")).name,
+            "Dracula"
+        );
+        assert_eq!(
+            resolve_template_theme(&config, &default, Some("missing-theme")).name,
+            "Nord"
+        );
+        assert_eq!(resolve_template_theme(&config, &default, None).name, "Nord");
+    }
+
+    #[test]
+    fn unique_template_lookup_finds_the_existing_tab_and_pane() {
+        let layout = PaneLayout::new();
+        let pane_id = layout.active();
+        let pane = PaneEntry {
+            source_id: 1,
+            terminal: Arc::new(Mutex::new(Terminal::new(80, 24, ScreenConfig::default()))),
+            title: "Editor".to_string(),
+            reader_handle: None,
+            session_id: None,
+            daemon_socket: None,
+            title_locked: true,
+            template_name: Some("Editor".to_string()),
+            keep_open: true,
+            has_bell: false,
+            daemon_cmd_tx: None,
+            backend: PaneBackendContext::LocalPty,
+        };
+        let tab = TabEntry {
+            id: 7,
+            title: "Editor".to_string(),
+            color: None,
+            background_color: None,
+            theme: Theme::dark(),
+            has_bell: false,
+            title_locked: true,
+            pane_layout: layout,
+            panes: BTreeMap::from([(pane_id, pane)]),
+        };
+
+        let tabs = [tab];
+        assert_eq!(
+            reusable_template_location(TemplateInstancePolicy::ReuseExisting, &tabs, "Editor"),
+            Some((0, pane_id))
+        );
+        assert_eq!(
+            reusable_template_location(TemplateInstancePolicy::AlwaysCreate, &tabs, "Editor"),
+            None
+        );
     }
 
     #[test]
