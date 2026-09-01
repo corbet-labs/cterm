@@ -13,6 +13,9 @@ use gtk4::{
 use parking_lot::Mutex;
 
 use cterm_app::config::Config;
+use cterm_app::kitty_dnd::{
+    DndAdapterAction, DndDestination, DndLocation, DndOperation, DropData, URI_LIST_MIME,
+};
 use cterm_core::cell::CellAttrs;
 use cterm_core::color::{Color, ColorPalette, Rgb};
 use cterm_core::mouse::{
@@ -110,6 +113,8 @@ pub struct TerminalWidget {
     on_bell: EventCallback,
     on_title_change: TitleCallback,
     on_file_transfer: FileTransferCallback,
+    /// Shared Kitty OSC 72 state used by PTY and GTK drop callbacks.
+    dnd_destination: Rc<RefCell<DndDestination>>,
     /// Command channel for daemon I/O — None for local PTY sessions
     daemon_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<DaemonCommand>>,
 }
@@ -1388,18 +1393,85 @@ impl TerminalWidget {
 
     /// Set up file drag-and-drop
     fn setup_drop(&self) {
-        let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
+        let drop_target = gtk4::DropTarget::new(
+            gio::File::static_type(),
+            // GtkDropTarget completes synchronously. Restrict this first
+            // adapter to copy so the OS cannot delete a source before the
+            // terminal application sends its explicit finish command.
+            gdk::DragAction::COPY,
+        );
+        let dnd = Rc::clone(&self.dnd_destination);
         let terminal = Arc::clone(&self.terminal);
+        let cell_dims = Rc::clone(&self.cell_dims);
         let drawing_area = self.drawing_area.clone();
 
-        drop_target.connect_drop(move |_, value, _, _| {
+        let dnd_enter = Rc::clone(&dnd);
+        let terminal_enter = Arc::clone(&terminal);
+        let cell_dims_enter = Rc::clone(&cell_dims);
+        drop_target.connect_enter(move |target, x, y| {
+            gtk_dnd_motion(target, x, y, &dnd_enter, &terminal_enter, &cell_dims_enter)
+        });
+
+        let dnd_motion = Rc::clone(&dnd);
+        let terminal_motion = Arc::clone(&terminal);
+        let cell_dims_motion = Rc::clone(&cell_dims);
+        drop_target.connect_motion(move |target, x, y| {
+            gtk_dnd_motion(
+                target,
+                x,
+                y,
+                &dnd_motion,
+                &terminal_motion,
+                &cell_dims_motion,
+            )
+        });
+
+        let dnd_leave = Rc::clone(&dnd);
+        let terminal_leave = Arc::clone(&terminal);
+        drop_target.connect_leave(move |_| {
+            let frames = dnd_leave.borrow_mut().drag_left();
+            write_dnd_frames(&terminal_leave, frames);
+        });
+
+        drop_target.connect_drop(move |target, value, x, y| {
             let file = match value.get::<gio::File>() {
-                Ok(f) => f,
+                Ok(file) => file,
                 Err(_) => return false,
             };
             let Some(path) = file.path() else {
                 return false;
             };
+
+            if dnd.borrow().is_enabled() {
+                if !dnd_accepts_uri_list(&dnd.borrow()) {
+                    return false;
+                }
+                let operation = gtk_drop_operation(target);
+                if dnd.borrow().accepted_operation() == DndOperation::None {
+                    return false;
+                }
+                let mut uri = file.uri().to_string();
+                if path.is_dir() && !uri.ends_with('/') {
+                    uri.push('/');
+                }
+                let location = gtk_dnd_location(x, y, *cell_dims.borrow());
+                let result = dnd.borrow_mut().dropped(
+                    location,
+                    operation,
+                    vec![DropData::uri_list(uri.into_bytes())],
+                );
+                return match result {
+                    Ok(frames) => {
+                        write_dnd_frames(&terminal, frames);
+                        true
+                    }
+                    Err(error) => {
+                        log::warn!("Rejected Kitty DND drop: {error:?}");
+                        false
+                    }
+                };
+            }
+
             let info = match cterm_app::file_drop::FileDropInfo::from_path(&path) {
                 Ok(info) => info,
                 Err(e) => {
@@ -1562,6 +1634,7 @@ impl TerminalWidget {
             on_title_change: Rc::new(RefCell::new(None)),
             preedit: Rc::new(RefCell::new(PreeditState::default())),
             on_file_transfer: Rc::new(RefCell::new(None)),
+            dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
             daemon_cmd_tx: Some(cmd_tx.clone()),
         };
 
@@ -1658,6 +1731,7 @@ impl TerminalWidget {
             on_title_change: Rc::new(RefCell::new(None)),
             preedit: Rc::new(RefCell::new(PreeditState::default())),
             on_file_transfer: Rc::new(RefCell::new(None)),
+            dnd_destination: Rc::new(RefCell::new(DndDestination::default())),
             daemon_cmd_tx: Some(cmd_tx.clone()),
         };
 
@@ -1984,6 +2058,7 @@ impl TerminalWidget {
         let on_bell = Rc::clone(&self.on_bell);
         let on_title_change = Rc::clone(&self.on_title_change);
         let on_file_transfer = Rc::clone(&self.on_file_transfer);
+        let dnd_destination = Rc::clone(&self.dnd_destination);
         let blink_clock = Rc::clone(&self.blink_clock);
         let blink_started = self.blink_started;
         glib::timeout_add_local(Duration::from_millis(10), move || {
@@ -2041,7 +2116,12 @@ impl TerminalWidget {
                                     crate::desktop_notification::handle(notification);
                                 }
                                 TerminalEvent::ContentChanged => content_changed = true,
-                                TerminalEvent::ProcessExited(_) | TerminalEvent::DndCommand(_) => {}
+                                TerminalEvent::DndCommand(command) => {
+                                    let actions =
+                                        dnd_destination.borrow_mut().handle_command(command);
+                                    apply_dnd_actions(&mut term, actions);
+                                }
+                                TerminalEvent::ProcessExited(_) => {}
                             }
                         }
 
@@ -2090,6 +2170,111 @@ impl TerminalWidget {
             glib::ControlFlow::Continue
         });
     }
+}
+
+fn dnd_accepts_uri_list(destination: &DndDestination) -> bool {
+    destination.is_enabled()
+        && (destination.registered_mimes().is_empty()
+            || destination
+                .registered_mimes()
+                .iter()
+                .any(|mime| mime == URI_LIST_MIME))
+}
+
+fn gtk_drop_operation(target: &gtk4::DropTarget) -> DndOperation {
+    let actions = target
+        .drop()
+        .map(|drop| drop.actions())
+        .unwrap_or_else(|| target.actions());
+    let copy = actions.contains(gdk::DragAction::COPY);
+    let move_ = actions.contains(gdk::DragAction::MOVE);
+    match (copy, move_) {
+        (true, true) => DndOperation::Either,
+        (true, false) => DndOperation::Copy,
+        (false, true) => DndOperation::Move,
+        (false, false) => DndOperation::None,
+    }
+}
+
+fn gtk_accepted_operation(operation: DndOperation) -> gdk::DragAction {
+    match operation {
+        DndOperation::Copy => gdk::DragAction::COPY,
+        DndOperation::Move => gdk::DragAction::MOVE,
+        DndOperation::Either => gdk::DragAction::COPY | gdk::DragAction::MOVE,
+        DndOperation::None => gdk::DragAction::empty(),
+    }
+}
+
+fn gtk_dnd_location(x: f64, y: f64, dimensions: CellDimensions) -> DndLocation {
+    fn coordinate(value: f64) -> i32 {
+        if value.is_finite() {
+            value.floor().clamp(0.0, i32::MAX as f64) as i32
+        } else {
+            0
+        }
+    }
+
+    DndLocation {
+        cell_x: coordinate(x / dimensions.width),
+        cell_y: coordinate(y / dimensions.height),
+        pixel_x: coordinate(x),
+        pixel_y: coordinate(y),
+    }
+}
+
+fn write_dnd_frames(terminal: &Arc<Mutex<Terminal>>, frames: Vec<Vec<u8>>) {
+    if frames.is_empty() {
+        return;
+    }
+    let mut terminal = terminal.lock();
+    for frame in frames {
+        if let Err(error) = terminal.write(&frame) {
+            log::error!("Failed to write Kitty DND frame to PTY: {error}");
+            break;
+        }
+    }
+}
+
+fn apply_dnd_actions(terminal: &mut Terminal, actions: Vec<DndAdapterAction>) {
+    for action in actions {
+        match action {
+            DndAdapterAction::Write(frame) => {
+                if let Err(error) = terminal.write(&frame) {
+                    log::error!("Failed to write Kitty DND response to PTY: {error}");
+                    break;
+                }
+            }
+            DndAdapterAction::RegistrationChanged { .. } | DndAdapterAction::DropFinished(_) => {}
+        }
+    }
+}
+
+fn gtk_dnd_motion(
+    target: &gtk4::DropTarget,
+    x: f64,
+    y: f64,
+    destination: &Rc<RefCell<DndDestination>>,
+    terminal: &Arc<Mutex<Terminal>>,
+    cell_dims: &Rc<RefCell<CellDimensions>>,
+) -> gdk::DragAction {
+    if !destination.borrow().is_enabled() {
+        return gdk::DragAction::COPY;
+    }
+    if !dnd_accepts_uri_list(&destination.borrow()) {
+        return gdk::DragAction::empty();
+    }
+
+    let operation = gtk_drop_operation(target);
+    let location = gtk_dnd_location(x, y, *cell_dims.borrow());
+    let frames =
+        destination
+            .borrow_mut()
+            .drag_moved(location, operation, &[URI_LIST_MIME.to_string()]);
+    match frames {
+        Ok(frames) => write_dnd_frames(terminal, frames),
+        Err(error) => log::warn!("Failed to report Kitty DND motion: {error:?}"),
+    }
+    gtk_accepted_operation(destination.borrow().accepted_operation())
 }
 
 /// Reset application-controlled state without discarding scrollback or the
@@ -3003,5 +3188,39 @@ mod tests {
         assert_eq!(screen.cursor.configured_style(), CursorStyle::Bar);
         assert!(!screen.cursor.blink.configured());
         assert!(!screen.cursor.blink.enabled());
+    }
+
+    #[test]
+    fn kitty_dnd_coordinates_are_bounded_and_cell_relative() {
+        let dimensions = CellDimensions {
+            width: 8.0,
+            height: 16.0,
+        };
+        assert_eq!(
+            gtk_dnd_location(20.5, 35.9, dimensions),
+            DndLocation {
+                cell_x: 2,
+                cell_y: 2,
+                pixel_x: 20,
+                pixel_y: 35,
+            }
+        );
+        assert_eq!(
+            gtk_dnd_location(f64::NAN, -5.0, dimensions),
+            DndLocation::default()
+        );
+    }
+
+    #[test]
+    fn kitty_dnd_maps_only_negotiated_copy_or_move_actions() {
+        assert_eq!(
+            gtk_accepted_operation(DndOperation::Copy),
+            gdk::DragAction::COPY
+        );
+        assert_eq!(
+            gtk_accepted_operation(DndOperation::Move),
+            gdk::DragAction::MOVE
+        );
+        assert!(gtk_accepted_operation(DndOperation::None).is_empty());
     }
 }
