@@ -935,6 +935,7 @@ impl SessionState {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn decode_transfer_responses(bytes: &[u8]) -> Vec<FileTransferCommand> {
         let mut responses = Vec::new();
         let mut remaining = bytes;
