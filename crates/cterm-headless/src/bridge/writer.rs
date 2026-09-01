@@ -16,9 +16,11 @@
 
 use std::io::Write;
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::time::{Duration, Instant};
 
 /// Maximum number of queued write messages before new writes are dropped.
 const WRITE_QUEUE_CAP: usize = 1024;
+const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Routes PTY writes to a dedicated blocking writer thread.
 pub struct PtyWriter {
@@ -66,6 +68,32 @@ impl PtyWriter {
             }
             Err(TrySendError::Disconnected(_)) => {
                 // Writer thread has exited (PTY closed / child gone). Drop silently.
+            }
+        }
+    }
+
+    /// Enqueue an owned response without dropping it when the bounded queue is
+    /// temporarily full. This is intended for a dedicated blocking worker,
+    /// never a Tokio runtime thread. The deadline prevents a child which has
+    /// stopped reading from wedging terminal-session shutdown forever.
+    pub fn send_with_backpressure(&self, mut data: Vec<u8>, deadline: Instant) -> bool {
+        if data.is_empty() {
+            return true;
+        }
+        loop {
+            match self.tx.try_send(data) {
+                Ok(()) => return true,
+                Err(TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        log::warn!(
+                            "PTY write queue remained full; aborting streamed OSC 5113 response"
+                        );
+                        return false;
+                    }
+                    data = returned;
+                    std::thread::sleep(BACKPRESSURE_POLL_INTERVAL);
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
             }
         }
     }

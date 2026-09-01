@@ -68,6 +68,13 @@ pub enum TtyTransferAction {
     Write(Vec<u8>),
     /// A command whose session has received explicit user consent.
     Execute(AuthorizedTtyTransferCommand),
+    /// Finish the metadata listing for an approved receive session. The
+    /// filesystem executor supplies the local home path in the terminating
+    /// `OK` response after every queued path has been inspected.
+    CompleteReceiveListing {
+        session_id: String,
+        quiet: u8,
+    },
     /// Drop any filesystem staging owned by this session.
     Abort {
         session_id: String,
@@ -165,6 +172,7 @@ impl TtyTransferManager {
                         })
                     }),
             );
+            actions.push(TtyTransferAction::CompleteReceiveListing { session_id, quiet });
         }
         actions
     }
@@ -649,6 +657,11 @@ mod tests {
                 .count(),
             2
         );
+        assert!(matches!(
+            approved.last(),
+            Some(TtyTransferAction::CompleteReceiveListing { session_id, quiet: 0 })
+                if session_id == "receive-1"
+        ));
     }
 
     #[test]

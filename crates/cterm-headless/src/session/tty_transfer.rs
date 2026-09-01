@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use cterm_app::{
-    TtyTransferAction, TtyTransferLimits, TtyTransferManager, TtyTransferSendFilesystem,
-};
+use cterm_app::{TtyTransferAction, TtyTransferFilesystem, TtyTransferLimits, TtyTransferManager};
 use cterm_core::FileTransferCommand;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -16,6 +14,7 @@ use tokio::time::Instant;
 use super::SessionState;
 
 const COMMAND_QUEUE_CAPACITY: usize = 512;
+const STREAM_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const APPROVED_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(super) const DEFAULT_MAX_FILES_PER_SESSION: usize = 256;
@@ -51,7 +50,7 @@ impl TtyTransferController {
             DEFAULT_MAX_SESSION_BYTES,
         )
         .map_err(|_| "default transfer limits are invalid")?;
-        let filesystem = TtyTransferSendFilesystem::new(home, limits)
+        let filesystem = TtyTransferFilesystem::new(home, limits)
             .map_err(|_| "local transfer filesystem is unavailable")?;
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| "Tokio runtime is unavailable")?;
@@ -162,7 +161,7 @@ fn local_home_directory() -> Option<PathBuf> {
 async fn run_worker(
     session: Weak<SessionState>,
     mut rx: mpsc::Receiver<WorkerMessage>,
-    filesystem: TtyTransferSendFilesystem,
+    filesystem: TtyTransferFilesystem,
     active: Arc<AtomicBool>,
     queued: Arc<AtomicUsize>,
 ) {
@@ -180,7 +179,7 @@ async fn run_worker(
         active: Arc::clone(&active),
         queued: Arc::clone(&queued),
     };
-    let mut manager = TtyTransferManager::send_only();
+    let mut manager = TtyTransferManager::new();
     let mut filesystem = filesystem;
     let mut pending: HashMap<u64, (String, Instant)> = HashMap::new();
     let mut approved_idle: HashMap<String, Instant> = HashMap::new();
@@ -355,9 +354,9 @@ async fn run_worker(
 async fn dispatch_actions(
     session: &Weak<SessionState>,
     pending: &mut HashMap<u64, (String, Instant)>,
-    mut filesystem: TtyTransferSendFilesystem,
+    mut filesystem: TtyTransferFilesystem,
     actions: Vec<TtyTransferAction>,
-) -> Option<TtyTransferSendFilesystem> {
+) -> Option<TtyTransferFilesystem> {
     let mut actions: VecDeque<_> = actions.into();
     while let Some(action) = actions.pop_front() {
         match action {
@@ -371,18 +370,25 @@ async fn dispatch_actions(
                 let session = session.upgrade()?;
                 session.register_tty_transfer_prompt(request, expires_at);
             }
-            executable @ (TtyTransferAction::Execute(_) | TtyTransferAction::Abort { .. }) => {
+            executable @ (TtyTransferAction::Execute(_)
+            | TtyTransferAction::CompleteReceiveListing { .. }
+            | TtyTransferAction::Abort { .. }) => {
+                let live_session = session.upgrade()?;
                 let mut current = filesystem;
                 match tokio::task::spawn_blocking(move || {
-                    let next = current.handle_action(executable);
-                    (current, next)
+                    let deadline = std::time::Instant::now() + STREAM_BACKPRESSURE_TIMEOUT;
+                    let completed = current.handle_executable(executable, &mut |bytes| {
+                        live_session
+                            .send_tty_transfer_response_with_backpressure(bytes, deadline)
+                    });
+                    (current, completed)
                 })
                 .await
                 {
-                    Ok((current, next)) => {
+                    Ok((current, true)) => {
                         filesystem = current;
-                        actions.extend(next);
                     }
+                    Ok((_current, false)) => return None,
                     Err(error) => {
                         log::error!("OSC 5113 filesystem worker panicked: {error}");
                         return None;
@@ -424,8 +430,8 @@ mod tests {
     }
 
     #[test]
-    fn only_start_actions_can_enter_a_fresh_manager() {
-        let mut manager = TtyTransferManager::send_only();
+    fn receive_start_enters_the_full_daemon_manager_without_filesystem_work() {
+        let mut manager = TtyTransferManager::new();
         let command = FileTransferCommand {
             action: FileTransferAction::Receive,
             id: "unsupported".into(),
@@ -434,7 +440,7 @@ mod tests {
             quiet: 0,
             mtime: None,
             permissions: None,
-            size: Some(0),
+            size: Some(1),
             name: None,
             status: None,
             parent: None,
@@ -443,9 +449,7 @@ mod tests {
             file_type: None,
             transmission_type: None,
         };
-        assert!(matches!(
-            manager.handle(command).as_slice(),
-            [TtyTransferAction::Write(_)]
-        ));
+        assert!(manager.handle(command).is_empty());
+        assert_eq!(manager.active_sessions(), 1);
     }
 }

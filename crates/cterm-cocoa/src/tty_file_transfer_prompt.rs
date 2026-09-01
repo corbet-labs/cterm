@@ -1,4 +1,4 @@
-//! Native macOS consent for daemon-owned Kitty OSC 5113 send sessions.
+//! Native macOS consent for daemon-owned Kitty OSC 5113 sessions.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

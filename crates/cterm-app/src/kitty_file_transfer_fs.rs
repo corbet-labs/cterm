@@ -25,6 +25,7 @@ use thiserror::Error;
 use crate::kitty_file_transfer::{
     AuthorizedTtyTransferCommand, TtyTransferAction, TtyTransferDirection,
 };
+use crate::kitty_file_transfer_receive::TtyTransferReceiveFilesystem;
 
 /// Explicit resource policy for transfers accepted by the local frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,80 @@ pub enum TtyTransferFilesystemConfigError {
     FileLimitExceedsSessionLimit,
     #[error("TTY file-transfer home directory must be absolute")]
     HomeIsNotAbsolute,
+    #[error("TTY file-transfer home directory cannot be represented by the protocol")]
+    HomeIsNotRepresentable,
+}
+
+/// Bidirectional consent-gated OSC 5113 filesystem executor.
+#[derive(Debug)]
+pub struct TtyTransferFilesystem {
+    send: TtyTransferSendFilesystem,
+    receive: TtyTransferReceiveFilesystem,
+}
+
+impl TtyTransferFilesystem {
+    pub fn new(
+        home: PathBuf,
+        limits: TtyTransferLimits,
+    ) -> Result<Self, TtyTransferFilesystemConfigError> {
+        Ok(Self {
+            send: TtyTransferSendFilesystem::new(home.clone(), limits)?,
+            receive: TtyTransferReceiveFilesystem::new(home, limits)?,
+        })
+    }
+
+    /// Consume an executor action and deliver encoded protocol output through
+    /// a bounded caller-owned sink. Returning `false` means the sink closed
+    /// while a receive file was being streamed.
+    pub fn handle_executable<F>(&mut self, action: TtyTransferAction, emit: &mut F) -> bool
+    where
+        F: FnMut(Vec<u8>) -> bool,
+    {
+        match action {
+            TtyTransferAction::Execute(authorized)
+                if authorized.direction() == TtyTransferDirection::Receive =>
+            {
+                self.receive.handle_authorized(authorized, emit)
+            }
+            TtyTransferAction::CompleteReceiveListing { session_id, quiet } => {
+                self.receive.complete_listing(session_id, quiet, emit)
+            }
+            TtyTransferAction::Abort { session_id } => {
+                self.send.sessions.remove(&session_id);
+                self.receive.abort(&session_id);
+                true
+            }
+            executable @ TtyTransferAction::Execute(_) => {
+                for output in self.send.handle_action(executable) {
+                    if let TtyTransferAction::Write(bytes) = output {
+                        if !emit(bytes) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            TtyTransferAction::Write(bytes) => emit(bytes),
+            TtyTransferAction::RequestApproval(_) => true,
+        }
+    }
+
+    /// Collection adapter used by focused unit tests and non-streaming callers.
+    pub fn handle_action(&mut self, action: TtyTransferAction) -> Vec<TtyTransferAction> {
+        if matches!(action, TtyTransferAction::RequestApproval(_)) {
+            return vec![action];
+        }
+        let mut output = Vec::new();
+        self.handle_executable(action, &mut |bytes| {
+            output.push(TtyTransferAction::Write(bytes));
+            true
+        });
+        output
+    }
+
+    pub fn active_sessions(&self) -> usize {
+        self.send.active_sessions() + self.receive.active_sessions()
+    }
 }
 
 /// Filesystem stage for approved remote-to-local regular-file transfers.
@@ -1669,7 +1744,7 @@ fn apply_permissions(_file: &fs::File, _permissions: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn resolve_protocol_path(home: &Path, path: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_protocol_path(home: &Path, path: &str) -> Option<PathBuf> {
     // OSC 5113 paths always use POSIX separators, including on Windows.
     // Rejecting backslashes also prevents a component from becoming an
     // unexpected Windows path prefix when it is appended below.

@@ -852,6 +852,20 @@ impl SessionState {
         }
     }
 
+    /// Reliably enqueue one streamed OSC 5113 packet from the transfer
+    /// filesystem's blocking worker. Unlike ordinary terminal reports, file
+    /// contents must not be silently dropped when the PTY queue is full.
+    pub(super) fn send_tty_transfer_response_with_backpressure(
+        &self,
+        response: Vec<u8>,
+        deadline: std::time::Instant,
+    ) -> bool {
+        match self.pty_writer.get() {
+            Some(writer) => writer.send_with_backpressure(response, deadline),
+            None => self.terminal.write().write(&response).is_ok(),
+        }
+    }
+
     fn send_terminal_responses(&self, responses: Vec<Vec<u8>>) {
         if responses.is_empty() {
             return;
@@ -921,6 +935,29 @@ impl SessionState {
 mod tests {
     use super::*;
 
+    fn decode_transfer_responses(bytes: &[u8]) -> Vec<FileTransferCommand> {
+        let mut responses = Vec::new();
+        let mut remaining = bytes;
+        while let Some(start) = remaining
+            .windows(b"\x1b]5113;".len())
+            .position(|window| window == b"\x1b]5113;")
+        {
+            remaining = &remaining[start + b"\x1b]5113;".len()..];
+            let Some(end) = remaining.windows(2).position(|window| window == b"\x1b\\") else {
+                break;
+            };
+            let body = &remaining[..end];
+            let mut fields = vec![&b"5113"[..]];
+            fields.extend(body.split(|byte| *byte == b';'));
+            responses.push(
+                cterm_core::parse_file_transfer_command(&fields)
+                    .expect("daemon emitted a valid OSC 5113 response"),
+            );
+            remaining = &remaining[end + 2..];
+        }
+        responses
+    }
+
     #[test]
     fn detach_count_saturates_at_zero() {
         let session =
@@ -989,6 +1026,143 @@ mod tests {
                 .await
         );
         assert!(session.subscribe_tty_transfer_prompts().0.is_empty());
+        session.shutdown_tty_transfers().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_receive_streams_only_the_listed_file_through_the_daemon_actor() {
+        use std::io::Write as _;
+        use std::sync::Mutex;
+
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        let contents = vec![b'r'; cterm_core::MAX_FILE_TRANSFER_CHUNK_BYTES * 2 + 37];
+        source.write_all(&contents).unwrap();
+        source.as_file().sync_all().unwrap();
+        let source_path = source.path().to_str().unwrap().to_string();
+
+        let session = SessionState::new_ssh_connecting(
+            "tty-transfer-receive".to_string(),
+            PtySize::default(),
+            0,
+        );
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&writes);
+        session.with_terminal_mut(|terminal| {
+            terminal.set_write_fn(Box::new(move |data| {
+                observed.lock().unwrap().extend_from_slice(data);
+                Ok(())
+            }));
+        });
+        let controller = TtyTransferController::spawn(&session).unwrap();
+        assert!(session.tty_transfer.set(Some(controller)).is_ok());
+        let (_, mut approvals) = session.subscribe_tty_transfer_prompts();
+
+        let mut start = FileTransferCommand {
+            action: FileTransferAction::Receive,
+            id: "receive-actor".into(),
+            file_id: None,
+            bypass: None,
+            quiet: 0,
+            mtime: None,
+            permissions: None,
+            size: Some(1),
+            name: None,
+            status: None,
+            parent: None,
+            data: Vec::new(),
+            compression: None,
+            file_type: None,
+            transmission_type: None,
+        };
+        let mut query = start.clone();
+        query.action = FileTransferAction::File;
+        query.size = None;
+        query.file_id = Some("spec-0".into());
+        query.name = Some(source_path);
+        let mut request_bytes = start.encode().unwrap();
+        request_bytes.extend(query.encode().unwrap());
+        session.process_output(&request_bytes).await;
+
+        let approval = tokio::time::timeout(std::time::Duration::from_secs(1), approvals.recv())
+            .await
+            .expect("receive approval timed out")
+            .expect("receive approval channel closed");
+        assert_eq!(
+            approval.direction,
+            crate::proto::TtyFileTransferDirection::Receive as i32
+        );
+        assert_eq!(approval.paths, [query.name.clone().unwrap()]);
+        assert!(
+            session
+                .respond_tty_transfer_approval(approval.request_id, true)
+                .await
+        );
+
+        let listing = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let responses = decode_transfer_responses(&writes.lock().unwrap());
+                if responses.len() >= 3 {
+                    break responses;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("receive metadata listing timed out");
+        assert_eq!(listing[0].status.as_deref(), Some("OK"));
+        assert_eq!(listing[1].action, FileTransferAction::File);
+        assert_eq!(listing[1].size, Some(contents.len() as u64));
+        assert_eq!(listing[2].status.as_deref(), Some("OK"));
+        assert!(listing[2]
+            .name
+            .as_deref()
+            .is_some_and(|home| home.starts_with('/')));
+
+        writes.lock().unwrap().clear();
+        let mut data_request = start.clone();
+        data_request.action = FileTransferAction::File;
+        data_request.size = None;
+        data_request.file_id = Some("local-0".into());
+        data_request.name = listing[1].name.clone();
+        session
+            .process_output(&data_request.encode().unwrap())
+            .await;
+        let packets = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let responses = decode_transfer_responses(&writes.lock().unwrap());
+                if responses
+                    .last()
+                    .is_some_and(|packet| packet.action == FileTransferAction::EndData)
+                {
+                    break responses;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("receive data stream timed out");
+        assert!(packets
+            .iter()
+            .all(|packet| packet.data.len() <= cterm_core::MAX_FILE_TRANSFER_CHUNK_BYTES));
+        assert_eq!(
+            packets
+                .into_iter()
+                .flat_map(|packet| packet.data)
+                .collect::<Vec<_>>(),
+            contents
+        );
+
+        start.action = FileTransferAction::Finished;
+        start.size = None;
+        session.process_output(&start.encode().unwrap()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while session.has_active_tty_transfers() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("receive session did not close");
         session.shutdown_tty_transfers().await;
     }
 }
