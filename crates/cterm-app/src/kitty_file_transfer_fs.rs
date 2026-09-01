@@ -1200,7 +1200,7 @@ fn replace_staged_file(
     // handle was opened with DELETE access.
     let status = unsafe {
         (*info).Anonymous.ReplaceIfExists = true;
-        (*info).RootDirectory = windows_handle(parent);
+        (*info).RootDirectory = windows_handle(parent).cast();
         (*info).FileNameLength = name_bytes as u32;
         ptr::copy_nonoverlapping(
             name.as_ptr(),
@@ -1209,7 +1209,7 @@ fn replace_staged_file(
         );
         let mut io_status = IO_STATUS_BLOCK::default();
         NtSetInformationFile(
-            windows_handle(file),
+            windows_handle(file).cast(),
             &mut io_status,
             info.cast(),
             buffer_size,
