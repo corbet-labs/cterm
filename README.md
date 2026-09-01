@@ -520,17 +520,19 @@ begins from redirecting the payload or its commit. On Unix, unsafe shared
 destination directories that are group/world-writable without the sticky bit
 are rejected; Windows staging directories use a protected owner-only DACL and
 retain the payload with read/write sharing disabled until its atomic commit.
-Approved local-to-remote regular-file sessions list metadata from retained,
-no-follow file handles and will only stream paths present in that consented
-listing. Plain and zlib data use Kitty-sized chunks through a bounded
-backpressured PTY path, while changed, replaced, oversized, duplicate, and
-unlisted sources fail closed without reopening a client-selected pathname.
+Approved local-to-remote sessions recursively enumerate consented directory
+handles without following symlinks, correlate parent directories, symbolic
+links, and filesystem-identity hardlinks, and retain exact regular-file handles
+and symbolic-link values for later requests. Plain and zlib data use
+Kitty-sized chunks through a bounded backpressured PTY path, while changed,
+replaced, oversized, duplicate, and unlisted sources fail closed without
+reopening a client-selected pathname.
 GTK/Wayland, Cocoa, and Win32 surface daemon-owned, deny-by-default native
 consent dialogs with exact token, expiry, pane/session cancellation, and
 reconnect replay semantics; the daemon refuses relaunch while any transfer
-actor is pending, queued, staged, or draining. Directory/link trees,
-rsync/XXH3, authorization bypass, and native prompt interaction automation
-remain open and are tracked in the
+actor is pending, queued, staged, or draining. Remote-to-local directory/link
+creation, rsync/XXH3, authorization bypass, and native prompt interaction
+automation remain open and are tracked in the
 [parity inventory](docs/parity.md); cterm does not advertise the protocol as
 complete yet.
 

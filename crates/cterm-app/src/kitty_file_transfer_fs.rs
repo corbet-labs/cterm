@@ -1751,6 +1751,9 @@ pub(crate) fn resolve_protocol_path(home: &Path, path: &str) -> Option<PathBuf> 
     if path.contains('\\') {
         return None;
     }
+    if path == "~" {
+        return Some(home.to_path_buf());
+    }
     if let Some(relative) = path.strip_prefix("~/") {
         return append_normal_components(home.to_path_buf(), Path::new(relative));
     }

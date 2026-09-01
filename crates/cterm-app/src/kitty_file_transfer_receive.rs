@@ -6,6 +6,7 @@
 //! or win a pathname replacement race between listing and transmission.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,17 +14,17 @@ use std::time::UNIX_EPOCH;
 
 use cterm_core::{
     FileTransferAction, FileTransferCommand, FileTransferCompression, FileTransferType,
-    FileTransmissionType, MAX_FILE_TRANSFER_CHUNK_BYTES,
+    FileTransmissionType, MAX_FILE_TRANSFER_CHUNK_BYTES, MAX_FILE_TRANSFER_PATH_BYTES,
 };
 use flate2::{write::ZlibEncoder, Compression};
-use fs_at::OpenOptions as OpenOptionsAt;
+use fs_at::{read_dir, OpenOptions as OpenOptionsAt};
 
 use crate::kitty_file_transfer::{AuthorizedTtyTransferCommand, TtyTransferDirection};
 use crate::kitty_file_transfer_fs::{
     resolve_protocol_path, TtyTransferFilesystemConfigError, TtyTransferLimits,
 };
 
-/// Filesystem stage for approved local-to-remote regular-file transfers.
+/// Filesystem stage for approved local-to-remote file-tree transfers.
 #[derive(Debug)]
 pub struct TtyTransferReceiveFilesystem {
     home: PathBuf,
@@ -71,9 +72,9 @@ impl TtyTransferReceiveFilesystem {
                     .get(&command.id)
                     .is_none_or(|session| !session.listing_complete);
                 if listing {
-                    self.list_regular_file(command, quiet, emit)
+                    self.list_path(command, quiet, emit)
                 } else {
-                    self.transmit_regular_file(command, quiet, emit)
+                    self.transmit_source(command, quiet, emit)
                 }
             }
             FileTransferAction::Data | FileTransferAction::EndData => emit_status(
@@ -104,6 +105,99 @@ impl TtyTransferReceiveFilesystem {
     {
         let session = self.sessions.entry(session_id.clone()).or_default();
         session.listing_complete = true;
+        let entries = std::mem::take(&mut session.entries);
+        let path_ids: HashMap<_, _> = entries
+            .iter()
+            .filter_map(|item| match item {
+                PendingReceiveListingItem::Entry(entry) => {
+                    Some((entry.path.clone(), entry.actual_id.clone()))
+                }
+                PendingReceiveListingItem::Error(_) => None,
+            })
+            .collect();
+        let mut regular_ids: HashMap<FileIdentity, String> = HashMap::new();
+
+        for item in entries {
+            let entry = match item {
+                PendingReceiveListingItem::Entry(entry) => entry,
+                PendingReceiveListingItem::Error(bytes) => {
+                    if !emit(bytes) {
+                        self.sessions.remove(&session_id);
+                        return false;
+                    }
+                    continue;
+                }
+            };
+            let (file_type, data, source) = match entry.kind {
+                ListedReceiveKind::Regular {
+                    file,
+                    size,
+                    identity,
+                } => {
+                    if let Some(target_id) = regular_ids.get(&identity).cloned() {
+                        (
+                            FileTransferType::Link,
+                            target_id.into_bytes(),
+                            ReceiveSource::Link,
+                        )
+                    } else {
+                        regular_ids.insert(identity, entry.actual_id.clone());
+                        (
+                            FileTransferType::Regular,
+                            Vec::new(),
+                            ReceiveSource::Regular { file, size },
+                        )
+                    }
+                }
+                ListedReceiveKind::Directory => (
+                    FileTransferType::Directory,
+                    Vec::new(),
+                    ReceiveSource::Directory,
+                ),
+                ListedReceiveKind::Symlink {
+                    target,
+                    resolved_target,
+                    absolute,
+                } => {
+                    let data = resolved_target
+                        .as_ref()
+                        .and_then(|target| path_ids.get(target))
+                        .map(|target_id| target_id.as_bytes().to_vec())
+                        .unwrap_or_default();
+                    (
+                        FileTransferType::Symlink,
+                        data,
+                        ReceiveSource::Symlink { target, absolute },
+                    )
+                }
+            };
+            session
+                .sources
+                .entry(entry.name.clone())
+                .or_default()
+                .push_back(source);
+            let metadata_command = FileTransferCommand {
+                action: FileTransferAction::File,
+                id: session_id.clone(),
+                file_id: Some(entry.spec_id),
+                bypass: None,
+                quiet: 0,
+                mtime: entry.mtime,
+                permissions: Some(entry.permissions),
+                size: Some(entry.size),
+                name: Some(entry.name),
+                status: Some(entry.actual_id),
+                parent: entry.parent,
+                data,
+                compression: None,
+                file_type: Some(file_type),
+                transmission_type: None,
+            };
+            if !emit_command(emit, metadata_command) {
+                self.sessions.remove(&session_id);
+                return false;
+            }
+        }
         let request = FileTransferCommand {
             action: FileTransferAction::Status,
             id: session_id,
@@ -139,12 +233,7 @@ impl TtyTransferReceiveFilesystem {
         self.sessions.remove(session_id);
     }
 
-    fn list_regular_file<F>(
-        &mut self,
-        command: FileTransferCommand,
-        quiet: u8,
-        emit: &mut F,
-    ) -> bool
+    fn list_path<F>(&mut self, command: FileTransferCommand, quiet: u8, emit: &mut F) -> bool
     where
         F: FnMut(Vec<u8>) -> bool,
     {
@@ -167,60 +256,6 @@ impl TtyTransferReceiveFilesystem {
                 None,
             );
         };
-        let listed_name = match protocol_absolute_path(&path) {
-            Some(name) => name,
-            None => {
-                return emit_status(
-                    emit,
-                    &command,
-                    "EINVAL:Source path is not representable",
-                    quiet,
-                    true,
-                    None,
-                    None,
-                );
-            }
-        };
-        let file = match open_regular_nofollow(&path) {
-            Ok(file) => file,
-            Err(error) => {
-                return emit_status(
-                    emit,
-                    &command,
-                    receive_io_status(&error, "EIO:Could not open source file"),
-                    quiet,
-                    true,
-                    None,
-                    None,
-                );
-            }
-        };
-        let metadata = match file.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return emit_status(
-                    emit,
-                    &command,
-                    receive_io_status(&error, "EIO:Could not inspect source file"),
-                    quiet,
-                    true,
-                    None,
-                    None,
-                );
-            }
-        };
-        if !metadata.is_file() {
-            return emit_status(
-                emit,
-                &command,
-                "ENOTSUP:Only regular-file receive is implemented",
-                quiet,
-                true,
-                None,
-                None,
-            );
-        }
-
         let session = self.sessions.entry(command.id.clone()).or_default();
         if session.listing_complete {
             return emit_status(
@@ -233,71 +268,58 @@ impl TtyTransferReceiveFilesystem {
                 None,
             );
         }
-        if session.listed_files >= self.limits.max_files_per_session {
-            return emit_status(
-                emit,
-                &command,
-                "ENOSPC:Too many files in transfer session",
-                quiet,
-                true,
-                None,
-                None,
-            );
-        }
-        let size = metadata.len();
-        if size > self.limits.max_file_bytes
-            || session
-                .planned_bytes
-                .checked_add(size)
-                .is_none_or(|total| total > self.limits.max_session_bytes)
-        {
-            return emit_status(
-                emit,
-                &command,
-                "EFBIG:Transfer exceeds configured size limits",
-                quiet,
-                true,
-                None,
-                None,
-            );
-        }
-
-        let actual_id = session.next_actual_id.to_string();
-        session.next_actual_id = session.next_actual_id.wrapping_add(1);
-        session.listed_files += 1;
-        session.planned_bytes += size;
-        session
-            .sources
-            .entry(listed_name.clone())
-            .or_default()
-            .push_back(ReceiveSource { file, size });
-
-        let metadata_command = FileTransferCommand {
-            action: FileTransferAction::File,
-            id: command.id,
-            file_id: Some(file_id.to_string()),
-            bypass: None,
-            quiet: 0,
-            mtime: modification_time_nanoseconds(&metadata),
-            permissions: Some(protocol_permissions(&metadata)),
-            size: Some(size),
-            name: Some(listed_name),
-            status: Some(actual_id),
-            parent: None,
-            data: Vec::new(),
-            compression: None,
-            file_type: Some(FileTransferType::Regular),
-            transmission_type: None,
+        let remaining_files = self
+            .limits
+            .max_files_per_session
+            .saturating_sub(session.listed_files);
+        let remaining_bytes = self
+            .limits
+            .max_session_bytes
+            .saturating_sub(session.planned_bytes);
+        let collected = match collect_receive_tree(
+            &path,
+            file_id,
+            session.next_actual_id,
+            remaining_files,
+            self.limits.max_file_bytes,
+            remaining_bytes,
+        ) {
+            Ok(collected) => collected,
+            Err(error) => {
+                let mut encoded = None;
+                emit_status(
+                    &mut |bytes| {
+                        encoded = Some(bytes);
+                        true
+                    },
+                    &command,
+                    error.protocol_status(),
+                    quiet,
+                    true,
+                    None,
+                    None,
+                );
+                if let Some(encoded) = encoded {
+                    session
+                        .entries
+                        .push(PendingReceiveListingItem::Error(encoded));
+                }
+                return true;
+            }
         };
-        emit_command(emit, metadata_command)
+        session.next_actual_id = collected.next_actual_id;
+        session.listed_files += collected.entries.len();
+        session.planned_bytes += collected.planned_bytes;
+        session.entries.extend(
+            collected
+                .entries
+                .into_iter()
+                .map(PendingReceiveListingItem::Entry),
+        );
+        true
     }
 
-    fn transmit_regular_file<F>(
-        &mut self,
-        command: FileTransferCommand,
-        quiet: u8,
-        emit: &mut F,
-    ) -> bool
+    fn transmit_source<F>(&mut self, command: FileTransferCommand, quiet: u8, emit: &mut F) -> bool
     where
         F: FnMut(Vec<u8>) -> bool,
     {
@@ -357,7 +379,7 @@ impl TtyTransferReceiveFilesystem {
             );
         };
         session.transmitted_ids.insert(file_id.to_string());
-        let Some(mut source) = sources.pop_front() else {
+        let Some(source) = sources.pop_front() else {
             return emit_status(
                 emit,
                 &command,
@@ -371,29 +393,68 @@ impl TtyTransferReceiveFilesystem {
         if sources.is_empty() {
             session.sources.remove(requested_name);
         }
-        if match source.file.metadata() {
-            Ok(metadata) => metadata.len() != source.size,
-            Err(_) => true,
-        } {
-            return emit_status(
-                emit,
-                &command,
-                "ESTALE:Source file changed after approval",
-                quiet,
-                true,
-                None,
-                None,
-            );
-        }
-
-        let result = stream_file(
-            &mut source.file,
-            source.size,
-            &command.id,
-            file_id,
-            command.compression,
-            emit,
-        );
+        let result = match source {
+            ReceiveSource::Regular { mut file, size } => {
+                if match file.metadata() {
+                    Ok(metadata) => metadata.len() != size,
+                    Err(_) => true,
+                } {
+                    return emit_status(
+                        emit,
+                        &command,
+                        "ESTALE:Source file changed after approval",
+                        quiet,
+                        true,
+                        None,
+                        None,
+                    );
+                }
+                stream_file(
+                    &mut file,
+                    size,
+                    &command.id,
+                    file_id,
+                    command.compression,
+                    emit,
+                )
+            }
+            ReceiveSource::Symlink { target, absolute } => {
+                if absolute {
+                    return emit_status(
+                        emit,
+                        &command,
+                        "EINVAL:Absolute symlink data must not be requested",
+                        quiet,
+                        true,
+                        None,
+                        None,
+                    );
+                }
+                stream_bytes(&target, &command.id, file_id, emit)
+            }
+            ReceiveSource::Directory => {
+                return emit_status(
+                    emit,
+                    &command,
+                    "EISDIR:Directory data must not be requested",
+                    quiet,
+                    true,
+                    None,
+                    None,
+                );
+            }
+            ReceiveSource::Link => {
+                return emit_status(
+                    emit,
+                    &command,
+                    "EINVAL:Hard-link data must not be requested",
+                    quiet,
+                    true,
+                    None,
+                    None,
+                );
+            }
+        };
         match result {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => false,
@@ -412,6 +473,7 @@ impl TtyTransferReceiveFilesystem {
 
 #[derive(Debug, Default)]
 struct ReceiveSession {
+    entries: Vec<PendingReceiveListingItem>,
     sources: HashMap<String, VecDeque<ReceiveSource>>,
     transmitted_ids: HashSet<String>,
     listed_files: usize,
@@ -421,12 +483,262 @@ struct ReceiveSession {
 }
 
 #[derive(Debug)]
-struct ReceiveSource {
-    file: fs::File,
-    size: u64,
+enum PendingReceiveListingItem {
+    Entry(ListedReceiveEntry),
+    Error(Vec<u8>),
 }
 
-fn open_regular_nofollow(path: &Path) -> io::Result<fs::File> {
+#[derive(Debug)]
+struct ListedReceiveEntry {
+    spec_id: String,
+    actual_id: String,
+    path: PathBuf,
+    name: String,
+    parent: Option<String>,
+    mtime: Option<i64>,
+    permissions: u32,
+    size: u64,
+    kind: ListedReceiveKind,
+}
+
+#[derive(Debug)]
+enum ListedReceiveKind {
+    Regular {
+        file: fs::File,
+        size: u64,
+        identity: FileIdentity,
+    },
+    Directory,
+    Symlink {
+        target: Vec<u8>,
+        resolved_target: Option<PathBuf>,
+        absolute: bool,
+    },
+}
+
+#[derive(Debug)]
+enum ReceiveSource {
+    Regular { file: fs::File, size: u64 },
+    Directory,
+    Symlink { target: Vec<u8>, absolute: bool },
+    Link,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    volume: u64,
+    node: u64,
+}
+
+#[derive(Debug)]
+struct CollectedReceiveTree {
+    entries: Vec<ListedReceiveEntry>,
+    planned_bytes: u64,
+    next_actual_id: u64,
+}
+
+#[derive(Debug)]
+enum ReceiveListingError {
+    Io(io::Error),
+    TooManyEntries,
+    FileTooLarge,
+    SessionTooLarge,
+    UnrepresentablePath,
+    UnsupportedFileType,
+}
+
+impl ReceiveListingError {
+    fn protocol_status(&self) -> &'static str {
+        match self {
+            Self::Io(error) => receive_io_status(error, "EIO:Could not inspect source tree"),
+            Self::TooManyEntries => "ENOSPC:Too many files in transfer session",
+            Self::FileTooLarge | Self::SessionTooLarge => {
+                "EFBIG:Transfer exceeds configured size limits"
+            }
+            Self::UnrepresentablePath => "EINVAL:Source path is not representable",
+            Self::UnsupportedFileType => "ENOTSUP:Source contains an unsupported file type",
+        }
+    }
+}
+
+impl From<io::Error> for ReceiveListingError {
+    fn from(error: io::Error) -> Self {
+        if error.kind() == io::ErrorKind::Unsupported {
+            Self::UnsupportedFileType
+        } else {
+            Self::Io(error)
+        }
+    }
+}
+
+fn collect_receive_tree(
+    path: &Path,
+    spec_id: &str,
+    first_actual_id: u64,
+    max_entries: usize,
+    max_file_bytes: u64,
+    max_session_bytes: u64,
+) -> Result<CollectedReceiveTree, ReceiveListingError> {
+    let mut collector = ReceiveTreeCollector {
+        spec_id,
+        entries: Vec::new(),
+        planned_bytes: 0,
+        next_actual_id: first_actual_id,
+        max_entries,
+        max_file_bytes,
+        max_session_bytes,
+    };
+    let opened = open_top_level_entry(path)?;
+    collector.collect(path.to_path_buf(), None, opened)?;
+    Ok(CollectedReceiveTree {
+        entries: collector.entries,
+        planned_bytes: collector.planned_bytes,
+        next_actual_id: collector.next_actual_id,
+    })
+}
+
+struct ReceiveTreeCollector<'a> {
+    spec_id: &'a str,
+    entries: Vec<ListedReceiveEntry>,
+    planned_bytes: u64,
+    next_actual_id: u64,
+    max_entries: usize,
+    max_file_bytes: u64,
+    max_session_bytes: u64,
+}
+
+impl ReceiveTreeCollector<'_> {
+    fn collect(
+        &mut self,
+        path: PathBuf,
+        parent: Option<String>,
+        opened: OpenedReceiveEntry,
+    ) -> Result<(), ReceiveListingError> {
+        if self.entries.len() >= self.max_entries {
+            return Err(ReceiveListingError::TooManyEntries);
+        }
+        let name = protocol_absolute_path(&path)
+            .filter(|name| valid_generated_protocol_path(name))
+            .ok_or(ReceiveListingError::UnrepresentablePath)?;
+        let actual_id = self.next_actual_id.to_string();
+        self.next_actual_id = self.next_actual_id.wrapping_add(1);
+
+        match opened {
+            OpenedReceiveEntry::Regular { file, metadata } => {
+                let size = metadata.len();
+                self.reserve_data(size)?;
+                let identity = file_identity(&file, &metadata)?;
+                self.entries.push(ListedReceiveEntry {
+                    spec_id: self.spec_id.to_string(),
+                    actual_id,
+                    path,
+                    name,
+                    parent,
+                    mtime: modification_time_nanoseconds(&metadata),
+                    permissions: protocol_permissions(&metadata),
+                    size,
+                    kind: ListedReceiveKind::Regular {
+                        file,
+                        size,
+                        identity,
+                    },
+                });
+            }
+            OpenedReceiveEntry::Symlink { target, metadata } => {
+                let encoded_target = protocol_symlink_target(&target)
+                    .ok_or(ReceiveListingError::UnrepresentablePath)?;
+                self.reserve_data(encoded_target.len() as u64)?;
+                let absolute = target.is_absolute();
+                let resolved_target = resolve_symlink_target(&path, &target);
+                self.entries.push(ListedReceiveEntry {
+                    spec_id: self.spec_id.to_string(),
+                    actual_id,
+                    path,
+                    name,
+                    parent,
+                    mtime: modification_time_nanoseconds(&metadata),
+                    permissions: protocol_permissions(&metadata),
+                    size: metadata.len(),
+                    kind: ListedReceiveKind::Symlink {
+                        target: encoded_target.into_bytes(),
+                        resolved_target,
+                        absolute,
+                    },
+                });
+            }
+            OpenedReceiveEntry::Directory {
+                mut directory,
+                metadata,
+            } => {
+                self.entries.push(ListedReceiveEntry {
+                    spec_id: self.spec_id.to_string(),
+                    actual_id: actual_id.clone(),
+                    path: path.clone(),
+                    name,
+                    parent,
+                    mtime: modification_time_nanoseconds(&metadata),
+                    permissions: protocol_permissions(&metadata),
+                    size: metadata.len(),
+                    kind: ListedReceiveKind::Directory,
+                });
+                let mut children = Vec::new();
+                for child in read_dir(&mut directory)? {
+                    let child = child?;
+                    if child.name() != OsStr::new(".") && child.name() != OsStr::new("..") {
+                        if children.len() >= self.max_entries - self.entries.len() {
+                            return Err(ReceiveListingError::TooManyEntries);
+                        }
+                        children.push(child.name().to_os_string());
+                    }
+                }
+                children.sort();
+                for child in children {
+                    let child_path = path.join(&child);
+                    let opened = open_child_entry(&directory, &child, &child_path)?;
+                    self.collect(child_path, Some(actual_id.clone()), opened)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn reserve_data(&mut self, size: u64) -> Result<(), ReceiveListingError> {
+        if size > self.max_file_bytes {
+            return Err(ReceiveListingError::FileTooLarge);
+        }
+        self.planned_bytes = self
+            .planned_bytes
+            .checked_add(size)
+            .filter(|total| *total <= self.max_session_bytes)
+            .ok_or(ReceiveListingError::SessionTooLarge)?;
+        Ok(())
+    }
+}
+
+enum OpenedReceiveEntry {
+    Regular {
+        file: fs::File,
+        metadata: fs::Metadata,
+    },
+    Directory {
+        directory: fs::File,
+        metadata: fs::Metadata,
+    },
+    Symlink {
+        target: PathBuf,
+        metadata: fs::Metadata,
+    },
+}
+
+fn open_top_level_entry(path: &Path) -> io::Result<OpenedReceiveEntry> {
+    if path.file_name().is_none() {
+        let directory = open_read_directory(path)?;
+        let metadata = directory.metadata()?;
+        return Ok(OpenedReceiveEntry::Directory {
+            directory,
+            metadata,
+        });
+    }
     let parent_path = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no parent"))?;
@@ -434,9 +746,46 @@ fn open_regular_nofollow(path: &Path) -> io::Result<fs::File> {
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?;
     let parent = open_read_directory(parent_path)?;
+    open_child_entry(&parent, name, path)
+}
+
+fn open_child_entry(
+    parent: &fs::File,
+    name: &OsStr,
+    display_path: &Path,
+) -> io::Result<OpenedReceiveEntry> {
+    match entry_kind_at(parent, name, display_path)? {
+        ReceiveEntryKind::Symlink => {
+            let target = read_link_at(parent, name, display_path)?;
+            let metadata = fs::symlink_metadata(display_path)?;
+            Ok(OpenedReceiveEntry::Symlink { target, metadata })
+        }
+        ReceiveEntryKind::Directory => {
+            let mut options = OpenOptionsAt::default();
+            options.read(true).follow(false);
+            let directory = options.open_dir_at(parent, name)?;
+            let metadata = directory.metadata()?;
+            Ok(OpenedReceiveEntry::Directory {
+                directory,
+                metadata,
+            })
+        }
+        ReceiveEntryKind::Regular => {
+            let file = open_regular_at(parent, name)?;
+            let metadata = file.metadata()?;
+            Ok(OpenedReceiveEntry::Regular { file, metadata })
+        }
+        ReceiveEntryKind::Unsupported => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "source is not a regular file, directory, or symbolic link",
+        )),
+    }
+}
+
+fn open_regular_at(parent: &fs::File, name: &OsStr) -> io::Result<fs::File> {
     let mut options = OpenOptionsAt::default();
     options.read(true).follow(false);
-    let file = options.open_at(&parent, name)?;
+    let file = options.open_at(parent, name)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -444,6 +793,220 @@ fn open_regular_nofollow(path: &Path) -> io::Result<fs::File> {
         ));
     }
     Ok(file)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveEntryKind {
+    Regular,
+    Directory,
+    Symlink,
+    Unsupported,
+}
+
+#[cfg(unix)]
+fn entry_kind_at(
+    parent: &fs::File,
+    name: &OsStr,
+    _display_path: &Path,
+) -> io::Result<ReceiveEntryKind> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source name contains NUL"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is NUL-terminated, `stat` points to writable storage, and
+    // the retained directory descriptor remains alive for the call.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful `fstatat` initialized the structure.
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    Ok(match mode & libc::S_IFMT {
+        libc::S_IFREG => ReceiveEntryKind::Regular,
+        libc::S_IFDIR => ReceiveEntryKind::Directory,
+        libc::S_IFLNK => ReceiveEntryKind::Symlink,
+        _ => ReceiveEntryKind::Unsupported,
+    })
+}
+
+#[cfg(windows)]
+fn entry_kind_at(
+    _parent: &fs::File,
+    _name: &OsStr,
+    display_path: &Path,
+) -> io::Result<ReceiveEntryKind> {
+    let metadata = fs::symlink_metadata(display_path)?;
+    Ok(if metadata.file_type().is_symlink() {
+        ReceiveEntryKind::Symlink
+    } else if metadata.is_dir() {
+        ReceiveEntryKind::Directory
+    } else if metadata.is_file() {
+        ReceiveEntryKind::Regular
+    } else {
+        ReceiveEntryKind::Unsupported
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn entry_kind_at(
+    _parent: &fs::File,
+    _name: &OsStr,
+    _display_path: &Path,
+) -> io::Result<ReceiveEntryKind> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "handle-relative metadata is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn read_link_at(parent: &fs::File, name: &OsStr, _display_path: &Path) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source name contains NUL"))?;
+    let mut target = vec![0_u8; MAX_FILE_TRANSFER_PATH_BYTES + 1];
+    // SAFETY: the retained directory and C string are valid, and `target`
+    // exposes its full initialized allocation as a writable byte buffer.
+    let size = unsafe {
+        libc::readlinkat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            target.as_mut_ptr().cast(),
+            target.len(),
+        )
+    };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let size = usize::try_from(size).expect("readlinkat returned a non-negative ssize_t");
+    if size > MAX_FILE_TRANSFER_PATH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "symbolic-link target exceeds the protocol path limit",
+        ));
+    }
+    target.truncate(size);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(target)))
+}
+
+#[cfg(windows)]
+fn read_link_at(_parent: &fs::File, _name: &OsStr, display_path: &Path) -> io::Result<PathBuf> {
+    fs::read_link(display_path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_link_at(_parent: &fs::File, _name: &OsStr, _display_path: &Path) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symbolic-link reads are unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn file_identity(_file: &fs::File, metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(FileIdentity {
+        volume: metadata.dev(),
+        node: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn file_identity(file: &fs::File, _metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use winapi::um::fileapi::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the file handle is valid for this call and `information` points
+    // to writable storage of the exact structure expected by Win32.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful Win32 call initialized the structure.
+    let information = unsafe { information.assume_init() };
+    Ok(FileIdentity {
+        volume: information.dwVolumeSerialNumber as u64,
+        node: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_file: &fs::File, _metadata: &fs::Metadata) -> io::Result<FileIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable file identities are unsupported on this platform",
+    ))
+}
+
+fn resolve_symlink_target(link_path: &Path, target: &Path) -> Option<PathBuf> {
+    let candidate = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link_path.parent()?.join(target)
+    };
+    normalize_absolute_path(&candidate)
+}
+
+fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+    Some(normalized)
+}
+
+#[cfg(not(windows))]
+fn protocol_symlink_target(target: &Path) -> Option<String> {
+    let target = target.to_str()?.to_string();
+    (target.len() <= MAX_FILE_TRANSFER_PATH_BYTES).then_some(target)
+}
+
+#[cfg(windows)]
+fn protocol_symlink_target(target: &Path) -> Option<String> {
+    let mut target = target.to_str()?.replace('\\', "/");
+    if let Some(stripped) = target.strip_prefix("//?/") {
+        target = stripped.to_string();
+    }
+    if target.as_bytes().get(1) == Some(&b':') && !target.starts_with('/') {
+        target.insert(0, '/');
+    }
+    (target.len() <= MAX_FILE_TRANSFER_PATH_BYTES).then_some(target)
+}
+
+fn valid_generated_protocol_path(path: &str) -> bool {
+    path.len() <= MAX_FILE_TRANSFER_PATH_BYTES
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .all(|component| component.len() <= 255)
 }
 
 #[cfg(unix)]
@@ -529,6 +1092,15 @@ where
             }
         }
     }
+    chunks.finish()
+}
+
+fn stream_bytes<F>(data: &[u8], session_id: &str, file_id: &str, emit: &mut F) -> io::Result<()>
+where
+    F: FnMut(Vec<u8>) -> bool,
+{
+    let mut chunks = ProtocolChunkWriter::new(session_id, file_id, emit);
+    chunks.write_all(data)?;
     chunks.finish()
 }
 
@@ -837,7 +1409,11 @@ mod tests {
         assert_eq!(metadata.status.as_deref(), Some("0"));
         assert_eq!(metadata.size, Some(17));
         assert_eq!(metadata.file_type, Some(FileTransferType::Regular));
-        assert_eq!(decode(&listing[2]).name.as_deref(), home.path().to_str());
+        let protocol_home = protocol_absolute_path(home.path()).unwrap();
+        assert_eq!(
+            decode(&listing[2]).name.as_deref(),
+            Some(protocol_home.as_str())
+        );
 
         fs::rename(&original, &retained).unwrap();
         fs::write(&original, b"replacement secret").unwrap();
@@ -950,5 +1526,202 @@ mod tests {
             .status
             .as_deref()
             .is_some_and(|status| status.starts_with("ENOSPC:")));
+    }
+
+    #[test]
+    fn approved_directory_lists_nested_files_and_hardlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let tree = home.path().join("tree");
+        let sub = tree.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let original = tree.join("original.txt");
+        let hardlink = sub.join("hardlink.txt");
+        fs::write(&original, b"one filesystem object").unwrap();
+        fs::hard_link(&original, &hardlink).unwrap();
+        fs::write(sub.join("child.txt"), b"child").unwrap();
+
+        let limits = TtyTransferLimits::new(8, 1024, 4096).unwrap();
+        let mut filesystem =
+            TtyTransferReceiveFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+        let mut manager = TtyTransferManager::new();
+        let listing = run_actions(
+            &mut filesystem,
+            approve_receive(&mut manager, "portable-tree", &[("tree", "~/tree")]),
+        );
+        let listing: Vec<_> = listing.iter().map(|encoded| decode(encoded)).collect();
+        let files: HashMap<_, _> = listing
+            .iter()
+            .filter(|command| command.action == FileTransferAction::File)
+            .map(|command| (command.name.as_deref().unwrap(), command))
+            .collect();
+        assert_eq!(files.len(), 5);
+
+        let tree_name = protocol_absolute_path(&tree).unwrap();
+        let sub_name = protocol_absolute_path(&sub).unwrap();
+        let original_name = protocol_absolute_path(&original).unwrap();
+        let hardlink_name = protocol_absolute_path(&hardlink).unwrap();
+        let tree_metadata = files[tree_name.as_str()];
+        let sub_metadata = files[sub_name.as_str()];
+        let original_metadata = files[original_name.as_str()];
+        let hardlink_metadata = files[hardlink_name.as_str()];
+        assert_eq!(tree_metadata.file_type, Some(FileTransferType::Directory));
+        assert_eq!(sub_metadata.parent, tree_metadata.status);
+        assert_eq!(hardlink_metadata.file_type, Some(FileTransferType::Link));
+        assert_eq!(
+            hardlink_metadata.data,
+            original_metadata.status.as_deref().unwrap().as_bytes()
+        );
+    }
+
+    #[test]
+    fn bare_home_spec_lists_the_home_directory_itself() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("inside.txt"), b"inside").unwrap();
+        let limits = TtyTransferLimits::new(4, 1024, 4096).unwrap();
+        let mut filesystem =
+            TtyTransferReceiveFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+        let mut manager = TtyTransferManager::new();
+        let listing = run_actions(
+            &mut filesystem,
+            approve_receive(&mut manager, "home-tree", &[("home", "~")]),
+        );
+        let files: Vec<_> = listing
+            .iter()
+            .map(|encoded| decode(encoded))
+            .filter(|command| command.action == FileTransferAction::File)
+            .collect();
+        assert_eq!(files.len(), 2);
+        let protocol_home = protocol_absolute_path(home.path()).unwrap();
+        assert!(files.iter().any(|command| {
+            command.name.as_deref() == Some(protocol_home.as_str())
+                && command.file_type == Some(FileTransferType::Directory)
+                && command.parent.is_none()
+        }));
+    }
+
+    #[test]
+    fn oversized_directory_listing_is_rejected_without_partial_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let tree = home.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("one"), b"1").unwrap();
+        fs::write(tree.join("two"), b"2").unwrap();
+        let limits = TtyTransferLimits::new(2, 1024, 4096).unwrap();
+        let mut filesystem =
+            TtyTransferReceiveFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+        let mut manager = TtyTransferManager::new();
+        let listing = run_actions(
+            &mut filesystem,
+            approve_receive(&mut manager, "wide-tree", &[("tree", "~/tree")]),
+        );
+        let listing: Vec<_> = listing.iter().map(|encoded| decode(encoded)).collect();
+        assert!(!listing
+            .iter()
+            .any(|command| command.action == FileTransferAction::File));
+        assert!(listing.iter().any(|command| command
+            .status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("ENOSPC:"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_directory_tree_preserves_links_and_retained_file_handles() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let tree = home.path().join("tree");
+        let sub = tree.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let root_file = tree.join("root.txt");
+        let child_file = sub.join("child.txt");
+        fs::write(&root_file, b"root contents").unwrap();
+        fs::write(&child_file, b"approved child").unwrap();
+        fs::hard_link(&root_file, sub.join("hard.txt")).unwrap();
+        symlink("../root.txt", sub.join("relative-link")).unwrap();
+        symlink("/outside-the-approved-tree", sub.join("absolute-link")).unwrap();
+
+        let limits = TtyTransferLimits::new(16, 1024, 4096).unwrap();
+        let mut filesystem =
+            TtyTransferReceiveFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+        let mut manager = TtyTransferManager::new();
+        let listing = run_actions(
+            &mut filesystem,
+            approve_receive(&mut manager, "tree-session", &[("tree-spec", "~/tree")]),
+        );
+        let listing: Vec<_> = listing.iter().map(|encoded| decode(encoded)).collect();
+        assert_eq!(listing.first().unwrap().status.as_deref(), Some("OK"));
+        assert_eq!(listing.last().unwrap().status.as_deref(), Some("OK"));
+        let files: HashMap<_, _> = listing
+            .iter()
+            .filter(|command| command.action == FileTransferAction::File)
+            .map(|command| (command.name.as_deref().unwrap(), command))
+            .collect();
+        assert_eq!(files.len(), 7);
+
+        let tree_name = protocol_absolute_path(&tree).unwrap();
+        let sub_name = protocol_absolute_path(&sub).unwrap();
+        let root_name = protocol_absolute_path(&root_file).unwrap();
+        let child_name = protocol_absolute_path(&child_file).unwrap();
+        let hard_name = protocol_absolute_path(&sub.join("hard.txt")).unwrap();
+        let relative_name = protocol_absolute_path(&sub.join("relative-link")).unwrap();
+        let absolute_name = protocol_absolute_path(&sub.join("absolute-link")).unwrap();
+
+        let tree_metadata = files[tree_name.as_str()];
+        let sub_metadata = files[sub_name.as_str()];
+        let root_metadata = files[root_name.as_str()];
+        assert_eq!(tree_metadata.file_type, Some(FileTransferType::Directory));
+        assert_eq!(tree_metadata.parent, None);
+        assert_eq!(sub_metadata.file_type, Some(FileTransferType::Directory));
+        assert_eq!(sub_metadata.parent, tree_metadata.status);
+        assert_eq!(files[child_name.as_str()].parent, sub_metadata.status);
+
+        let hard_metadata = files[hard_name.as_str()];
+        assert_eq!(hard_metadata.file_type, Some(FileTransferType::Link));
+        assert_eq!(
+            hard_metadata.data,
+            root_metadata.status.as_deref().unwrap().as_bytes()
+        );
+        let relative_metadata = files[relative_name.as_str()];
+        assert_eq!(relative_metadata.file_type, Some(FileTransferType::Symlink));
+        assert_eq!(
+            relative_metadata.data,
+            root_metadata.status.as_deref().unwrap().as_bytes()
+        );
+        assert_eq!(
+            files[absolute_name.as_str()].file_type,
+            Some(FileTransferType::Symlink)
+        );
+        assert!(files[absolute_name.as_str()].data.is_empty());
+
+        let retained_tree = home.path().join("retained-tree");
+        fs::rename(&tree, &retained_tree).unwrap();
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(&child_file, b"replacement secret").unwrap();
+
+        let mut child_request = command(FileTransferAction::File, "tree-session");
+        child_request.file_id = Some("client-child".into());
+        child_request.name = Some(child_name);
+        let child_output = run_actions(&mut filesystem, manager.handle(child_request));
+        let child_data: Vec<_> = child_output
+            .iter()
+            .flat_map(|packet| decode(packet).data)
+            .collect();
+        assert_eq!(child_data, b"approved child");
+
+        let mut link_request = command(FileTransferAction::File, "tree-session");
+        link_request.file_id = Some("client-link".into());
+        link_request.name = Some(relative_name);
+        let link_output = run_actions(&mut filesystem, manager.handle(link_request));
+        assert_eq!(decode(&link_output[0]).data, b"../root.txt");
+
+        let mut hard_request = command(FileTransferAction::File, "tree-session");
+        hard_request.file_id = Some("client-hard".into());
+        hard_request.name = Some(hard_name);
+        let hard_output = run_actions(&mut filesystem, manager.handle(hard_request));
+        assert!(decode(&hard_output[0])
+            .status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("EINVAL:")));
     }
 }
