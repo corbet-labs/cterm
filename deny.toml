@@ -1,0 +1,51 @@
+# Evaluate optional and platform-specific dependencies as part of the same
+# policy gate. Cargo metadata resolves every supported target when no target
+# filter is specified.
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "FSL-1.1-ALv2",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+# vislyhq/stretch 0.3.2 declares a license file but accidentally excludes it
+# from the published crate. Its 0.3.2 tag
+# (20e0748c15ceb0695bd2ebb821a8eee7364f3c8d) carries the standard MIT license.
+# Hash the published manifest that names that file so a repackaged crate cannot
+# silently inherit this clarification.
+[[licenses.clarify]]
+crate = "stretch@0.3.2"
+expression = "MIT"
+license-files = [{ path = "Cargo.toml", hash = 0x0e758977 }]
+
+[licenses.private]
+ignore = false
+
+[bans]
+# Multiple versions remain visible technical debt without blocking unrelated
+# upgrades. Local workspace crates intentionally use versionless path
+# dependencies; Cargo.lock and the release metadata gate bind their versions.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

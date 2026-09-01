@@ -52,52 +52,55 @@ if [[ "$CHANGELOG_SECTION_COUNT" != "1" ]]; then
     exit 1
 fi
 
-if ! cargo metadata --locked --no-deps --format-version 1 >/dev/null; then
+if ! command -v jq >/dev/null 2>&1; then
+    echo "release metadata check: jq is required to inspect Cargo workspace metadata" >&2
+    exit 1
+fi
+
+if ! WORKSPACE_METADATA="$(cargo metadata --locked --no-deps --format-version 1)"; then
     echo "release metadata check: Cargo.lock does not match the release manifests" >&2
     exit 1
 fi
 
-WORKSPACE_PACKAGES=(
-    cterm
-    cterm-app
-    cterm-client
-    cterm-cocoa
-    cterm-core
-    cterm-gtk
-    cterm-headless
-    cterm-proto
-    cterm-ui
-    cterm-win32
-)
-for package in "${WORKSPACE_PACKAGES[@]}"; do
-    locked_versions="$({
-        awk -v target="$package" '
-            /^\[\[package\]\]$/ {
-                if (name == target) print version
-                name = ""
-                version = ""
-                next
-            }
-            /^name = "/ {
-                name = $0
-                sub(/^name = "/, "", name)
-                sub(/".*/, "", name)
-                next
-            }
-            /^version = "/ {
-                version = $0
-                sub(/^version = "/, "", version)
-                sub(/".*/, "", version)
-            }
-            END {
-                if (name == target) print version
-            }
-        ' Cargo.lock
-    })"
-    if [[ "$locked_versions" != "$WORKSPACE_VERSION" ]]; then
-        echo "release metadata check: Cargo.lock has '$package' version '$locked_versions', expected '$WORKSPACE_VERSION'" >&2
-        exit 1
-    fi
-done
+WORKSPACE_PACKAGE_COUNT="$({
+    jq -er '.workspace_members | length' <<<"$WORKSPACE_METADATA"
+})"
+DISCOVERED_PACKAGE_COUNT="$({
+    jq -er '
+        .workspace_members as $members
+        | [.packages[] | select(.id as $id | $members | index($id))]
+        | length
+    ' <<<"$WORKSPACE_METADATA"
+})"
 
-echo "release metadata check: $TAG_NAME matches Cargo.toml, Cargo.lock, and CHANGELOG.md"
+if [[ "$DISCOVERED_PACKAGE_COUNT" != "$WORKSPACE_PACKAGE_COUNT" ]]; then
+    echo "release metadata check: cargo metadata described $DISCOVERED_PACKAGE_COUNT of $WORKSPACE_PACKAGE_COUNT workspace packages" >&2
+    exit 1
+fi
+
+VERSION_MISMATCHES="$({
+    jq -r --arg expected "$WORKSPACE_VERSION" '
+        .workspace_members as $members
+        | .packages[]
+        | select(.id as $id | $members | index($id))
+        | select(.version != $expected)
+        | "\(.name)@\(.version)"
+    ' <<<"$WORKSPACE_METADATA"
+})"
+
+if [[ -n "$VERSION_MISMATCHES" ]]; then
+    echo "release metadata check: workspace packages do not match version '$WORKSPACE_VERSION':" >&2
+    printf '%s\n' "$VERSION_MISMATCHES" >&2
+    exit 1
+fi
+
+WORKSPACE_PACKAGE_NAMES="$({
+    jq -r '
+        .workspace_members as $members
+        | [.packages[] | select(.id as $id | $members | index($id)) | .name]
+        | sort
+        | join(", ")
+    ' <<<"$WORKSPACE_METADATA"
+})"
+
+echo "release metadata check: $TAG_NAME matches Cargo.toml, Cargo.lock, CHANGELOG.md, and $WORKSPACE_PACKAGE_COUNT workspace packages ($WORKSPACE_PACKAGE_NAMES)"

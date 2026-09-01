@@ -11,6 +11,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
@@ -22,6 +25,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v7
+
+      - name: Install workspace metadata parser
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -44,16 +52,17 @@ jobs:
         run: cargo fmt --all -- --check
 
   security-advisories:
-    name: Security advisories
+    name: Dependency policy
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
 
-      - name: Reject vulnerable or unsound Rust dependencies
+      - name: Enforce dependency advisories, licenses, sources, and bans
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          command: check advisories
+          command: check advisories bans licenses sources
           arguments: --locked
+          command-arguments: --hide-inclusion-graph
 
   lint-linux:
     name: Clippy (Linux)
