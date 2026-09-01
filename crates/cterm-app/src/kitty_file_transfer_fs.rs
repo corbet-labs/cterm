@@ -1577,7 +1577,7 @@ fn create_staged_file(parent_path: &Path, parent: &fs::File) -> io::Result<Stage
         .file_name()
         .expect("tempfile builder always supplies a file name")
         .to_os_string();
-    let source_directory = temporary_directory.into_file();
+    let source_directory = reopen_staging_directory(temporary_directory.into_file())?;
     let temporary_name = OsString::from("payload");
     let file = match create_relative_file(&source_directory, &temporary_name) {
         Ok(file) => file,
@@ -1594,6 +1594,44 @@ fn create_staged_file(parent_path: &Path, parent: &fs::File) -> io::Result<Stage
         temporary_name,
         file,
     })
+}
+
+#[cfg(windows)]
+fn reopen_staging_directory(directory: fs::File) -> io::Result<fs::File> {
+    use fs_at::os::windows::FileExt;
+    use std::os::windows::io::FromRawHandle;
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::winbase::{ReOpenFile, FILE_FLAG_BACKUP_SEMANTICS};
+    use winapi::um::winnt::{
+        DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    };
+
+    // fs_at intentionally returns newly created directories with directory-
+    // traversal rights only. Retain the exact directory object while adding
+    // FILE_ADD_FILE, which NtSetInformationFile needs when it resolves a new
+    // hardlink name relative to this private staging directory.
+    let reopened = unsafe {
+        ReOpenFile(
+            windows_handle(&directory),
+            FILE_GENERIC_READ
+                | FILE_ADD_FILE
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_WRITE_ATTRIBUTES
+                | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    };
+    if reopened == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        let _ = directory.delete_by_handle();
+        Err(error)
+    } else {
+        drop(directory);
+        // SAFETY: ReOpenFile returned a new owned handle not managed elsewhere.
+        Ok(unsafe { fs::File::from_raw_handle(reopened.cast()) })
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
