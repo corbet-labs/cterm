@@ -378,8 +378,7 @@ async fn dispatch_actions(
                 match tokio::task::spawn_blocking(move || {
                     let deadline = std::time::Instant::now() + STREAM_BACKPRESSURE_TIMEOUT;
                     let completed = current.handle_executable(executable, &mut |bytes| {
-                        live_session
-                            .send_tty_transfer_response_with_backpressure(bytes, deadline)
+                        live_session.send_tty_transfer_response_with_backpressure(bytes, deadline)
                     });
                     (current, completed)
                 })
