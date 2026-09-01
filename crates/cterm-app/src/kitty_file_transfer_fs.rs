@@ -1554,8 +1554,6 @@ fn create_staged_file(parent_path: &Path, parent: &fs::File) -> io::Result<Stage
 
 #[cfg(windows)]
 fn create_staged_file(parent_path: &Path, parent: &fs::File) -> io::Result<StagedFileContext> {
-    use fs_at::os::windows::OpenOptionsExt;
-
     // Create the empty directory atomically with an owner-only, protected DACL
     // before placing any transfer bytes inside it.
     let security = WindowsPrivateSecurityDescriptor::new()?;
@@ -1568,11 +1566,7 @@ fn create_staged_file(parent_path: &Path, parent: &fs::File) -> io::Result<Stage
         let name = candidate
             .file_name()
             .expect("tempfile builder always supplies a file name");
-        let mut options = OpenOptionsAt::default();
-        options
-            .create_new(true)
-            .security_descriptor(security.descriptor);
-        options.mkdir_at(parent, name)
+        create_private_staging_directory(parent, name, &security.descriptor)
     })?;
     let staging_directory_name = temporary_directory
         .path()
@@ -1596,6 +1590,90 @@ fn create_staged_file(parent_path: &Path, parent: &fs::File) -> io::Result<Stage
         temporary_name,
         file,
     })
+}
+
+#[cfg(windows)]
+fn create_private_staging_directory(
+    parent: &fs::File,
+    name: &OsStr,
+    security: &fs_at::os::windows::SECURITY_DESCRIPTOR,
+) -> io::Result<fs::File> {
+    use std::mem;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::ptr;
+    use winapi::shared::ntdef::OBJ_CASE_INSENSITIVE;
+    use winapi::um::winnt::{
+        DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_LIST_DIRECTORY,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
+        SYNCHRONIZE,
+    };
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let mut name: Vec<u16> = name.encode_wide().collect();
+    let name_bytes = name
+        .len()
+        .checked_mul(mem::size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staging name is too long"))?;
+    if name.is_empty() || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "staging name is empty or contains NUL",
+        ));
+    }
+    let unicode_name = UNICODE_STRING {
+        Length: name_bytes,
+        MaximumLength: name_bytes,
+        Buffer: name.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &unicode_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: ptr::from_ref(security).cast(),
+        SecurityQualityOfService: ptr::null(),
+    };
+    let mut handle = ptr::null_mut();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // This follows fs_at's tested mkdir_at NtCreateFile call, with explicit
+    // child-creation rights on the returned handle. fs_at 0.2.1 intentionally
+    // fixes mkdir access internally and cannot request FILE_ADD_FILE itself.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            SYNCHRONIZE
+                | DELETE
+                | FILE_LIST_DIRECTORY
+                | FILE_TRAVERSE
+                | FILE_WRITE_ATTRIBUTES
+                | FILE_ADD_FILE
+                | FILE_ADD_SUBDIRECTORY,
+            &attributes,
+            &mut status_block,
+            ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: RtlNtStatusToDosError accepts every NTSTATUS value.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    // SAFETY: successful NtCreateFile returned a new owned synchronous handle.
+    Ok(unsafe { fs::File::from_raw_handle(handle) })
 }
 
 #[cfg(not(any(unix, windows)))]
