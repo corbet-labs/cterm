@@ -1008,11 +1008,16 @@ fn open_parent_directory(path: &Path) -> io::Result<fs::File> {
 fn open_parent_directory(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
-    use winapi::um::winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use winapi::um::winnt::{
+        FILE_ADD_FILE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     let mut options = fs::OpenOptions::new();
     options
         .read(true)
+        // FILE_RENAME_INFO resolves the final name relative to this retained
+        // handle, and Windows requires FILE_ADD_FILE on that target directory.
+        .access_mode(FILE_GENERIC_READ | FILE_ADD_FILE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
@@ -2064,8 +2069,22 @@ mod tests {
             Some("STARTED")
         );
 
-        fs::rename(&original_parent, &retained_parent).unwrap();
-        fs::create_dir(&original_parent).unwrap();
+        #[cfg(windows)]
+        let parent_moved = match fs::rename(&original_parent, &retained_parent) {
+            Ok(()) => true,
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                false
+            }
+        };
+        #[cfg(not(windows))]
+        let parent_moved = {
+            fs::rename(&original_parent, &retained_parent).unwrap();
+            true
+        };
+        if parent_moved {
+            fs::create_dir(&original_parent).unwrap();
+        }
         let mut end = command(FileTransferAction::EndData, "parent-race");
         end.file_id = Some("f1".into());
         end.data = b"safe".to_vec();
@@ -2082,8 +2101,20 @@ mod tests {
         )
         .is_empty());
 
-        assert_eq!(fs::read(retained_parent.join("file.txt")).unwrap(), b"safe");
-        assert!(!original_parent.join("file.txt").exists());
+        let committed_parent = if parent_moved {
+            &retained_parent
+        } else {
+            &original_parent
+        };
+        assert_eq!(
+            fs::read(committed_parent.join("file.txt")).unwrap(),
+            b"safe"
+        );
+        if parent_moved {
+            assert!(!original_parent.join("file.txt").exists());
+        } else {
+            assert!(!retained_parent.exists());
+        }
     }
 
     #[cfg(unix)]
