@@ -12,6 +12,7 @@ pub mod docker;
 pub mod file_drop;
 pub mod file_transfer;
 pub mod git_sync;
+pub mod kitty_dnd;
 pub mod log_capture;
 pub mod plugin_broker;
 pub mod plugin_runtime;
