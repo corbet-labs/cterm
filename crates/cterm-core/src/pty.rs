@@ -1407,12 +1407,55 @@ mod tests {
         let mut pty = Pty::new(&config).expect("Failed to create PTY");
         assert!(pty.child_pid() > 0);
 
-        // Give the command time to produce output
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // A blocking read can wait forever when a platform reports no PTY EOF
+        // after a short-lived child. Poll the master with the same deadline as
+        // the child wait so this native-platform test always fails finitely.
+        let fd = pty.try_raw_fd().expect("local PTY should have a raw fd");
+        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(original_flags >= 0, "failed to read PTY descriptor flags");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) },
+            0,
+            "failed to make PTY test reader non-blocking"
+        );
 
-        // Read the output (important on macOS to unblock the child)
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
         let mut buf = [0u8; 1024];
-        let _ = pty.read(&mut buf);
+        let mut output = Vec::new();
+        while start.elapsed() < timeout {
+            match pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    output.extend_from_slice(&buf[..read]);
+                    if output
+                        .windows(b"hello".len())
+                        .any(|window| window == b"hello")
+                    {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                // BSD PTY masters commonly report EIO instead of EOF after
+                // the final slave closes.
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("failed to read PTY output: {error}"),
+            }
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) },
+            0,
+            "failed to restore PTY descriptor flags"
+        );
+        assert!(
+            output
+                .windows(b"hello".len())
+                .any(|window| window == b"hello"),
+            "PTY child produced no expected output: {}",
+            String::from_utf8_lossy(&output)
+        );
 
         // Wait for the child with a timeout
         let status = wait_with_timeout(&mut pty, 5000).expect("Child did not exit in time");
