@@ -668,8 +668,8 @@ impl TtyTransferSendFilesystem {
             let source = match target {
                 ResolvedLinkTarget::Hard { source_id } => session
                     .files
-                    .get(source_id)
-                    .and_then(|file| file.temporary.as_ref()),
+                    .get_mut(source_id)
+                    .and_then(|file| file.temporary.as_mut()),
                 ResolvedLinkTarget::Symbolic { .. } => None,
             };
             if let Err(error) = link.prepare(target, source) {
@@ -923,7 +923,7 @@ impl StagedLink {
     fn prepare(
         &mut self,
         target: &ResolvedLinkTarget,
-        hardlink_source: Option<&StagedTempFile>,
+        hardlink_source: Option<&mut StagedTempFile>,
     ) -> io::Result<()> {
         remove_staged_file(
             &mut self.scaffold.file,
@@ -946,6 +946,7 @@ impl StagedLink {
                         "hardlink source is not a completed regular file",
                     )
                 })?;
+                prepare_hard_link_source(source)?;
                 create_hard_link_at(
                     source.as_file(),
                     &source.source_directory,
@@ -1990,6 +1991,47 @@ fn remove_created_directory(
     _directory: &fs::File,
     _name: &OsStr,
 ) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_hard_link_source(source: &mut StagedTempFile) -> io::Result<()> {
+    use std::os::windows::io::FromRawHandle;
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::winbase::ReOpenFile;
+    use winapi::um::winnt::{
+        DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, WRITE_DAC,
+    };
+
+    // Transfer payloads remain read-exclusive until the application sends its
+    // approved Finish command. A hardlink operation can make Windows reopen the
+    // source internally, so at this commit boundary replace the primary handle
+    // with an all-sharing handle that still retains every right needed for
+    // metadata, synchronization, atomic rename, and cleanup.
+    let commit_handle = unsafe {
+        ReOpenFile(
+            windows_handle(source.as_file()),
+            FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | WRITE_DAC | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if commit_handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ReOpenFile returned a new owned handle not managed elsewhere.
+    let commit_file = unsafe { fs::File::from_raw_handle(commit_handle.cast()) };
+    let previous = source
+        .file
+        .replace(commit_file)
+        .expect("completed hardlink source retains its file handle");
+    drop(previous);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn prepare_hard_link_source(_source: &mut StagedTempFile) -> io::Result<()> {
     Ok(())
 }
 
