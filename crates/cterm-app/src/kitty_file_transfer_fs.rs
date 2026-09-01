@@ -670,9 +670,16 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
 }
 
 #[cfg(windows)]
+fn windows_handle(file: &fs::File) -> winapi::shared::ntdef::HANDLE {
+    use std::os::windows::io::AsRawHandle;
+
+    file.as_raw_handle().cast()
+}
+
+#[cfg(windows)]
 fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File> {
     use fs_at::os::windows::OpenOptionsExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::io::FromRawHandle;
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::winbase::ReOpenFile;
     use winapi::um::winnt::{DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, WRITE_DAC};
@@ -695,7 +702,7 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
     // write, or delete access. The returned handle is independently owned.
     let exclusive = unsafe {
         ReOpenFile(
-            shared_file.as_raw_handle(),
+            windows_handle(&shared_file),
             FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | WRITE_DAC | DELETE,
             0,
             0,
@@ -709,7 +716,7 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
     }
     drop(shared_file);
     // SAFETY: ReOpenFile returned a new owned handle not managed elsewhere.
-    Ok(unsafe { fs::File::from_raw_handle(exclusive) })
+    Ok(unsafe { fs::File::from_raw_handle(exclusive.cast()) })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1020,8 +1027,9 @@ fn open_parent_directory(_path: &Path) -> io::Result<fs::File> {
 fn validate_shared_parent(parent: &fs::File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
+    const STICKY_BIT: u32 = 0o1000;
     let mode = parent.metadata()?.mode();
-    if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
+    if mode & 0o022 != 0 && mode & STICKY_BIT == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "group/world-writable destination directory lacks the sticky bit",
@@ -1157,7 +1165,6 @@ fn replace_staged_file(
 ) -> io::Result<()> {
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
     use std::ptr;
     use winapi::shared::minwindef::DWORD;
     use winapi::um::fileapi::{SetFileInformationByHandle, FILE_RENAME_INFO};
@@ -1186,7 +1193,7 @@ fn replace_staged_file(
             info,
             FILE_RENAME_INFO {
                 ReplaceIfExists: 1,
-                RootDirectory: parent.as_raw_handle(),
+                RootDirectory: windows_handle(parent),
                 FileNameLength: name_bytes as DWORD,
                 FileName: [0],
             },
@@ -1197,7 +1204,7 @@ fn replace_staged_file(
             name.len(),
         );
         SetFileInformationByHandle(
-            file.as_raw_handle(),
+            windows_handle(file),
             FileRenameInfo,
             info.cast(),
             buffer_size,
@@ -1226,7 +1233,6 @@ fn replace_staged_file(
 
 #[cfg(windows)]
 fn prepare_destination_security(file: &fs::File, parent: &fs::File) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
     use winapi::shared::minwindef::{FALSE, TRUE};
     use winapi::um::accctrl::SE_FILE_OBJECT;
     use winapi::um::aclapi::{GetSecurityInfo, SetSecurityInfo};
@@ -1268,7 +1274,7 @@ fn prepare_destination_security(file: &fs::File, parent: &fs::File) -> io::Resul
     // generic read access, and the descriptor output pointer is valid.
     let status = unsafe {
         GetSecurityInfo(
-            parent.as_raw_handle(),
+            windows_handle(parent),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -1337,7 +1343,7 @@ fn prepare_destination_security(file: &fs::File, parent: &fs::File) -> io::Resul
     // and Drop removes only the staging entry.
     let status = unsafe {
         SetSecurityInfo(
-            file.as_raw_handle(),
+            windows_handle(file),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
@@ -2377,7 +2383,6 @@ mod tests {
     #[test]
     fn windows_committed_file_inherits_the_destination_dacl() {
         use std::os::windows::fs::OpenOptionsExt;
-        use std::os::windows::io::AsRawHandle;
         use winapi::shared::minwindef::LPVOID;
         use winapi::um::accctrl::SE_FILE_OBJECT;
         use winapi::um::aclapi::{GetSecurityInfo, SetSecurityInfo};
@@ -2424,7 +2429,7 @@ mod tests {
         // live through this synchronous call.
         let status = unsafe {
             SetSecurityInfo(
-                parent.as_raw_handle(),
+                windows_handle(&parent),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
@@ -2465,7 +2470,7 @@ mod tests {
         // valid for a DACL query.
         let status = unsafe {
             GetSecurityInfo(
-                committed.as_raw_handle(),
+                windows_handle(&committed),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
