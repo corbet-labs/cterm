@@ -14,6 +14,7 @@ pub mod grid;
 pub mod image_decode;
 pub mod iterm2;
 pub mod keyboard;
+pub mod kitty_file_transfer;
 mod kitty_graphics;
 mod kitty_placeholder;
 pub mod mouse;
@@ -36,6 +37,11 @@ pub use grid::Grid;
 pub use image_decode::{decode_image, DecodedImage, ImageDecodeError};
 pub use iterm2::{Iterm2Dimension, Iterm2FileParams};
 pub use keyboard::{KeyEventKind, KeyEventMetadata, KeyboardEnhancementFlags};
+pub use kitty_file_transfer::{
+    parse_file_transfer_command, FileTransferAction, FileTransferCodecError, FileTransferCommand,
+    FileTransferCompression, FileTransferType, FileTransmissionType, MAX_FILE_TRANSFER_CHUNK_BYTES,
+    MAX_FILE_TRANSFER_PATH_BYTES, MAX_PENDING_FILE_TRANSFER_COMMANDS,
+};
 pub use kitty_graphics::GraphicsAnimationTick;
 pub use multiple_cursors::{ExtraCursor, ExtraCursorColor, ExtraCursorColors, ExtraCursorShape};
 pub use parser::Parser;

@@ -18,6 +18,7 @@ use crate::drcs::DecdldDecoder;
 use crate::image_decode::decode_image;
 use crate::iterm2::{Iterm2Dimension, Iterm2FileParams};
 use crate::keyboard::KeyboardEnhancementFlags;
+use crate::kitty_file_transfer::parse_file_transfer_command;
 use crate::kitty_graphics::{
     GraphicsAnimationTick, InterceptorResult as KittyInterceptorResult, KittyGraphics,
 };
@@ -757,6 +758,18 @@ impl vte::Perform for ScreenPerformer<'_> {
             // iTerm2 inline images and file transfer (1337)
             1337 => {
                 self.handle_osc_1337(params);
+            }
+            // Kitty's session-based TTY file-transfer protocol requires ST;
+            // decoded commands still need explicit frontend authorization.
+            5113 => {
+                if bell_terminated {
+                    log::warn!("Rejected BEL-terminated Kitty OSC 5113 command");
+                } else {
+                    match parse_file_transfer_command(params) {
+                        Ok(command) => self.screen.queue_kitty_file_transfer_command(command),
+                        Err(error) => log::warn!("Rejected Kitty OSC 5113 command: {error}"),
+                    }
+                }
             }
             // Copy to clipboard (52)
             52 => {
@@ -3827,6 +3840,42 @@ mod tests {
         );
         assert_eq!(screen.grid().row(0).unwrap().text().trim_end(), "recovered");
         assert!(!screen.has_file_transfers());
+    }
+
+    #[test]
+    fn test_kitty_osc_5113_queues_only_valid_st_terminated_commands() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+
+        parser.parse(
+            &mut screen,
+            b"\x1b]5113;ac=send;id=session-1;n=L3RtcC9maWxlLnR4dA==\x1b\\",
+        );
+        let commands = screen.take_kitty_file_transfer_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].action,
+            crate::kitty_file_transfer::FileTransferAction::Send
+        );
+        assert_eq!(commands[0].id, "session-1");
+        assert_eq!(commands[0].name.as_deref(), Some("/tmp/file.txt"));
+
+        parser.parse(&mut screen, b"\x1b]5113;ac=send;id=bell\x07");
+        parser.parse(&mut screen, b"\x1b]5113;ac=bogus;id=bad\x1b\\");
+        assert!(!screen.has_kitty_file_transfer_commands());
+    }
+
+    #[test]
+    fn test_kitty_osc_5113_frontend_queue_is_bounded() {
+        let mut screen = make_screen();
+        let mut parser = Parser::new();
+        for _ in 0..=crate::kitty_file_transfer::MAX_PENDING_FILE_TRANSFER_COMMANDS {
+            parser.parse(&mut screen, b"\x1b]5113;ac=cancel;id=x\x1b\\");
+        }
+        assert_eq!(
+            screen.take_kitty_file_transfer_commands().len(),
+            crate::kitty_file_transfer::MAX_PENDING_FILE_TRANSFER_COMMANDS
+        );
     }
 
     #[test]
