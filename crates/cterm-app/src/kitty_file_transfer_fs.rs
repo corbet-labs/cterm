@@ -682,7 +682,9 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
     use std::os::windows::io::FromRawHandle;
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::winbase::ReOpenFile;
-    use winapi::um::winnt::{DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, WRITE_DAC};
+    use winapi::um::winnt::{
+        DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, WRITE_DAC,
+    };
 
     let security = WindowsPrivateSecurityDescriptor::new()?;
     let mut options = OpenOptionsAt::default();
@@ -691,20 +693,21 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
         .create_new(true)
         .follow(false)
         // fs_at currently shares every handle. Create with only SYNCHRONIZE,
-        // then reopen with the complete access mask and no sharing while the
-        // protected owner-only DACL makes that transition private.
+        // then reopen with the complete access mask and only delete sharing
+        // while the protected owner-only DACL makes that transition private.
         .desired_access(0)
         .security_descriptor(security.descriptor);
     let shared_file = options.open_at(parent, name)?;
     // SAFETY: shared_file is a live synchronous file handle. The requested
-    // rights are granted by the owner-only creation DACL; zero share access is
-    // compatible with the original handle because it requested no read,
-    // write, or delete access. The returned handle is independently owned.
+    // rights are granted by the owner-only creation DACL. Delete sharing is
+    // compatible with the original handle and required for handle-relative
+    // rename; read and write sharing remain disabled. The returned handle is
+    // independently owned.
     let exclusive = unsafe {
         ReOpenFile(
             windows_handle(&shared_file),
             FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | WRITE_DAC | DELETE,
-            0,
+            FILE_SHARE_DELETE,
             0,
         )
     };
