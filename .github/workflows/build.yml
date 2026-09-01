@@ -291,22 +291,53 @@ jobs:
             export WLR_RENDERER=pixman
             export WLR_HEADLESS_OUTPUTS=1
             export WLR_LIBINPUT_NO_DEVICES=1
+            export WAYLAND_DISPLAY=wayland-0
 
             ui_status=0
-            # Keep the VM action alive long enough to copy its workspace back
-            # to the runner even when Cage, cterm, or a descendant wedges.
-            # Run Cage directly so GNU timeout owns the whole compositor/client
-            # process group and can escalate to SIGKILL. wlheadless-run creates
-            # a new process group internally, which lets wedged descendants
-            # escape timeout's cleanup.
-            gtimeout --signal=TERM --kill-after=10s 3m \
-              dbus-run-session -- \
-                cage -- \
+            # Own the compositor lifecycle independently from the test client.
+            # Cage may remain alive after the tested application exits when
+            # auxiliary Wayland clients (for example accessibility services)
+            # still hold connections. That must not turn a completed UI test
+            # into a timeout.
+            cage >"$OUTPUT_DIR/wlheadless.log" 2>&1 &
+            cage_pid=$!
+            cleanup_cage() {
+              kill "$cage_pid" 2>/dev/null || true
+              wait "$cage_pid" 2>/dev/null || true
+            }
+            trap cleanup_cage 0 1 2 15
+
+            for attempt in $(seq 1 80); do
+              if [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+                break
+              fi
+              if ! kill -0 "$cage_pid" 2>/dev/null; then
+                echo "Cage exited before creating its Wayland socket" \
+                  >"$OUTPUT_DIR/test-driver.log"
+                ui_status=1
+                break
+              fi
+              if [ "$attempt" -eq 80 ]; then
+                echo "Cage did not create its Wayland socket" \
+                  >"$OUTPUT_DIR/test-driver.log"
+                ui_status=1
+                break
+              fi
+              sleep 0.25
+            done
+
+            if [ "$ui_status" -eq 0 ]; then
+              gtimeout --signal=TERM --kill-after=10s 3m \
+                dbus-run-session -- \
                   env -u DISPLAY \
-                  ./scripts/linux_ui_test.sh \
-                  ./freebsd-ui-binaries/cterm \
-                  "$OUTPUT_DIR" \
-                  >"$OUTPUT_DIR/wlheadless.log" 2>&1 || ui_status=$?
+                    ./scripts/linux_ui_test.sh \
+                    ./freebsd-ui-binaries/cterm \
+                    "$OUTPUT_DIR" \
+                    >"$OUTPUT_DIR/test-driver.log" 2>&1 || ui_status=$?
+            fi
+
+            cleanup_cage
+            trap - 0 1 2 15
             printf '%s\n' "$ui_status" >"$OUTPUT_DIR/exit-code"
             rm -rf -- "$XDG_RUNTIME_DIR"
 
@@ -336,6 +367,7 @@ jobs:
             for LOG_FILE in \
               freebsd-ui-test-results/environment.log \
               freebsd-ui-test-results/wlheadless.log \
+              freebsd-ui-test-results/test-driver.log \
               freebsd-ui-test-results/test.log \
               freebsd-ui-test-results/cterm.stderr.log \
               freebsd-ui-test-results/cterm.log; do
