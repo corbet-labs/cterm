@@ -12,6 +12,9 @@ components listed here. The original notices are preserved in the derived files.
 | foot | `765ca4070bb6f095fc58c030f2154ed03857701d` (1.27.0) | Behavioral reference and adapted DEC rectangular-editing, xterm palette-stack, Sixel aspect/palette/resource-management, theme/visibility-reporting, and cursor/cell blink source, timing and rearm semantics, validation and tests in `cterm-core` and `cterm-ui` | MIT |
 | Zellij | `e839bfffa586992364309a685b2c71f3b23c247e` | Adapted all-or-none bounded control-string interception and split/recovery test structure for streamed OSC 1337, plus the Kitty graphics command vocabulary, chunk state, and error model in `cterm-core` | MIT |
 | Noa | `8d843ce352e2f10ef1c130bcf7f94198f1ccaca6` | Adapted the tested Rust full-canvas `Arc` frame-store, quota-accounting, monotonic animation-tick structure, Unicode-placeholder scanner, and 297-entry diacritic table; cterm's command mapping, playback, placeholder inference, aspect ratio, and layer behavior are corrected against Kitty's specification and reference implementation | MIT |
+| Qwertty Term / Ghostty | `9021f511bf053ec4155298e43a65de4365a13f80`; `2da015cd6` | Adapted Qwertty Term's Rust port of Ghostty's complete Kitty OSC 72 command vocabulary and parser test matrix in `cterm-core`; cterm adds strict integer, duplicate-key, terminator, chunk-chain, and payload bounds | MIT |
+| Yazi | `a73d235678db3a070b7e013ccf9573bf45a5324f` | Adapted Kitty OSC 72 chunk-state and MIME-payload test cases in `cterm-core` | MIT |
+| Elio | `3a39678609e927ea4f248a3cf40d7dbf353260fe` | Behavioral reference for tested Kitty OSC 72 client sequencing, URI-list handling, and chunk boundaries; no source copied | MIT |
 | `shared_memory-rs` | `68563b3aa82b832dfb73b18a59f4db34ff182df2` (`0.12.4`) | Cargo dependency providing tested Windows named-mapping lifecycle for Kitty shared-memory transfers; no source copied | MIT OR Apache-2.0 |
 | `nix` | `9cd968a1af35b46b05ed41e05acfcca5d02a5645` (`0.31.3`) | Cargo dependency providing safe POSIX `shm_open`, `shm_unlink`, and descriptor ownership on Linux, macOS, and FreeBSD; no source copied | MIT |
 | `memmap2` | `7710019665fec7bdac1dc18cf6661fbe215a1ad2` (`0.9.11`) | Cargo dependency providing tested read-only POSIX mapping for Kitty shared-memory payload snapshots; no source copied | MIT OR Apache-2.0 |
@@ -99,6 +102,73 @@ SOFTWARE.
 ## Zellij MIT license
 
 Copyright (c) 2020 Zellij contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Qwertty Term MIT license
+
+Copyright (c) 2026 Josh McKinney
+Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Yazi MIT license
+
+Copyright (c) 2023 - sxyazi
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Elio MIT license
+
+Copyright (c) 2026 Miguel Regueiro
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

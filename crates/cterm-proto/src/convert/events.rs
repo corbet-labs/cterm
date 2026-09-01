@@ -43,6 +43,10 @@ pub fn event_to_proto(event: &CoreEvent) -> Option<proto::TerminalEvent> {
         CoreEvent::DesktopNotification(notification) => {
             Event::DesktopNotification(desktop_notification_to_proto(notification))
         }
+        // OSC 72 remains in the mirrored PTY byte stream and is parsed by the
+        // native frontend. Sending it again on the event stream would apply a
+        // drag command twice.
+        CoreEvent::DndCommand(_) => return None,
     };
 
     Some(proto::TerminalEvent { event: Some(event) })
@@ -164,5 +168,22 @@ mod tests {
             }
             _ => panic!("Expected DesktopNotification event"),
         }
+    }
+
+    #[test]
+    fn dnd_commands_stay_in_the_mirrored_pty_stream() {
+        let event = CoreEvent::DndCommand(cterm_core::DndCommand {
+            command_type: cterm_core::DndCommandType::AcceptDrops,
+            more: false,
+            client_id: 0,
+            operation: 0,
+            cell_x: 0,
+            cell_y: 0,
+            pixel_x: 0,
+            pixel_y: 0,
+            payload: b"text/uri-list".to_vec(),
+        });
+
+        assert!(event_to_proto(&event).is_none());
     }
 }

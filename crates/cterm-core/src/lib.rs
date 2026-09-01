@@ -8,6 +8,7 @@
 
 pub mod cell;
 pub mod color;
+pub mod dnd;
 pub mod drcs;
 pub mod grid;
 pub mod image_decode;
@@ -29,6 +30,7 @@ mod text_sizing;
 
 pub use cell::{Cell, CellAttrs};
 pub use color::{AnsiColor, Color, ColorPalette, Rgb};
+pub use dnd::{DndCommand, DndCommandType, MAX_DND_CHUNK_BYTES};
 pub use drcs::{DecdldDecoder, DrcsFont, DrcsGlyph};
 pub use grid::Grid;
 pub use image_decode::{decode_image, DecodedImage, ImageDecodeError};

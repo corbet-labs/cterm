@@ -2041,7 +2041,7 @@ impl TerminalWidget {
                                     crate::desktop_notification::handle(notification);
                                 }
                                 TerminalEvent::ContentChanged => content_changed = true,
-                                TerminalEvent::ProcessExited(_) => {}
+                                TerminalEvent::ProcessExited(_) | TerminalEvent::DndCommand(_) => {}
                             }
                         }
 

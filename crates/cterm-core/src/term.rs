@@ -3,6 +3,7 @@
 //! Provides a high-level interface for terminal emulation.
 
 use crate::color::ColorPalette;
+use crate::dnd::DndCommand;
 use crate::kitty_graphics::GraphicsAnimationTick;
 use crate::parser::Parser;
 use crate::pty::{Pty, PtyConfig, PtyError, PtySize};
@@ -30,6 +31,8 @@ pub enum TerminalEvent {
     ClipboardRequest(ClipboardOperation),
     /// Terminal application requested a native desktop notification.
     DesktopNotification(DesktopNotificationAction),
+    /// Terminal application changed a native Kitty OSC 72 drag session.
+    DndCommand(DndCommand),
 }
 
 /// Terminal configuration
@@ -207,6 +210,12 @@ impl Terminal {
         if self.screen.has_notifications() {
             for notification in self.screen.take_notifications() {
                 events.push(TerminalEvent::DesktopNotification(notification));
+            }
+        }
+
+        if self.screen.has_dnd_commands() {
+            for command in self.screen.take_dnd_commands() {
+                events.push(TerminalEvent::DndCommand(command));
             }
         }
 
@@ -1435,6 +1444,34 @@ mod tests {
                 if notification.id.as_deref() == Some("build")
                     && notification.title == "finished"
                     && notification.focus
+        )));
+    }
+
+    #[test]
+    fn process_emits_validated_dnd_commands_without_premature_capability_claims() {
+        let mut term = Terminal::new(80, 24, ScreenConfig::default());
+
+        let (events, responses) = term.process_collecting(
+            concat!(
+                "\x1b]72;t=q:i=3\x1b\\",
+                "\x1b]72;t=o:x=1;1:machine-id\x1b\\"
+            )
+            .as_bytes(),
+        );
+
+        assert!(responses.is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::DndCommand(command)
+                if command.command_type == crate::dnd::DndCommandType::Query
+                    && command.client_id == 3
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::DndCommand(command)
+                if command.command_type == crate::dnd::DndCommandType::OfferDrag
+                    && command.cell_x == 1
+                    && command.payload == b"1:machine-id"
         )));
     }
 
