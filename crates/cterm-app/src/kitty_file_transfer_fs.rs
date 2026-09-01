@@ -14,11 +14,11 @@ use std::path::{Component, Path, PathBuf};
 
 use cterm_core::{
     FileTransferAction, FileTransferCommand, FileTransferCompression, FileTransferType,
-    FileTransmissionType,
+    FileTransmissionType, MAX_FILE_TRANSFER_PATH_BYTES,
 };
 use filetime::{set_file_handle_times, FileTime};
 use flate2::{Decompress, FlushDecompress, Status};
-use fs_at::{OpenOptions as OpenOptionsAt, OpenOptionsWriteMode};
+use fs_at::{LinkEntryType, OpenOptions as OpenOptionsAt, OpenOptionsWriteMode};
 use tempfile::Builder;
 use thiserror::Error;
 
@@ -102,7 +102,7 @@ impl TtyTransferFilesystem {
                 self.receive.complete_listing(session_id, quiet, emit)
             }
             TtyTransferAction::Abort { session_id } => {
-                self.send.sessions.remove(&session_id);
+                self.send.abort(&session_id);
                 self.receive.abort(&session_id);
                 true
             }
@@ -175,7 +175,7 @@ impl TtyTransferSendFilesystem {
                     .collect()
             }
             TtyTransferAction::Abort { session_id } => {
-                self.sessions.remove(&session_id);
+                self.abort(&session_id);
                 Vec::new()
             }
             action => vec![action],
@@ -184,6 +184,12 @@ impl TtyTransferSendFilesystem {
 
     pub fn active_sessions(&self) -> usize {
         self.sessions.len()
+    }
+
+    fn abort(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.remove(session_id) {
+            session.abort();
+        }
     }
 
     fn execute(&mut self, authorized: AuthorizedTtyTransferCommand) -> Vec<Vec<u8>> {
@@ -205,23 +211,13 @@ impl TtyTransferSendFilesystem {
             .to_string();
         let session = self.sessions.entry(command.id.clone()).or_default();
 
-        if session.files.contains_key(&file_id) || session.rejected.contains(&file_id) {
+        if session.contains_entry(&file_id) || session.rejected.contains(&file_id) {
             return response(&command, "EEXIST:Duplicate file id", quiet, true, None);
         }
-        if session.files.len() + session.rejected.len() >= self.limits.max_files_per_session {
+        if session.entry_count() + session.rejected.len() >= self.limits.max_files_per_session {
             return response(
                 &command,
                 "ENOSPC:Too many files in transfer session",
-                quiet,
-                true,
-                None,
-            );
-        }
-        if !matches!(command.file_type, None | Some(FileTransferType::Regular)) {
-            session.rejected.insert(file_id);
-            return response(
-                &command,
-                "ENOTSUP:File type is not implemented",
                 quiet,
                 true,
                 None,
@@ -241,10 +237,32 @@ impl TtyTransferSendFilesystem {
             );
         }
 
-        // Kitty commonly omits `sz`. Reserve declared bytes eagerly, but let
-        // undeclared files grow under the real per-file and cumulative limits
-        // instead of pessimistically charging the entire per-file maximum.
-        let reservation = command.size.unwrap_or(0);
+        let file_type = command.file_type.unwrap_or(FileTransferType::Regular);
+        if file_type != FileTransferType::Regular
+            && !matches!(
+                command.compression,
+                None | Some(FileTransferCompression::None)
+            )
+        {
+            session.rejected.insert(file_id);
+            return response(
+                &command,
+                "EINVAL:Compression is valid only for regular files",
+                quiet,
+                true,
+                None,
+            );
+        }
+
+        // Kitty commonly omits `sz`. Reserve declared regular-file bytes
+        // eagerly, but let undeclared files grow under the real per-file and
+        // cumulative limits instead of pessimistically charging the entire
+        // per-file maximum. Link metadata size is not link-payload size.
+        let reservation = if file_type == FileTransferType::Regular {
+            command.size.unwrap_or(0)
+        } else {
+            0
+        };
         let planned_unwritten = session.planned_unwritten_bytes();
         if reservation > self.limits.max_file_bytes
             || session
@@ -277,6 +295,24 @@ impl TtyTransferSendFilesystem {
                 None,
             );
         };
+        if file_type == FileTransferType::Directory {
+            let directory =
+                match StagedDirectory::new(destination, command.permissions, command.mtime) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        session.rejected.insert(file_id);
+                        return response(
+                            &command,
+                            io_status(&error, "Could not stage destination directory"),
+                            quiet,
+                            true,
+                            None,
+                        );
+                    }
+                };
+            session.directories.insert(file_id, directory);
+            return response(&command, "OK", quiet, false, None);
+        }
         if fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.is_dir()) {
             session.rejected.insert(file_id);
             return response(
@@ -286,6 +322,27 @@ impl TtyTransferSendFilesystem {
                 true,
                 None,
             );
+        }
+        if matches!(
+            file_type,
+            FileTransferType::Symlink | FileTransferType::Link
+        ) {
+            let link =
+                match StagedLink::new(file_type, destination, command.permissions, command.mtime) {
+                    Ok(link) => link,
+                    Err(error) => {
+                        session.rejected.insert(file_id);
+                        return response(
+                            &command,
+                            io_status(&error, "Could not stage destination link"),
+                            quiet,
+                            true,
+                            None,
+                        );
+                    }
+                };
+            session.links.insert(file_id, link);
+            return response(&command, "STARTED", quiet, false, None);
         }
         let temporary = match StagedTempFile::new(&destination) {
             Ok(temporary) => temporary,
@@ -316,6 +373,7 @@ impl TtyTransferSendFilesystem {
         session.files.insert(
             file_id,
             StagedFile {
+                destination,
                 expected_size: command.size,
                 permissions: command.permissions,
                 mtime: command.mtime,
@@ -343,6 +401,66 @@ impl TtyTransferSendFilesystem {
         };
         if session.rejected.contains(file_id) {
             return Vec::new();
+        }
+        if session.directories.contains_key(file_id) {
+            return response(
+                &command,
+                "EISDIR:Cannot write data to a directory entry",
+                quiet,
+                true,
+                None,
+            );
+        }
+        if let Some(link) = session.links.get_mut(file_id) {
+            if link.complete {
+                session.reject_link(file_id);
+                return response(
+                    &command,
+                    "EINVAL:Link data was already completed",
+                    quiet,
+                    true,
+                    None,
+                );
+            }
+            let new_len = link.data.len().checked_add(command.data.len());
+            let remaining_session = self
+                .limits
+                .max_session_bytes
+                .saturating_sub(session.consumed_bytes);
+            if new_len.is_none_or(|length| {
+                length > MAX_FILE_TRANSFER_PATH_BYTES
+                    || length as u64 > self.limits.max_file_bytes
+                    || command.data.len() as u64 > remaining_session
+            }) {
+                session.consumed_bytes = session
+                    .consumed_bytes
+                    .saturating_add(command.data.len() as u64);
+                session.reject_link(file_id);
+                return response(
+                    &command,
+                    "EFBIG:Link target exceeds configured size limits",
+                    quiet,
+                    true,
+                    None,
+                );
+            }
+            link.data.extend_from_slice(&command.data);
+            session.consumed_bytes += command.data.len() as u64;
+            if completes_file {
+                if parse_link_target(&link.data).is_none() {
+                    session.reject_link(file_id);
+                    return response(&command, "EINVAL:Invalid link target", quiet, true, None);
+                }
+                link.complete = true;
+                return response(&command, "OK", quiet, false, Some(link.data.len() as u64));
+            }
+            return response(
+                &command,
+                "PROGRESS",
+                quiet,
+                false,
+                Some(link.data.len() as u64),
+            );
         }
         let Some(file) = session.files.get_mut(file_id) else {
             return Vec::new();
@@ -445,64 +563,194 @@ impl TtyTransferSendFilesystem {
     }
 
     fn commit_session(&mut self, command: FileTransferCommand, quiet: u8) -> Vec<Vec<u8>> {
-        let Some(session) = self.sessions.remove(&command.id) else {
+        let Some(mut session) = self.sessions.remove(&command.id) else {
             return Vec::new();
         };
-        if session.files.values().any(|file| file.temporary.is_none()) {
-            return response(
+        if session.files.values().any(|file| file.temporary.is_none())
+            || session.links.values().any(|link| !link.complete)
+        {
+            let output = response(
                 &command,
-                "EINVAL:Transfer contains incomplete files",
+                "EINVAL:Transfer contains incomplete entries",
                 quiet,
                 true,
                 None,
             );
+            session.abort();
+            return output;
         }
 
-        let mut files: Vec<_> = session.files.into_iter().collect();
+        let mut destinations = HashMap::new();
+        destinations.extend(session.files.iter().map(|(file_id, file)| {
+            (
+                file_id.clone(),
+                (file.destination.clone(), FileTransferType::Regular),
+            )
+        }));
+        destinations.extend(session.directories.iter().map(|(file_id, directory)| {
+            (
+                file_id.clone(),
+                (directory.destination(), FileTransferType::Directory),
+            )
+        }));
+        destinations.extend(
+            session.links.iter().map(|(file_id, link)| {
+                (file_id.clone(), (link.destination.clone(), link.file_type))
+            }),
+        );
+
+        let mut links = Vec::new();
+        for (file_id, link) in std::mem::take(&mut session.links) {
+            let target = match resolve_staged_link_target(&link, &destinations) {
+                Ok(target) => target,
+                Err(error) => {
+                    let output = response(
+                        &command,
+                        io_status(&error, "Could not resolve staged link"),
+                        quiet,
+                        true,
+                        None,
+                    );
+                    session.abort();
+                    return output;
+                }
+            };
+            links.push((file_id, link, target));
+        }
+        links.sort_by_key(|(_, link, _)| {
+            if link.file_type == FileTransferType::Link {
+                0
+            } else {
+                1
+            }
+        });
+        for (_, link, target) in &mut links {
+            let source = match target {
+                ResolvedLinkTarget::Hard { source_id } => session
+                    .files
+                    .get(source_id)
+                    .and_then(|file| file.temporary.as_ref()),
+                ResolvedLinkTarget::Symbolic { .. } => None,
+            };
+            if let Err(error) = link.prepare(target, source) {
+                let output = response(
+                    &command,
+                    io_status(&error, "Could not stage link"),
+                    quiet,
+                    true,
+                    None,
+                );
+                session.abort();
+                return output;
+            }
+        }
+
+        let mut files: Vec<_> = std::mem::take(&mut session.files).into_iter().collect();
         files.sort_by(|left, right| left.0.cmp(&right.0));
         for (_, mut file) in files {
             let temporary = file.temporary.take().expect("completion was checked above");
             if let Err(error) = apply_metadata(temporary.as_file(), file.permissions, file.mtime) {
-                return response(
+                let output = response(
                     &command,
                     io_status(&error, "Could not apply file metadata"),
                     quiet,
                     true,
                     None,
                 );
+                session.abort();
+                return output;
             }
             if let Err(error) = temporary.as_file().sync_all() {
-                return response(
+                let output = response(
                     &command,
                     io_status(&error, "Could not synchronize staged metadata"),
                     quiet,
                     true,
                     None,
                 );
+                session.abort();
+                return output;
             }
             if let Err(error) = temporary.commit() {
-                return response(
+                let output = response(
                     &command,
                     io_status(&error, "Could not commit staged file"),
                     quiet,
                     true,
                     None,
                 );
+                session.abort();
+                return output;
+            }
+        }
+
+        for (_, link, _) in links {
+            if let Err(error) = link.commit() {
+                let output = response(
+                    &command,
+                    io_status(&error, "Could not commit staged link"),
+                    quiet,
+                    true,
+                    None,
+                );
+                session.abort();
+                return output;
+            }
+        }
+
+        let mut directories: Vec<_> = std::mem::take(&mut session.directories)
+            .into_values()
+            .collect();
+        directories.sort_by_key(|directory| std::cmp::Reverse(directory.depth));
+        for directory in &mut directories {
+            if let Err(error) = directory.commit() {
+                let output = response(
+                    &command,
+                    io_status(&error, "Could not apply directory metadata"),
+                    quiet,
+                    true,
+                    None,
+                );
+                for directory in &mut directories {
+                    directory.cleanup();
+                }
+                session.abort();
+                return output;
             }
         }
         Vec::new()
     }
 }
 
+impl Drop for TtyTransferSendFilesystem {
+    fn drop(&mut self) {
+        for (_, session) in self.sessions.drain() {
+            session.abort();
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct SendSession {
     files: HashMap<String, StagedFile>,
+    directories: HashMap<String, StagedDirectory>,
+    links: HashMap<String, StagedLink>,
     rejected: HashSet<String>,
     reserved_bytes: u64,
     consumed_bytes: u64,
 }
 
 impl SendSession {
+    fn contains_entry(&self, file_id: &str) -> bool {
+        self.files.contains_key(file_id)
+            || self.directories.contains_key(file_id)
+            || self.links.contains_key(file_id)
+    }
+
+    fn entry_count(&self) -> usize {
+        self.files.len() + self.directories.len() + self.links.len()
+    }
+
     fn planned_unwritten_bytes(&self) -> u64 {
         let live_written = self
             .files
@@ -518,10 +766,337 @@ impl SendSession {
         }
         self.rejected.insert(file_id.to_string());
     }
+
+    fn reject_link(&mut self, file_id: &str) {
+        self.links.remove(file_id);
+        self.rejected.insert(file_id.to_string());
+    }
+
+    fn abort(mut self) {
+        self.files.clear();
+        self.links.clear();
+        let mut directories: Vec<_> = self.directories.into_values().collect();
+        directories.sort_by_key(|directory| std::cmp::Reverse(directory.depth));
+        for mut directory in directories {
+            directory.cleanup();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StagedDirectory {
+    destination: PathBuf,
+    parent: fs::File,
+    directory: fs::File,
+    name: OsString,
+    permissions: Option<u32>,
+    mtime: Option<i64>,
+    depth: usize,
+    created: bool,
+    committed: bool,
+}
+
+impl StagedDirectory {
+    fn new(destination: PathBuf, permissions: Option<u32>, mtime: Option<i64>) -> io::Result<Self> {
+        let depth = destination.components().count();
+        let parent_path = destination
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+        let name = destination
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing directory name"))?
+            .to_os_string();
+        let parent = open_or_create_parent_directory(parent_path)?;
+        let (directory, created) = match open_destination_directory(&parent, &name) {
+            Ok(directory) => (directory, false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                (create_destination_directory(&parent, &name)?, true)
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            destination,
+            parent,
+            directory,
+            name,
+            permissions,
+            mtime,
+            depth,
+            created,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self) -> io::Result<()> {
+        if self.created {
+            finalize_destination_security(&self.directory, &self.parent)?;
+        }
+        apply_metadata(&self.directory, self.permissions, self.mtime)?;
+        sync_directory_metadata(&self.directory)?;
+        sync_parent_directory(&self.parent)?;
+        self.committed = true;
+        Ok(())
+    }
+
+    fn destination(&self) -> PathBuf {
+        self.destination.clone()
+    }
+
+    fn cleanup(&mut self) {
+        if self.created && !self.committed {
+            let _ = remove_created_directory(&self.parent, &self.directory, &self.name);
+            self.created = false;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StagedLink {
+    file_type: FileTransferType,
+    destination: PathBuf,
+    permissions: Option<u32>,
+    mtime: Option<i64>,
+    data: Vec<u8>,
+    complete: bool,
+    scaffold: StagedTempFile,
+}
+
+impl StagedLink {
+    fn new(
+        file_type: FileTransferType,
+        destination: PathBuf,
+        permissions: Option<u32>,
+        mtime: Option<i64>,
+    ) -> io::Result<Self> {
+        let scaffold = StagedTempFile::new(&destination)?;
+        Ok(Self {
+            file_type,
+            destination,
+            permissions,
+            mtime,
+            data: Vec::new(),
+            complete: false,
+            scaffold,
+        })
+    }
+
+    fn prepare(
+        &mut self,
+        target: &ResolvedLinkTarget,
+        hardlink_source: Option<&StagedTempFile>,
+    ) -> io::Result<()> {
+        remove_staged_file(
+            &mut self.scaffold.file,
+            &self.scaffold.source_directory,
+            &self.scaffold.temporary_name,
+        );
+        match target {
+            ResolvedLinkTarget::Symbolic { target, entry_type } => {
+                OpenOptionsAt::default().symlink_at(
+                    &self.scaffold.source_directory,
+                    &self.scaffold.temporary_name,
+                    *entry_type,
+                    target,
+                )?;
+            }
+            ResolvedLinkTarget::Hard { .. } => {
+                let source = hardlink_source.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "hardlink source is not a completed regular file",
+                    )
+                })?;
+                create_hard_link_at(
+                    &source.source_directory,
+                    &source.temporary_name,
+                    &self.scaffold.source_directory,
+                    &self.scaffold.temporary_name,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(mut self) -> io::Result<()> {
+        let entry = open_staged_entry_for_rename(
+            &self.scaffold.source_directory,
+            &self.scaffold.temporary_name,
+        )?;
+        let symbolic = self.file_type == FileTransferType::Symlink;
+        if symbolic {
+            prepare_destination_security(&entry, &self.scaffold.parent)?;
+        }
+        replace_staged_file(
+            &entry,
+            &self.scaffold.source_directory,
+            &self.scaffold.parent,
+            &self.scaffold.temporary_name,
+            &self.scaffold.destination_name,
+        )?;
+        self.scaffold.committed = true;
+        if symbolic {
+            finalize_destination_security(&entry, &self.scaffold.parent)?;
+            apply_symlink_metadata(&self.destination, self.permissions, self.mtime)?;
+        }
+        let _ = self.scaffold.remove_staging_directory();
+        sync_parent_directory(&self.scaffold.parent)
+    }
+}
+
+impl Drop for StagedLink {
+    fn drop(&mut self) {
+        if self.scaffold.file.is_none() && !self.scaffold.committed {
+            let _ = OpenOptionsAt::default().unlink_at(
+                &self.scaffold.source_directory,
+                &self.scaffold.temporary_name,
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResolvedLinkTarget {
+    Symbolic {
+        target: PathBuf,
+        entry_type: LinkEntryType,
+    },
+    Hard {
+        source_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkTargetKind {
+    FidRelative,
+    FidAbsolute,
+    Path,
+}
+
+fn parse_link_target(data: &[u8]) -> Option<(LinkTargetKind, &str)> {
+    let data = std::str::from_utf8(data).ok()?;
+    let (kind, target) = if let Some(target) = data.strip_prefix("fid_abs:") {
+        (LinkTargetKind::FidAbsolute, target)
+    } else if let Some(target) = data.strip_prefix("fid:") {
+        (LinkTargetKind::FidRelative, target)
+    } else {
+        (LinkTargetKind::Path, data.strip_prefix("path:")?)
+    };
+    (!target.is_empty() && !target.contains('\0')).then_some((kind, target))
+}
+
+fn resolve_staged_link_target(
+    link: &StagedLink,
+    destinations: &HashMap<String, (PathBuf, FileTransferType)>,
+) -> io::Result<ResolvedLinkTarget> {
+    let (kind, value) = parse_link_target(&link.data)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid link target"))?;
+    let destination_parent = link
+        .destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "link has no parent"))?;
+
+    if link.file_type == FileTransferType::Link {
+        let source_id = match kind {
+            LinkTargetKind::FidRelative | LinkTargetKind::FidAbsolute => {
+                let Some((_, file_type)) = destinations.get(value) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "hardlink target file id is not in this transfer",
+                    ));
+                };
+                if *file_type != FileTransferType::Regular {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "hardlink target is not a regular file",
+                    ));
+                }
+                value.to_string()
+            }
+            LinkTargetKind::Path => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "hardlinks may target only regular files in this approved transfer",
+                ));
+            }
+        };
+        return Ok(ResolvedLinkTarget::Hard { source_id });
+    }
+
+    let (target, entry_type) = match kind {
+        LinkTargetKind::FidRelative | LinkTargetKind::FidAbsolute => {
+            let Some((path, file_type)) = destinations.get(value) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "symlink target file id is not in this transfer",
+                ));
+            };
+            let target = if kind == LinkTargetKind::FidRelative {
+                pathdiff::diff_paths(path, destination_parent).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "symlink target has no relative representation",
+                    )
+                })?
+            } else {
+                path.clone()
+            };
+            let entry_type = if *file_type == FileTransferType::Directory {
+                LinkEntryType::Dir
+            } else {
+                LinkEntryType::File
+            };
+            (target, entry_type)
+        }
+        LinkTargetKind::Path => {
+            let target = link_path_from_protocol(value).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid symbolic-link path")
+            })?;
+            let resolved = if target.is_absolute() {
+                target.clone()
+            } else {
+                destination_parent.join(&target)
+            };
+            let entry_type = if fs::metadata(resolved).is_ok_and(|metadata| metadata.is_dir()) {
+                LinkEntryType::Dir
+            } else {
+                LinkEntryType::File
+            };
+            (target, entry_type)
+        }
+    };
+    Ok(ResolvedLinkTarget::Symbolic { target, entry_type })
+}
+
+fn link_path_from_protocol(target: &str) -> Option<PathBuf> {
+    if target.contains('\\') || target.len() > MAX_FILE_TRANSFER_PATH_BYTES {
+        return None;
+    }
+    if target.starts_with('/') {
+        return resolve_absolute_protocol_path(target);
+    }
+    let mut path = PathBuf::new();
+    for component in target.split('/') {
+        match component {
+            "" | "." => path.push("."),
+            ".." => path.push(".."),
+            component => {
+                if component.len() > 255 {
+                    return None;
+                }
+                #[cfg(windows)]
+                if !valid_windows_component(component) {
+                    return None;
+                }
+                path.push(component);
+            }
+        }
+    }
+    Some(path)
 }
 
 #[derive(Debug)]
 struct StagedFile {
+    destination: PathBuf,
     expected_size: Option<u64>,
     permissions: Option<u32>,
     mtime: Option<i64>,
@@ -1274,6 +1849,163 @@ fn open_or_create_parent_directory(path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(unix)]
+fn open_destination_directory(parent: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+    let mut options = OpenOptionsAt::default();
+    options.read(true).follow(false);
+    options.open_dir_at(parent, name)
+}
+
+#[cfg(windows)]
+fn open_destination_directory(parent: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+    use fs_at::os::windows::OpenOptionsExt;
+    use winapi::um::winnt::{DELETE, FILE_GENERIC_READ, FILE_WRITE_ATTRIBUTES};
+
+    let mut options = OpenOptionsAt::default();
+    options
+        .follow(false)
+        .desired_access(FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES | DELETE);
+    options.open_dir_at(parent, name)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_destination_directory(_parent: &fs::File, _name: &OsStr) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory staging is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn create_destination_directory(parent: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+    use fs_at::os::unix::OpenOptionsExt;
+
+    let mut options = OpenOptionsAt::default();
+    options.create_new(true).follow(false).mode(0o700);
+    options.mkdir_at(parent, name)
+}
+
+#[cfg(windows)]
+fn create_destination_directory(parent: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+    use fs_at::os::windows::OpenOptionsExt;
+    use winapi::um::winnt::{DELETE, FILE_GENERIC_READ, FILE_WRITE_ATTRIBUTES};
+
+    let security = WindowsPrivateSecurityDescriptor::new()?;
+    let mut options = OpenOptionsAt::default();
+    options
+        .create_new(true)
+        .follow(false)
+        .desired_access(FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES | DELETE)
+        .security_descriptor(security.descriptor);
+    options.mkdir_at(parent, name)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_destination_directory(_parent: &fs::File, _name: &OsStr) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory staging is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn remove_created_directory(
+    parent: &fs::File,
+    _directory: &fs::File,
+    name: &OsStr,
+) -> io::Result<()> {
+    OpenOptionsAt::default().rmdir_at(parent, name)
+}
+
+#[cfg(windows)]
+fn remove_created_directory(
+    _parent: &fs::File,
+    directory: &fs::File,
+    _name: &OsStr,
+) -> io::Result<()> {
+    use fs_at::os::windows::FileExt;
+
+    directory
+        .try_clone()?
+        .delete_by_handle()
+        .map_err(|(_, error)| error)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_created_directory(
+    _parent: &fs::File,
+    _directory: &fs::File,
+    _name: &OsStr,
+) -> io::Result<()> {
+    Ok(())
+}
+
+fn create_hard_link_at(
+    source_directory: &fs::File,
+    source_name: &OsStr,
+    destination_directory: &fs::File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    let source_directory = cap_std::fs::Dir::reopen_dir(source_directory)?;
+    let destination_directory = cap_std::fs::Dir::reopen_dir(destination_directory)?;
+    source_directory.hard_link(source_name, &destination_directory, destination_name)
+}
+
+#[cfg(unix)]
+fn open_staged_entry_for_rename(
+    source_directory: &fs::File,
+    _name: &OsStr,
+) -> io::Result<fs::File> {
+    source_directory.try_clone()
+}
+
+#[cfg(windows)]
+fn open_staged_entry_for_rename(source_directory: &fs::File, name: &OsStr) -> io::Result<fs::File> {
+    use fs_at::os::windows::OpenOptionsExt;
+    use winapi::um::winnt::{DELETE, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC};
+
+    let mut options = OpenOptionsAt::default();
+    options
+        .follow(false)
+        .desired_access(DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC);
+    options.open_path_at(source_directory, name)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_staged_entry_for_rename(
+    _source_directory: &fs::File,
+    _name: &OsStr,
+) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic link commits are unsupported on this platform",
+    ))
+}
+
+fn apply_symlink_metadata(
+    destination: &Path,
+    _permissions: Option<u32>,
+    mtime: Option<i64>,
+) -> io::Result<()> {
+    if let Some(nanoseconds) = mtime {
+        let seconds = nanoseconds.div_euclid(1_000_000_000);
+        let nanos = nanoseconds.rem_euclid(1_000_000_000) as u32;
+        let time = FileTime::from_unix_time(seconds, nanos);
+        filetime::set_symlink_file_times(destination, time, time)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory_metadata(directory: &fs::File) -> io::Result<()> {
+    directory.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory_metadata(_directory: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn validate_shared_parent(parent: &fs::File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -2000,6 +2732,206 @@ mod tests {
     }
 
     #[test]
+    fn directory_and_hardlink_tree_commits_with_shared_file_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let directory_path = home.path().join("bundle");
+        let file_path = directory_path.join("file.txt");
+        let hardlink_path = directory_path.join("hard.txt");
+        let mut manager = TtyTransferManager::new();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits(1024)).unwrap();
+        approve_send(&mut manager, "tree");
+
+        let mut directory = command(FileTransferAction::File, "tree");
+        directory.file_id = Some("directory".into());
+        directory.name = Some("~/bundle".into());
+        directory.file_type = Some(FileTransferType::Directory);
+        directory.permissions = Some(0o750);
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, directory))
+                .status
+                .as_deref(),
+            Some("OK")
+        );
+        fs::write(&file_path, b"old destination").unwrap();
+
+        let mut file = command(FileTransferAction::File, "tree");
+        file.file_id = Some("file".into());
+        file.name = Some("~/bundle/file.txt".into());
+        file.size = Some(4);
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, file))
+                .status
+                .as_deref(),
+            Some("STARTED")
+        );
+        let mut file_data = command(FileTransferAction::EndData, "tree");
+        file_data.file_id = Some("file".into());
+        file_data.data = b"data".to_vec();
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, file_data))
+                .status
+                .as_deref(),
+            Some("OK")
+        );
+
+        let mut hardlink = command(FileTransferAction::File, "tree");
+        hardlink.file_id = Some("hard".into());
+        hardlink.name = Some("~/bundle/hard.txt".into());
+        hardlink.file_type = Some(FileTransferType::Link);
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, hardlink))
+                .status
+                .as_deref(),
+            Some("STARTED")
+        );
+        let mut hardlink_data = command(FileTransferAction::EndData, "tree");
+        hardlink_data.file_id = Some("hard".into());
+        hardlink_data.data = b"fid:file".to_vec();
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, hardlink_data))
+                .status
+                .as_deref(),
+            Some("OK")
+        );
+
+        assert!(directory_path.is_dir());
+        assert_eq!(fs::read(&file_path).unwrap(), b"old destination");
+        assert!(!hardlink_path.exists());
+        assert!(run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Finish, "tree")
+        )
+        .is_empty());
+        assert_eq!(fs::read(&file_path).unwrap(), b"data");
+        assert_eq!(fs::read(&hardlink_path).unwrap(), b"data");
+        fs::write(&file_path, b"same inode").unwrap();
+        assert_eq!(fs::read(&hardlink_path).unwrap(), b"same inode");
+    }
+
+    #[test]
+    fn cancel_removes_new_empty_tree_after_staging_cleanup() {
+        let home = tempfile::tempdir().unwrap();
+        let directory_path = home.path().join("cancelled-tree");
+        let mut manager = TtyTransferManager::new();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits(1024)).unwrap();
+        approve_send(&mut manager, "tree-cancel");
+
+        let mut directory = command(FileTransferAction::File, "tree-cancel");
+        directory.file_id = Some("directory".into());
+        directory.name = Some("~/cancelled-tree".into());
+        directory.file_type = Some(FileTransferType::Directory);
+        run(&mut manager, &mut filesystem, directory);
+        let mut file = command(FileTransferAction::File, "tree-cancel");
+        file.file_id = Some("file".into());
+        file.name = Some("~/cancelled-tree/file.txt".into());
+        run(&mut manager, &mut filesystem, file);
+        assert!(directory_path.is_dir());
+
+        let canceled = run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Cancel, "tree-cancel"),
+        );
+        assert_eq!(status(&canceled).status.as_deref(), Some("CANCELED"));
+        assert!(!directory_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_links_commit_atomically_with_relative_and_absolute_fid_targets() {
+        let home = tempfile::tempdir().unwrap();
+        let mut manager = TtyTransferManager::new();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits(1024)).unwrap();
+        approve_send(&mut manager, "symlinks");
+
+        let mut file = command(FileTransferAction::File, "symlinks");
+        file.file_id = Some("target".into());
+        file.name = Some("~/target.txt".into());
+        file.size = Some(6);
+        run(&mut manager, &mut filesystem, file);
+        let mut data = command(FileTransferAction::EndData, "symlinks");
+        data.file_id = Some("target".into());
+        data.data = b"target".to_vec();
+        run(&mut manager, &mut filesystem, data);
+
+        for (file_id, name, target) in [
+            ("relative", "~/relative-link", "fid:target"),
+            ("absolute", "~/absolute-link", "fid_abs:target"),
+            ("path", "~/path-link", "path:missing/target"),
+        ] {
+            let mut link = command(FileTransferAction::File, "symlinks");
+            link.file_id = Some(file_id.into());
+            link.name = Some(name.into());
+            link.file_type = Some(FileTransferType::Symlink);
+            run(&mut manager, &mut filesystem, link);
+            let mut link_data = command(FileTransferAction::EndData, "symlinks");
+            link_data.file_id = Some(file_id.into());
+            link_data.data = target.as_bytes().to_vec();
+            run(&mut manager, &mut filesystem, link_data);
+        }
+
+        assert!(!home.path().join("relative-link").exists());
+        assert!(run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Finish, "symlinks")
+        )
+        .is_empty());
+        assert_eq!(
+            fs::read_link(home.path().join("relative-link")).unwrap(),
+            Path::new("target.txt")
+        );
+        assert_eq!(
+            fs::read_link(home.path().join("absolute-link")).unwrap(),
+            home.path().join("target.txt")
+        );
+        assert_eq!(
+            fs::read_link(home.path().join("path-link")).unwrap(),
+            Path::new("missing/target")
+        );
+    }
+
+    #[test]
+    fn hardlinks_cannot_escape_the_approved_transfer_by_path() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = TtyTransferManager::new();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits(1024)).unwrap();
+        approve_send(&mut manager, "hardlink-path");
+
+        let mut hardlink = command(FileTransferAction::File, "hardlink-path");
+        hardlink.file_id = Some("hard".into());
+        hardlink.name = Some("~/hard.txt".into());
+        hardlink.file_type = Some(FileTransferType::Link);
+        run(&mut manager, &mut filesystem, hardlink);
+        let mut data = command(FileTransferAction::EndData, "hardlink-path");
+        data.file_id = Some("hard".into());
+        data.data = format!("path:{}", outside.path().display()).into_bytes();
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, data))
+                .status
+                .as_deref(),
+            Some("OK")
+        );
+
+        let rejected = run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Finish, "hardlink-path"),
+        );
+        assert!(status(&rejected)
+            .status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("EPERM:")));
+        assert!(!home.path().join("hard.txt").exists());
+    }
+
+    #[test]
     fn missing_parent_directories_are_created_for_relative_destinations() {
         let home = tempfile::tempdir().unwrap();
         let destination = home.path().join("new/subdirectory/received.txt");
@@ -2430,7 +3362,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_relative_components_and_unsupported_types_never_stage() {
+    fn unsafe_relative_components_and_unsupported_transmission_never_stage() {
         let home = tempfile::tempdir().unwrap();
         let mut manager = TtyTransferManager::new();
         let mut filesystem =
@@ -2454,11 +3386,11 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.starts_with("EINVAL:")));
 
-        let mut directory = command(FileTransferAction::File, "paths-rest");
-        directory.file_id = Some("f2".into());
-        directory.name = Some("~/directory".into());
-        directory.file_type = Some(FileTransferType::Directory);
-        let unsupported = run(&mut manager, &mut filesystem, directory);
+        let mut rsync = command(FileTransferAction::File, "paths-rest");
+        rsync.file_id = Some("f2".into());
+        rsync.name = Some("~/rsync".into());
+        rsync.transmission_type = Some(FileTransmissionType::Rsync);
+        let unsupported = run(&mut manager, &mut filesystem, rsync);
         assert!(status(&unsupported)
             .status
             .as_deref()

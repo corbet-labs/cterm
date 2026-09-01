@@ -631,6 +631,7 @@ version = "0.0.20"
 dependencies = [
  "anyhow",
  "base64",
+ "cap-std",
  "clap",
  "cterm-client",
  "cterm-core",
@@ -647,6 +648,7 @@ dependencies = [
  "log",
  "nix 0.31.3",
  "parking_lot",
+ "pathdiff",
  "process-wrap",
  "rsurl",
  "semver",

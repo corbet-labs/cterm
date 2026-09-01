@@ -73,6 +73,8 @@ directories = "6"
 tempfile = "3"
 filetime = "0.2"
 fs_at = "=0.2.1"
+cap-std = "=3.4.6"
+pathdiff = "=0.2.3"
 
 # Encoding
 base64 = "0.22"
