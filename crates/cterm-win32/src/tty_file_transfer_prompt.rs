@@ -329,7 +329,7 @@ fn format_bytes(bytes: u64) -> String {
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
     for (unit, label) in [(GIB, "GiB"), (MIB, "MiB"), (KIB, "KiB")] {
-        if bytes >= unit && bytes % unit == 0 {
+        if bytes >= unit && bytes.is_multiple_of(unit) {
             return format!("{} {label}", bytes / unit);
         }
     }
