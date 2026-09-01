@@ -13,6 +13,7 @@ pub mod file_drop;
 pub mod file_transfer;
 pub mod git_sync;
 pub mod kitty_dnd;
+pub mod kitty_file_transfer;
 pub mod log_capture;
 pub mod plugin_broker;
 pub mod plugin_runtime;
@@ -37,6 +38,9 @@ pub use git_sync::{
     clone_repo, get_directory_remote_url, get_remote_url, get_sync_status, init_with_remote,
     is_git_repo, prepare_working_directory, pull_with_conflict_resolution, GitError, InitResult,
     PullResult, SyncStatus,
+};
+pub use kitty_file_transfer::{
+    TtyTransferAction, TtyTransferApprovalRequest, TtyTransferDirection, TtyTransferManager,
 };
 pub use plugin_broker::{PluginBroker, PluginBrokerError, PluginBrokerOutput, PluginBrokerTimeout};
 pub use plugin_runtime::{
