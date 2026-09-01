@@ -61,8 +61,10 @@ impl Signature {
             ));
         }
 
+        let (records, remainder) = data[SIGNATURE_HEADER_BYTES..].as_chunks::<BLOCK_HASH_BYTES>();
+        debug_assert!(remainder.is_empty());
         let mut blocks: HashMap<u32, HashMap<u64, u64>> = HashMap::new();
-        for record in data[SIGNATURE_HEADER_BYTES..].chunks_exact(BLOCK_HASH_BYTES) {
+        for record in records {
             let index = u64::from_le_bytes(record[0..8].try_into().unwrap());
             let weak = u32::from_le_bytes(record[8..12].try_into().unwrap());
             let strong = u64::from_le_bytes(record[12..20].try_into().unwrap());
@@ -690,7 +692,9 @@ mod tests {
 
     fn hex(value: &str) -> [u8; 16] {
         let mut output = [0_u8; 16];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        for (index, pair) in pairs.iter().enumerate() {
             output[index] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
         }
         output
