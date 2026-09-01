@@ -2331,6 +2331,37 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_commit_primitives_preserve_the_prepared_handle() {
+        let home = tempfile::tempdir().unwrap();
+        let destination = home.path().join("primitive.txt");
+        let mut staged = StagedTempFile::new(&destination).unwrap();
+        staged.write_all(b"x").unwrap();
+        staged.as_file().sync_all().unwrap();
+
+        verify_staged_file(
+            staged.as_file(),
+            &staged.source_directory,
+            &staged.temporary_name,
+        )
+        .unwrap();
+        prepare_destination_security(staged.as_file(), &staged.parent).unwrap();
+        replace_staged_file(
+            staged.as_file(),
+            &staged.source_directory,
+            &staged.parent,
+            &staged.temporary_name,
+            &staged.destination_name,
+        )
+        .unwrap();
+        staged.committed = true;
+        staged.remove_staging_directory().unwrap();
+        drop(staged);
+
+        assert_eq!(fs::read(destination).unwrap(), b"x");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_stages_inside_a_private_directory() {
         let home = tempfile::tempdir().unwrap();
         let mut manager = TtyTransferManager::new();
