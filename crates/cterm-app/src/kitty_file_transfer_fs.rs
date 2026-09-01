@@ -1459,7 +1459,8 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::winbase::ReOpenFile;
     use winapi::um::winnt::{
-        DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, WRITE_DAC,
+        DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, WRITE_DAC,
     };
 
     let security = WindowsPrivateSecurityDescriptor::new()?;
@@ -1469,21 +1470,20 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
         .create_new(true)
         .follow(false)
         // fs_at currently shares every handle. Create with only SYNCHRONIZE,
-        // then reopen with the complete access mask and only delete sharing
-        // while the protected owner-only DACL makes that transition private.
+        // then reopen with the complete access mask. The random owner-only
+        // staging directory makes the shared handle private in practice.
         .desired_access(0)
         .security_descriptor(security.descriptor);
     let shared_file = options.open_at(parent, name)?;
     // SAFETY: shared_file is a live synchronous file handle. The requested
-    // rights are granted by the owner-only creation DACL. Delete sharing is
-    // compatible with the original handle and required for handle-relative
-    // rename; read and write sharing remain disabled. The returned handle is
-    // independently owned.
+    // rights are granted by the owner-only creation DACL. All share modes stay
+    // compatible with filesystem hardlink and rename work; the returned handle
+    // is independently owned.
     let exclusive = unsafe {
         ReOpenFile(
             windows_handle(&shared_file),
             FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | WRITE_DAC | DELETE,
-            FILE_SHARE_DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             0,
         )
     };
@@ -1577,11 +1577,7 @@ fn create_staged_file(parent_path: &Path, parent: &fs::File) -> io::Result<Stage
         .file_name()
         .expect("tempfile builder always supplies a file name")
         .to_os_string();
-    let source_directory = reopen_staging_directory(
-        parent,
-        &staging_directory_name,
-        temporary_directory.into_file(),
-    )?;
+    let source_directory = temporary_directory.into_file();
     let temporary_name = OsString::from("payload");
     let file = match create_relative_file(&source_directory, &temporary_name) {
         Ok(file) => file,
@@ -1598,80 +1594,6 @@ fn create_staged_file(parent_path: &Path, parent: &fs::File) -> io::Result<Stage
         temporary_name,
         file,
     })
-}
-
-#[cfg(windows)]
-fn reopen_staging_directory(
-    parent: &fs::File,
-    name: &OsStr,
-    directory: fs::File,
-) -> io::Result<fs::File> {
-    use fs_at::os::windows::FileExt;
-    use fs_at::os::windows::OpenOptionsExt;
-    use winapi::um::winnt::{
-        DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ, FILE_WRITE_ATTRIBUTES,
-    };
-
-    // fs_at intentionally returns newly created directories with directory-
-    // traversal rights only. Reopen the unguessable, owner-only entry relative
-    // to its retained parent with FILE_ADD_FILE, then compare stable file IDs
-    // before discarding the original creation handle. This keeps subsequent
-    // hardlink creation handle-relative without trusting a pathname lookup.
-    let mut options = OpenOptionsAt::default();
-    options.follow(false).desired_access(
-        FILE_GENERIC_READ | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_WRITE_ATTRIBUTES | DELETE,
-    );
-    let reopened = match options.open_dir_at(parent, name) {
-        Ok(reopened) => reopened,
-        Err(error) => {
-            let _ = directory.delete_by_handle();
-            return Err(error);
-        }
-    };
-    let same_object = match same_windows_file_object(&directory, &reopened) {
-        Ok(same_object) => same_object,
-        Err(error) => {
-            drop(reopened);
-            let _ = directory.delete_by_handle();
-            return Err(error);
-        }
-    };
-    if !same_object {
-        drop(reopened);
-        let _ = directory.delete_by_handle();
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "private staging directory changed while reopening",
-        ));
-    }
-    drop(directory);
-    Ok(reopened)
-}
-
-#[cfg(windows)]
-fn same_windows_file_object(left: &fs::File, right: &fs::File) -> io::Result<bool> {
-    use std::mem::MaybeUninit;
-    use winapi::um::fileapi::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-
-    fn information(file: &fs::File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
-        let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-        // SAFETY: the retained handle is valid and the out pointer has the
-        // exact layout required by GetFileInformationByHandle.
-        if unsafe { GetFileInformationByHandle(windows_handle(file), information.as_mut_ptr()) }
-            == 0
-        {
-            Err(io::Error::last_os_error())
-        } else {
-            // SAFETY: a successful call initialized the complete structure.
-            Ok(unsafe { information.assume_init() })
-        }
-    }
-
-    let left = information(left)?;
-    let right = information(right)?;
-    Ok(left.dwVolumeSerialNumber == right.dwVolumeSerialNumber
-        && left.nFileIndexHigh == right.nFileIndexHigh
-        && left.nFileIndexLow == right.nFileIndexLow)
 }
 
 #[cfg(not(any(unix, windows)))]
