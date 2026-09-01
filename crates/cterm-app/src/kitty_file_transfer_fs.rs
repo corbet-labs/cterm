@@ -609,6 +609,7 @@ impl StagedTempFile {
             &self.destination_name,
         )?;
         self.committed = true;
+        finalize_destination_security(self.as_file(), &self.parent)?;
         let _ = self.remove_staging_directory();
         sync_parent_directory(&self.parent)
     }
@@ -1240,6 +1241,24 @@ fn replace_staged_file(
 
 #[cfg(windows)]
 fn prepare_destination_security(file: &fs::File, parent: &fs::File) -> io::Result<()> {
+    use winapi::um::winnt::PROTECTED_DACL_SECURITY_INFORMATION;
+
+    apply_destination_security(file, parent, PROTECTED_DACL_SECURITY_INFORMATION)
+}
+
+#[cfg(windows)]
+fn finalize_destination_security(file: &fs::File, parent: &fs::File) -> io::Result<()> {
+    use winapi::um::winnt::UNPROTECTED_DACL_SECURITY_INFORMATION;
+
+    apply_destination_security(file, parent, UNPROTECTED_DACL_SECURITY_INFORMATION)
+}
+
+#[cfg(windows)]
+fn apply_destination_security(
+    file: &fs::File,
+    parent: &fs::File,
+    inheritance: u32,
+) -> io::Result<()> {
     use winapi::shared::minwindef::{FALSE, TRUE};
     use winapi::um::accctrl::SE_FILE_OBJECT;
     use winapi::um::aclapi::{GetSecurityInfo, SetSecurityInfo};
@@ -1251,7 +1270,6 @@ fn prepare_destination_security(file: &fs::File, parent: &fs::File) -> io::Resul
         DACL_SECURITY_INFORMATION, FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
         FILE_GENERIC_WRITE, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION,
         OWNER_SECURITY_INFORMATION, PACL, PSECURITY_DESCRIPTOR, SEF_DACL_AUTO_INHERIT,
-        UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
 
     struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
@@ -1345,14 +1363,16 @@ fn prepare_destination_security(file: &fs::File, parent: &fs::File) -> io::Resul
         ));
     }
 
-    // Apply the destination parent's derived child DACL while the payload is
-    // still private. If this fails, the old destination has not been replaced
-    // and Drop removes only the staging entry.
+    // Before the rename the DACL is protected so Windows cannot recalculate it
+    // against the private staging directory and discard the destination
+    // parent's inherited ACEs. After the rename the same derivation is applied
+    // unprotected, at which point the retained parent is the file's real
+    // parent and Windows can enforce its normal inheritance model.
     let status = unsafe {
         SetSecurityInfo(
             windows_handle(file),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | inheritance,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             dacl,
@@ -1371,6 +1391,11 @@ fn prepare_destination_security(file: &fs::File, parent: &fs::File) -> io::Resul
 
 #[cfg(not(windows))]
 fn prepare_destination_security(_file: &fs::File, _parent: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn finalize_destination_security(_file: &fs::File, _parent: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
@@ -2353,6 +2378,7 @@ mod tests {
         )
         .unwrap();
         staged.committed = true;
+        finalize_destination_security(staged.as_file(), &staged.parent).unwrap();
         staged.remove_staging_directory().unwrap();
         drop(staged);
 
