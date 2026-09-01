@@ -494,6 +494,14 @@ Kitty's independent bold/faint resets (`SGR 221`/`222`) and `CSI 22 J`
 viewport-to-scrollback operation are supported. Native Cocoa, GTK/Wayland, and
 Win32 pointer-leave hooks also emit Kitty's SGR-pixel mouse-leave report.
 
+### Kitty Drag and Drop
+
+Kitty OSC 72 destination negotiation and bounded data chunking are shared
+across the native frontends. GTK/Wayland, Cocoa, and Win32/OLE accept local
+file URI drops and deliver them to applications only after MIME and copy-action
+negotiation. Source-side drags, native move operations, and remote filesystem
+requests are not yet implemented and are never advertised as available.
+
 ### Kitty Multiple Cursors
 
 Kitty's multiple-cursors protocol supports block, beam, underline, and
