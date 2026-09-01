@@ -583,9 +583,10 @@ impl WindowState {
         let Some((tab_index, pane_id)) = self.source_location(source_id) else {
             return;
         };
-        let actions = self.tabs[tab_index].panes[&pane_id]
-            .dnd_destination
-            .handle_command(command);
+        let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+            return;
+        };
+        let actions = pane.dnd_destination.handle_command(command);
         self.apply_dnd_actions(source_id, actions);
     }
 
@@ -3616,19 +3617,25 @@ impl WindowState {
         let Some((tab_index, pane_id)) = self.source_location(source_id) else {
             return (None, false);
         };
-        let destination = &mut self.tabs[tab_index].panes[&pane_id].dnd_destination;
-        let frames = match destination.drag_moved(
-            location,
-            DndOperation::Copy,
-            &[URI_LIST_MIME.to_string()],
-        ) {
-            Ok(frames) => frames,
-            Err(error) => {
-                log::warn!("Failed to report Kitty DND motion: {error:?}");
-                return (Some(source_id), false);
-            }
+        let (frames, accepted) = {
+            let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+                return (None, false);
+            };
+            let destination = &mut pane.dnd_destination;
+            let frames = match destination.drag_moved(
+                location,
+                DndOperation::Copy,
+                &[URI_LIST_MIME.to_string()],
+            ) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    log::warn!("Failed to report Kitty DND motion: {error:?}");
+                    return (Some(source_id), false);
+                }
+            };
+            let accepted = destination.accepted_operation() == DndOperation::Copy;
+            (frames, accepted)
         };
-        let accepted = destination.accepted_operation() == DndOperation::Copy;
         self.write_dnd_frames(source_id, frames);
         (Some(source_id), accepted)
     }
@@ -3637,9 +3644,10 @@ impl WindowState {
         let Some((tab_index, pane_id)) = self.source_location(source_id) else {
             return;
         };
-        let frames = self.tabs[tab_index].panes[&pane_id]
-            .dnd_destination
-            .drag_left();
+        let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+            return;
+        };
+        let frames = pane.dnd_destination.drag_left();
         self.write_dnd_frames(source_id, frames);
     }
 
@@ -3659,13 +3667,14 @@ impl WindowState {
         let Some((tab_index, pane_id)) = self.source_location(source_id) else {
             return false;
         };
-        let frames = self.tabs[tab_index].panes[&pane_id]
-            .dnd_destination
-            .dropped(
-                location,
-                DndOperation::Copy,
-                vec![DropData::uri_list(uri_list)],
-            );
+        let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) else {
+            return false;
+        };
+        let frames = pane.dnd_destination.dropped(
+            location,
+            DndOperation::Copy,
+            vec![DropData::uri_list(uri_list)],
+        );
         match frames {
             Ok(frames) => {
                 self.write_dnd_frames(source_id, frames);
