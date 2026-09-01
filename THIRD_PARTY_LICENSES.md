@@ -19,6 +19,7 @@ components listed here. The original notices are preserved in the derived files.
 | Baseview | `c36ca154f882353f04684973dfe683c1b3d6abb3` | Behavioral reference for client-coordinate drag movement and retaining parsed file data across Win32 drag callbacks; no source copied | MIT OR Apache-2.0 |
 | `stretch` | `20e0748c15ceb0695bd2ebb821a8eee7364f3c8d` (`0.3.2`) | Transitive Rust flexbox dependency of `native-windows-gui`; the published crate omits its declared license file, so cterm pins a reviewed cargo-deny clarification and ships the upstream notice | MIT |
 | `fs_at` | `e8b58a0682496a0c6ddc9eae80942a2f29a5a7e4` (`0.2.1`) | Cargo dependency providing tested handle-relative file creation and cleanup through `openat` on Unix and `NtCreateFile` on Windows for OSC 5113 staging; cterm adds only the final platform rename operation | Apache-2.0 |
+| Microsoft OpenVMM | `ef54fd16f6449c51efe62ea46ddcfabd9e9cd589` | Adapted the tested Rust `NtSetInformationFile` buffer construction, retained-root rename, and NTSTATUS conversion for atomic OSC 5113 commits on Windows | MIT |
 | `shared_memory-rs` | `68563b3aa82b832dfb73b18a59f4db34ff182df2` (`0.12.4`) | Cargo dependency providing tested Windows named-mapping lifecycle for Kitty shared-memory transfers; no source copied | MIT OR Apache-2.0 |
 | `nix` | `9cd968a1af35b46b05ed41e05acfcca5d02a5645` (`0.31.3`) | Cargo dependency providing safe POSIX `shm_open`, `shm_unlink`, descriptor ownership, staged-file identity checks, and handle-relative `renameat` commit on Linux, macOS, and FreeBSD; no source copied | MIT |
 | `memmap2` | `7710019665fec7bdac1dc18cf6661fbe215a1ad2` (`0.9.11`) | Cargo dependency providing tested read-only POSIX mapping for Kitty shared-memory payload snapshots; no source copied | MIT OR Apache-2.0 |
@@ -176,6 +177,28 @@ SOFTWARE.
 ## Elio MIT license
 
 Copyright (c) 2026 Miguel Regueiro
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Microsoft OpenVMM MIT license
+
+Copyright (c) Microsoft Corporation.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -1015,7 +1015,7 @@ fn open_parent_directory(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options
         .read(true)
-        // FILE_RENAME_INFO resolves the final name relative to this retained
+        // FILE_RENAME_INFORMATION resolves the final name relative to this retained
         // handle, and Windows requires FILE_ADD_FILE on that target directory.
         .access_mode(FILE_GENERIC_READ | FILE_ADD_FILE)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -1171,58 +1171,57 @@ fn replace_staged_file(
     _temporary_name: &OsStr,
     destination_name: &OsStr,
 ) -> io::Result<()> {
-    use std::mem::{offset_of, size_of};
+    use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
-    use winapi::shared::minwindef::DWORD;
-    use winapi::um::fileapi::{SetFileInformationByHandle, FILE_RENAME_INFO};
-    use winapi::um::minwinbase::FileRenameInfo;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     let name: Vec<u16> = destination_name.encode_wide().collect();
     let name_bytes = name
         .len()
         .checked_mul(size_of::<u16>())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?;
-    let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName)
+    let buffer_bytes = size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(name_bytes)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?
-        .max(size_of::<FILE_RENAME_INFO>());
-    let buffer_size = DWORD::try_from(buffer_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?;
+    let buffer_size = u32::try_from(buffer_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name is too long"))?;
     let words = buffer_bytes.div_ceil(size_of::<usize>());
     let mut storage = vec![0_usize; words];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
 
-    // SAFETY: `storage` is usize-aligned and sized for the fixed header plus
-    // the complete UTF-16 name. Both handles remain owned and open for the
-    // duration of the call, and `fs_at` opened the source with DELETE access.
-    let succeeded = unsafe {
-        ptr::write(
-            info,
-            FILE_RENAME_INFO {
-                ReplaceIfExists: 1,
-                RootDirectory: windows_handle(parent),
-                FileNameLength: name_bytes as DWORD,
-                FileName: [0],
-            },
-        );
+    // Adapted from OpenVMM's tested handle-relative Windows rename. `storage`
+    // is pointer-aligned and sized for the fixed structure plus the complete
+    // UTF-16 component. Both handles stay open for the call, and the source
+    // handle was opened with DELETE access.
+    let status = unsafe {
+        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).RootDirectory = windows_handle(parent);
+        (*info).FileNameLength = name_bytes as u32;
         ptr::copy_nonoverlapping(
             name.as_ptr(),
             ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
             name.len(),
         );
-        SetFileInformationByHandle(
+        let mut io_status = IO_STATUS_BLOCK::default();
+        NtSetInformationFile(
             windows_handle(file),
-            FileRenameInfo,
+            &mut io_status,
             info.cast(),
             buffer_size,
+            FileRenameInformation,
         )
     };
-    if succeeded == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+    if status < 0 {
+        // SAFETY: the status came directly from `NtSetInformationFile`.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
     }
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
