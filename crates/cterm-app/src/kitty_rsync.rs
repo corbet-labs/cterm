@@ -19,6 +19,7 @@ const DEFAULT_BLOCK_BYTES: usize = 6 * 1024;
 const HASH_BLOCK_BYTES: usize = 64;
 const MAX_LITERAL_BYTES: usize = 64 * 1024;
 const OUTPUT_HASH_BYTES: usize = 16;
+const DELTA_INPUT_SLACK_BYTES: u64 = 64 * 1024;
 
 const OP_BLOCK: u8 = 0;
 const OP_DATA: u8 = 1;
@@ -203,6 +204,8 @@ pub(crate) struct DeltaPatcher<R, W> {
     base_size: u64,
     block_size: u64,
     output_limit: u64,
+    input_limit: u64,
+    bytes_received: u64,
     bytes_written: u64,
     checksum: XxHash3_128,
     pending: Vec<u8>,
@@ -217,6 +220,8 @@ impl<R, W> fmt::Debug for DeltaPatcher<R, W> {
             .field("base_size", &self.base_size)
             .field("block_size", &self.block_size)
             .field("output_limit", &self.output_limit)
+            .field("input_limit", &self.input_limit)
+            .field("bytes_received", &self.bytes_received)
             .field("bytes_written", &self.bytes_written)
             .field("pending_bytes", &self.pending.len())
             .field("data_remaining", &self.data_remaining)
@@ -244,6 +249,8 @@ impl<R: Read + Seek, W: Write> DeltaPatcher<R, W> {
             base_size,
             block_size: block_size as u64,
             output_limit,
+            input_limit: delta_input_limit(output_limit),
+            bytes_received: 0,
             bytes_written: 0,
             checksum: XxHash3_128::new(),
             pending: Vec::with_capacity(3 + OUTPUT_HASH_BYTES),
@@ -258,9 +265,16 @@ impl<R: Read + Seek, W: Write> DeltaPatcher<R, W> {
 
     pub(crate) fn set_output_limit(&mut self, limit: u64) {
         self.output_limit = limit;
+        self.input_limit = delta_input_limit(limit);
     }
 
     pub(crate) fn finish(mut self) -> io::Result<W> {
+        if self.bytes_written > self.output_limit {
+            return Err(output_too_large());
+        }
+        if self.bytes_received > self.input_limit {
+            return Err(delta_input_too_large());
+        }
         if self.data_remaining != 0 || !self.pending.is_empty() {
             return Err(unexpected_eof("rsync delta operation is truncated"));
         }
@@ -386,7 +400,13 @@ impl<R: Read + Seek, W: Write> DeltaPatcher<R, W> {
 
 impl<R: Read + Seek, W: Write> Write for DeltaPatcher<R, W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let received = self
+            .bytes_received
+            .checked_add(input.len() as u64)
+            .filter(|received| *received <= self.input_limit)
+            .ok_or_else(delta_input_too_large)?;
         self.consume(input)?;
+        self.bytes_received = received;
         Ok(input.len())
     }
 
@@ -575,6 +595,23 @@ fn output_too_large() -> io::Error {
     )
 }
 
+fn delta_input_limit(output_limit: u64) -> u64 {
+    // Kitty's differ emits literals in large chunks and combines contiguous
+    // block copies, so a valid delta remains well below twice its output size.
+    // The fixed allowance covers tiny files and fragmented operation headers
+    // while preventing an endless stream of zero-length operations.
+    output_limit
+        .saturating_mul(2)
+        .saturating_add(DELTA_INPUT_SLACK_BYTES)
+}
+
+fn delta_input_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::FileTooLarge,
+        "rsync delta input exceeds the configured limit",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -688,6 +725,16 @@ mod tests {
         write_delta(Cursor::new(b"abcdefgh!"), &valid_signature, &mut delta).unwrap();
         let mut patcher = DeltaPatcher::new(Cursor::new(base), Vec::new(), 8, 4, 8).unwrap();
         assert!(patcher.write_all(&delta).is_err());
+
+        let mut patcher = DeltaPatcher::new(Cursor::new([]), Vec::new(), 0, 64, 0).unwrap();
+        let empty_data = [OP_DATA, 0, 0, 0, 0];
+        for _ in 0..(DELTA_INPUT_SLACK_BYTES / empty_data.len() as u64) {
+            patcher.write_all(&empty_data).unwrap();
+        }
+        assert_eq!(
+            patcher.write_all(&empty_data).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
     }
 
     fn hex(value: &str) -> [u8; 16] {
