@@ -22,6 +22,9 @@ use objc2_foundation::{
 use parking_lot::Mutex;
 
 use cterm_app::config::{Config, ShortcutsConfig};
+use cterm_app::kitty_dnd::{
+    DndAdapterAction, DndDestination, DndLocation, DndOperation, DropData, URI_LIST_MIME,
+};
 use cterm_app::upgrade::PaneLaunchContext;
 use cterm_app::ShortcutManager;
 use cterm_core::screen::{ScreenConfig, SelectionMode};
@@ -86,6 +89,8 @@ struct ViewState {
     bell_changed: AtomicBool,
     /// Notifications parsed on the daemon reader thread and awaiting the main thread.
     pending_notifications: std::sync::Mutex<Vec<cterm_core::DesktopNotificationAction>>,
+    /// OSC 72 commands parsed off-main-thread and awaiting the AppKit adapter.
+    pending_dnd_commands: std::sync::Mutex<Vec<cterm_core::DndCommand>>,
 }
 
 impl Default for ViewState {
@@ -101,6 +106,7 @@ impl Default for ViewState {
             title_locked: AtomicBool::new(false),
             bell_changed: AtomicBool::new(false),
             pending_notifications: std::sync::Mutex::new(Vec::new()),
+            pending_dnd_commands: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -173,6 +179,8 @@ pub struct TerminalViewIvars {
     notification_bar: RefCell<Option<Retained<NotificationBar>>>,
     /// Pending file manager for file transfers
     file_manager: RefCell<PendingFileManager>,
+    /// Main-thread Kitty OSC 72 destination state.
+    dnd_destination: RefCell<DndDestination>,
     /// Color palette for HTML export
     color_palette: cterm_core::color::ColorPalette,
     /// Command channel for daemon I/O (write + resize) — None for local PTY sessions
@@ -1380,8 +1388,21 @@ define_class!(
 
         // Drag-and-drop support
         #[unsafe(method(draggingEntered:))]
-        fn dragging_entered(&self, _sender: &AnyObject) -> usize {
-            1 // NSDragOperationCopy
+        fn dragging_entered(&self, sender: &AnyObject) -> usize {
+            self.handle_drag_motion(sender)
+        }
+
+        #[unsafe(method(draggingUpdated:))]
+        fn dragging_updated(&self, sender: &AnyObject) -> usize {
+            self.handle_drag_motion(sender)
+        }
+
+        #[unsafe(method(draggingExited:))]
+        fn dragging_exited(&self, _sender: Option<&AnyObject>) {
+            let frames = self.ivars().dnd_destination.borrow_mut().drag_left();
+            for frame in frames {
+                self.write_to_pty(&frame);
+            }
         }
 
         #[unsafe(method(performDragOperation:))]
@@ -1638,6 +1659,7 @@ impl TerminalView {
             reported_keys: RefCell::new(HashMap::new()),
             notification_bar: RefCell::new(None),
             file_manager: RefCell::new(PendingFileManager::new()),
+            dnd_destination: RefCell::new(DndDestination::default()),
             color_palette: {
                 let mut palette = theme.colors.clone();
                 palette.cursor = theme.cursor.color;
@@ -2142,6 +2164,11 @@ impl TerminalView {
                                                         pending.push(notification);
                                                     }
                                                 }
+                                                TerminalEvent::DndCommand(command) => {
+                                                    if let Ok(mut pending) = state.pending_dnd_commands.lock() {
+                                                        pending.push(command);
+                                                    }
+                                                }
                                                 TerminalEvent::ContentChanged => {
                                                     content_changed = true;
                                                 }
@@ -2294,6 +2321,23 @@ impl TerminalView {
                     dispatch2::Queue::main().exec_async(move || {
                         for notification in notifications {
                             crate::desktop_notification::handle(&notification);
+                        }
+                    });
+                }
+
+                let dnd_commands = state
+                    .pending_dnd_commands
+                    .lock()
+                    .map(|mut pending| std::mem::take(&mut *pending))
+                    .unwrap_or_default();
+                if !dnd_commands.is_empty() && !state.view_invalid.load(Ordering::SeqCst) {
+                    let state_clone = state.clone();
+                    dispatch2::Queue::main().exec_async(move || {
+                        if !state_clone.view_invalid.load(Ordering::SeqCst) && view_ptr != 0 {
+                            unsafe {
+                                let view = &*(view_ptr as *const TerminalView);
+                                view.apply_dnd_commands(dnd_commands);
+                            }
                         }
                     });
                 }
@@ -2534,6 +2578,29 @@ impl TerminalView {
         }
     }
 
+    fn apply_dnd_commands(&self, commands: Vec<cterm_core::DndCommand>) {
+        let mut terminal = self.ivars().terminal.lock();
+        for command in commands {
+            let actions = self
+                .ivars()
+                .dnd_destination
+                .borrow_mut()
+                .handle_command(command);
+            for action in actions {
+                match action {
+                    DndAdapterAction::Write(frame) => {
+                        if let Err(error) = terminal.write(&frame) {
+                            log::error!("Failed to write Kitty DND response to PTY: {error}");
+                            return;
+                        }
+                    }
+                    DndAdapterAction::RegistrationChanged { .. }
+                    | DndAdapterAction::DropFinished(_) => {}
+                }
+            }
+        }
+    }
+
     fn write_text_input(&self, text: &str) {
         let mut terminal = self.ivars().terminal.lock();
         let encoded = terminal.handle_text_input(text);
@@ -2544,41 +2611,141 @@ impl TerminalView {
         }
     }
 
-    /// Handle a drop operation — extract file URL, show dialog, write to PTY
-    fn handle_drop(&self, sender: &AnyObject) -> bool {
-        use cterm_app::file_drop::{build_pty_input, FileDropAction, FileDropInfo};
+    fn dnd_accepts_uri_list(&self) -> bool {
+        let destination = self.ivars().dnd_destination.borrow();
+        destination.is_enabled()
+            && (destination.registered_mimes().is_empty()
+                || destination
+                    .registered_mimes()
+                    .iter()
+                    .any(|mime| mime == URI_LIST_MIME))
+    }
+
+    fn dnd_location(&self, sender: &AnyObject) -> DndLocation {
+        let point: NSPoint = unsafe { msg_send![sender, draggingLocation] };
+        let point = self.convert_point_from_view(point, None);
+        let coordinate = |value: f64| {
+            if value.is_finite() {
+                value.floor().clamp(0.0, i32::MAX as f64) as i32
+            } else {
+                0
+            }
+        };
+        DndLocation {
+            cell_x: coordinate(point.x / self.ivars().cell_width.get()),
+            cell_y: coordinate(point.y / self.ivars().cell_height.get()),
+            pixel_x: coordinate(point.x),
+            pixel_y: coordinate(point.y),
+        }
+    }
+
+    fn handle_drag_motion(&self, sender: &AnyObject) -> usize {
+        if !self.ivars().dnd_destination.borrow().is_enabled() {
+            return 1; // Preserve the existing copy-only file-drop fallback.
+        }
+        if !self.dnd_accepts_uri_list() {
+            return 0;
+        }
+        let source_operations: usize = unsafe { msg_send![sender, draggingSourceOperationMask] };
+        if source_operations & 1 == 0 {
+            return 0;
+        }
+
+        let location = self.dnd_location(sender);
+        let frames = self.ivars().dnd_destination.borrow_mut().drag_moved(
+            location,
+            DndOperation::Copy,
+            &[URI_LIST_MIME.to_string()],
+        );
+        match frames {
+            Ok(frames) => {
+                for frame in frames {
+                    self.write_to_pty(&frame);
+                }
+            }
+            Err(error) => log::warn!("Failed to report Kitty DND motion: {error:?}"),
+        }
+        usize::from(
+            self.ivars().dnd_destination.borrow().accepted_operation() == DndOperation::Copy,
+        )
+    }
+
+    fn dropped_file_urls(sender: &AnyObject) -> Vec<(std::path::PathBuf, String)> {
         use objc2_app_kit::NSPasteboard;
 
-        let mtm = MainThreadMarker::from(self);
-
-        // Get the dragging pasteboard
         let pasteboard: Retained<NSPasteboard> = unsafe { msg_send![sender, draggingPasteboard] };
-
-        // Read file URLs from pasteboard
-        let nsurl_class = class!(NSURL);
-        let classes = NSArray::from_slice(&[nsurl_class]);
+        let classes = NSArray::from_slice(&[class!(NSURL)]);
         let urls: Option<Retained<NSArray<AnyObject>>> = unsafe {
             let options =
                 objc2_foundation::NSDictionary::<objc2_foundation::NSString, AnyObject>::new();
             pasteboard.readObjectsForClasses_options(&classes, Some(&options))
         };
-
         let Some(urls) = urls else {
-            return false;
+            return Vec::new();
         };
-        if urls.count() == 0 {
+
+        let mut result = Vec::with_capacity(urls.count());
+        for index in 0..urls.count() {
+            let url: Retained<AnyObject> = unsafe { msg_send![&*urls, objectAtIndex: index] };
+            let path: Option<Retained<NSString>> = unsafe { msg_send![&*url, path] };
+            let absolute: Option<Retained<NSString>> = unsafe { msg_send![&*url, absoluteString] };
+            let (Some(path), Some(absolute)) = (path, absolute) else {
+                continue;
+            };
+            let path = std::path::PathBuf::from(path.to_string());
+            let mut uri = absolute.to_string();
+            if path.is_dir() && !uri.ends_with('/') {
+                uri.push('/');
+            }
+            result.push((path, uri));
+        }
+        result
+    }
+
+    /// Handle a drop operation — extract file URL, show dialog, write to PTY
+    fn handle_drop(&self, sender: &AnyObject) -> bool {
+        use cterm_app::file_drop::{build_pty_input, FileDropAction, FileDropInfo};
+
+        let mtm = MainThreadMarker::from(self);
+        let urls = Self::dropped_file_urls(sender);
+        if urls.is_empty() {
             return false;
         }
 
-        // Get the first URL
-        let url: Retained<AnyObject> = unsafe { msg_send![&*urls, objectAtIndex: 0usize] };
-        let path_str: Option<Retained<NSString>> = unsafe { msg_send![&*url, path] };
-        let Some(path_str) = path_str else {
-            return false;
-        };
-        let path = std::path::PathBuf::from(path_str.to_string());
+        if self.ivars().dnd_destination.borrow().is_enabled() {
+            if !self.dnd_accepts_uri_list()
+                || self.ivars().dnd_destination.borrow().accepted_operation() != DndOperation::Copy
+            {
+                return false;
+            }
+            let payload = urls
+                .iter()
+                .map(|(_, uri)| uri.as_str())
+                .collect::<Vec<_>>()
+                .join("\r\n")
+                .into_bytes();
+            let frames = self.ivars().dnd_destination.borrow_mut().dropped(
+                self.dnd_location(sender),
+                DndOperation::Copy,
+                vec![DropData::uri_list(payload)],
+            );
+            return match frames {
+                Ok(frames) => {
+                    for frame in frames {
+                        self.write_to_pty(&frame);
+                    }
+                    true
+                }
+                Err(error) => {
+                    log::warn!("Rejected Kitty DND drop: {error:?}");
+                    false
+                }
+            };
+        }
 
-        let info = match FileDropInfo::from_path(&path) {
+        let path = &urls[0].0;
+
+        let info = match FileDropInfo::from_path(path) {
             Ok(info) => info,
             Err(e) => {
                 log::error!("Failed to read dropped file info: {}", e);
