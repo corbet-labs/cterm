@@ -23,6 +23,7 @@ components listed here. The original notices are preserved in the derived files.
 | `cap-std` | `cd4c6330089e3731c68b7b98d4dde0cda27402ff` (`3.4.6`) | Cargo dependency providing tested capability-oriented hardlink creation between retained OSC 5113 staging directories on Unix; no source copied | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | `pathdiff` | `5180ff5b23d9d7eef0a14de13a3d814eb5d8d65c` (`0.2.3`) | Cargo dependency providing tested lexical relative-path construction for OSC 5113 symbolic links that target another approved transfer entry; no source copied | MIT OR Apache-2.0 |
 | Microsoft OpenVMM | `ef54fd16f6449c51efe62ea46ddcfabd9e9cd589` | Adapted the tested Rust `NtSetInformationFile` buffer construction, retained-root rename/hardlink operations, and NTSTATUS conversion for atomic OSC 5113 commits on Windows | MIT |
+| Go | `e3336a22ad3f0a90bd252c95d8b5544e02674205` | Adapted the tested Windows `Linkat` source-handle access and sharing pattern used before `FileLinkInformation`; cterm retains its owner-only staging directory and stricter primary-handle sharing | BSD-3-Clause |
 | Dropbox `fast_rsync` | `36e230d88d523f438d461d99ff1fae2584a335a6` (`0.2.0`) | Bounded adaptation of its tested Rust rolling-window matching and queued contiguous-copy structure for Kitty rsync; cterm supplies a streaming ring buffer, Kitty wire records, XXH3 hashes, strict limits, and final verification | Apache-2.0 |
 | `twox-hash` | `6f866bffe73900c63df2650be4eed41e3ed9b500` (`2.1.4`) | Pinned Cargo dependency providing pure-Rust, tested XXH3-64 and XXH3-128 implementations for Kitty rsync; default random/legacy hash features are disabled and no source is copied | MIT |
 | `shared_memory-rs` | `68563b3aa82b832dfb73b18a59f4db34ff182df2` (`0.12.4`) | Cargo dependency providing tested Windows named-mapping lifecycle for Kitty shared-memory transfers; no source copied | MIT OR Apache-2.0 |
@@ -46,6 +47,7 @@ full Apache-2.0 terms are also present in the `wasi-common` license file.
 The MIT notice omitted from the published `stretch` 0.3.2 crate is preserved in
 `LICENSES/STRETCH-MIT.txt`.
 The `twox-hash` MIT notice is preserved in `LICENSES/TWOX-HASH-MIT.txt`.
+The Go BSD-3-Clause notice is preserved in `LICENSES/GO-BSD-3-CLAUSE.txt`.
 
 ## Rio / Sugarloaf MIT license
 

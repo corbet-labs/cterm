@@ -1459,8 +1459,8 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::winbase::ReOpenFile;
     use winapi::um::winnt::{
-        DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, WRITE_DAC,
+        DELETE, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_WRITE,
+        WRITE_DAC,
     };
 
     let security = WindowsPrivateSecurityDescriptor::new()?;
@@ -1471,19 +1471,20 @@ fn create_relative_file(parent: &fs::File, name: &OsStr) -> io::Result<fs::File>
         .follow(false)
         // fs_at currently shares every handle. Create with only SYNCHRONIZE,
         // then reopen with the complete access mask. The random owner-only
-        // staging directory makes the shared handle private in practice.
+        // staging directory and omitted read sharing keep payload bytes private.
         .desired_access(0)
         .security_descriptor(security.descriptor);
     let shared_file = options.open_at(parent, name)?;
     // SAFETY: shared_file is a live synchronous file handle. The requested
-    // rights are granted by the owner-only creation DACL. All share modes stay
-    // compatible with filesystem hardlink and rename work; the returned handle
-    // is independently owned.
+    // rights are granted by the owner-only creation DACL. Metadata-write and
+    // delete sharing permit hardlink and rename work, while omitted read
+    // sharing prevents another opener from observing transfer bytes. The
+    // returned handle is independently owned.
     let exclusive = unsafe {
         ReOpenFile(
             windows_handle(&shared_file),
             FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES | WRITE_DAC | DELETE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             0,
         )
     };
@@ -2015,8 +2016,13 @@ fn create_hard_link_at(
 ) -> io::Result<()> {
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::ptr;
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::winbase::ReOpenFile;
+    use winapi::um::winnt::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, SYNCHRONIZE,
+    };
     use windows_sys::Wdk::Storage::FileSystem::{
         FileLinkInformation, NtSetInformationFile, FILE_LINK_INFORMATION,
     };
@@ -2061,12 +2067,30 @@ fn create_hard_link_at(
     }
 
     let mut status_block = IO_STATUS_BLOCK::default();
+    // Go's tested Windows linkat implementation opens the source with only
+    // SYNCHRONIZE | FILE_WRITE_ATTRIBUTES and all share modes before issuing
+    // FileLinkInformation. Keep the payload's primary handle read-exclusive,
+    // but derive the same minimal metadata handle for this operation.
+    let link_source = unsafe {
+        ReOpenFile(
+            source_file.as_raw_handle().cast(),
+            SYNCHRONIZE | FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if link_source == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ReOpenFile returned a new owned handle not managed elsewhere.
+    let link_source = unsafe { fs::File::from_raw_handle(link_source.cast()) };
+
     // SAFETY: Both handles are retained and valid, `information` points to an
     // aligned buffer containing the fixed header plus the declared UTF-16
-    // name, and the staged source was opened with DELETE access.
+    // name, and link_source has the access and sharing used by Go's linkat.
     let status = unsafe {
         NtSetInformationFile(
-            source_file.as_raw_handle(),
+            link_source.as_raw_handle(),
             &mut status_block,
             information.cast(),
             buffer_length,
