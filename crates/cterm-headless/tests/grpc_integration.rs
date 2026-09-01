@@ -141,6 +141,23 @@ async fn test_handshake_reports_exact_protocol_version_and_daemon_identity() {
 }
 
 #[tokio::test]
+async fn test_handshake_rejects_a_different_protocol_version() {
+    let server = CtermdServer::spawn();
+    let mut client = connect(&server.address()).await;
+    let error = client
+        .handshake(HandshakeRequest {
+            client_id: "outdated-integration-test".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: cterm_proto::PROTOCOL_VERSION - 1,
+            daemon_auth_challenge: Vec::new(),
+        })
+        .await
+        .expect_err("daemon accepted a mismatched protocol version");
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
 async fn test_authenticated_handshake_is_fresh_and_does_not_echo_secret() {
     let directory = tempfile::tempdir().unwrap();
     let auth_file = write_auth_file(directory.path(), 0x42);
@@ -435,6 +452,102 @@ async fn test_create_and_list_sessions() {
         .await
         .expect("list_sessions failed");
     assert!(response.get_ref().sessions.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_tty_file_transfer_consent_replay_and_relaunch_refusal() {
+    let server = CtermdServer::spawn();
+    let mut client = connect(&server.address()).await;
+    let create_response = client
+        .create_session(CreateSessionRequest {
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".to_string()),
+            args: vec![
+                "-c".to_string(),
+                "printf '\\033]5113;ac=send;id=grpc-consent\\033\\\\'; sleep 30".to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+            term: Some("xterm-256color".to_string()),
+            ssh: None,
+            pixel_width: 0,
+            pixel_height: 0,
+            base_palette: None,
+            theme_appearance: 0,
+            window_visibility: 0,
+            cursor_style: None,
+            cursor_blink: None,
+        })
+        .await
+        .expect("create_session failed")
+        .into_inner();
+
+    // Subscribe after the child has emitted its request. The daemon must replay
+    // the live consent token rather than losing it between UI reconnects.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut events = client
+        .stream_events(StreamEventsRequest {
+            session_id: create_response.session_id.clone(),
+        })
+        .await
+        .expect("stream_events failed")
+        .into_inner();
+    let approval = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events
+                .message()
+                .await
+                .expect("event stream failed")
+                .expect("event stream closed before consent");
+            if let Some(terminal_event::Event::TtyFileTransferApproval(approval)) = event.event {
+                break approval;
+            }
+        }
+    })
+    .await
+    .expect("OSC 5113 consent event timed out");
+    assert_eq!(approval.transfer_id, "grpc-consent");
+    assert_eq!(approval.direction, TtyFileTransferDirection::Send as i32);
+    assert!((1..=60_000).contains(&approval.expires_in_ms));
+
+    let relaunch_error = client
+        .relaunch_daemon(RelaunchDaemonRequest {
+            binary_path: String::new(),
+        })
+        .await
+        .expect_err("daemon relaunched with a live filesystem consent token");
+    assert_eq!(relaunch_error.code(), tonic::Code::FailedPrecondition);
+
+    let decision = client
+        .respond_tty_file_transfer_approval(RespondTtyFileTransferApprovalRequest {
+            session_id: create_response.session_id.clone(),
+            request_id: approval.request_id,
+            approve: false,
+        })
+        .await
+        .expect("denial RPC failed")
+        .into_inner();
+    assert!(decision.success);
+    let duplicate = client
+        .respond_tty_file_transfer_approval(RespondTtyFileTransferApprovalRequest {
+            session_id: create_response.session_id.clone(),
+            request_id: approval.request_id,
+            approve: true,
+        })
+        .await
+        .expect("duplicate decision RPC failed")
+        .into_inner();
+    assert!(!duplicate.success);
+
+    client
+        .destroy_session(DestroySessionRequest {
+            session_id: create_response.session_id,
+            signal: None,
+        })
+        .await
+        .expect("destroy_session failed");
 }
 
 #[tokio::test]

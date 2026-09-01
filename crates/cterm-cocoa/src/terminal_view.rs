@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -46,6 +46,9 @@ use crate::{clipboard, keycode};
 
 const MIN_FONT_SIZE: f64 = 6.0;
 const MAX_FONT_SIZE: f64 = 72.0;
+const DAEMON_VIEW_LIFECYCLE_POLL: Duration = Duration::from_millis(25);
+const TTY_FILE_TRANSFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const EVENT_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn adjusted_font_size(current: f64, delta: f64) -> f64 {
     (current + delta).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
@@ -109,6 +112,76 @@ impl Default for ViewState {
             pending_dnd_commands: std::sync::Mutex::new(Vec::new()),
         }
     }
+}
+
+/// Resolve one daemon-originated filesystem request while its pane and reader
+/// are both alive. The AppKit sheet is addressed by a process-local token so a
+/// timeout can dismiss only this prompt; every non-click path denies.
+async fn request_tty_file_transfer_consent(
+    view_ptr: usize,
+    state: Arc<ViewState>,
+    prompt: cterm_proto::proto::TtyFileTransferApprovalEvent,
+    daemon_host: String,
+    lifecycle_cancel: tokio::sync::watch::Receiver<bool>,
+    expires_at: Option<tokio::time::Instant>,
+) -> bool {
+    let Some(expires_at) = expires_at else {
+        log::warn!("Refusing OSC 5113 approval request with an invalid expiry");
+        return false;
+    };
+    if expires_at <= tokio::time::Instant::now()
+        || *lifecycle_cancel.borrow()
+        || state.view_invalid.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    let token = crate::tty_file_transfer_prompt::next_tty_file_transfer_prompt_token();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_ui = Arc::clone(&cancelled);
+    let state_for_ui = Arc::clone(&state);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+    dispatch2::Queue::main().exec_async(move || {
+        if cancelled_for_ui.load(Ordering::Acquire)
+            || state_for_ui.view_invalid.load(Ordering::Acquire)
+        {
+            let _ = result_tx.send(false);
+            return;
+        }
+
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        // The view's deallocation and this closure are serialized on AppKit's
+        // main thread. `view_invalid` is set before removal/deallocation.
+        let view = unsafe { &*(view_ptr as *const TerminalView) };
+        let Some(parent) = view.window() else {
+            let _ = result_tx.send(false);
+            return;
+        };
+        crate::tty_file_transfer_prompt::begin_tty_file_transfer_prompt(
+            mtm,
+            token,
+            &prompt,
+            &daemon_host,
+            &parent,
+            cancelled_for_ui,
+            result_tx,
+        );
+    });
+
+    let resolution = crate::tty_file_transfer_prompt::await_tty_file_transfer_prompt(
+        result_rx,
+        lifecycle_cancel,
+        expires_at,
+    )
+    .await;
+    if resolution.dismiss {
+        cancelled.store(true, Ordering::Release);
+        dispatch2::Queue::main().exec_async(move || {
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            crate::tty_file_transfer_prompt::cancel_tty_file_transfer_prompt(mtm, token);
+        });
+    }
+    resolution.approved
 }
 
 /// Commands sent to the daemon I/O thread
@@ -1760,6 +1833,7 @@ impl TerminalView {
                 sid,
                 terminal,
                 state_clone,
+                view_ptr,
                 cmd_rx,
                 daemon_socket,
                 base_palette,
@@ -1864,6 +1938,7 @@ impl TerminalView {
                 sid,
                 terminal,
                 state_clone,
+                view_ptr,
                 cmd_rx,
                 daemon_socket,
                 base_palette,
@@ -1891,6 +1966,7 @@ impl TerminalView {
         session_id: String,
         terminal: Arc<Mutex<Terminal>>,
         state: Arc<ViewState>,
+        view_ptr: usize,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
         daemon_socket: Option<std::path::PathBuf>,
         base_palette: cterm_core::ColorPalette,
@@ -2072,13 +2148,35 @@ impl TerminalView {
             // Subscribe to event stream (process exit, etc.)
             let event_session = session.clone();
             let exit_notify_event = Arc::clone(&exit_notify);
-            tokio::spawn(async move {
+            let (event_cancel_tx, mut event_cancel_rx) = tokio::sync::watch::channel(false);
+            let event_cancel_on_stream_end = event_cancel_tx.clone();
+            let event_state = Arc::clone(&state);
+            let event_task = tokio::spawn(async move {
+                let mut file_transfer_prompts = tokio::task::JoinSet::new();
                 match event_session.stream_events().await {
                     Ok(mut stream) => {
                         use tokio_stream::StreamExt;
-                        while let Some(result) = stream.next().await {
-                            if let Ok(event) = result {
-                                match event.event {
+                        loop {
+                            while let Some(result) = file_transfer_prompts.try_join_next() {
+                                if let Err(error) = result {
+                                    log::warn!("OSC 5113 consent task failed: {error}");
+                                }
+                            }
+                            let result = tokio::select! {
+                                biased;
+                                changed = event_cancel_rx.changed() => {
+                                    if changed.is_err() || *event_cancel_rx.borrow() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                result = stream.next() => result,
+                            };
+                            let Some(result) = result else {
+                                break;
+                            };
+                            match result {
+                                Ok(event) => match event.event {
                                     Some(
                                         cterm_proto::proto::terminal_event::Event::ProcessExited(_),
                                     ) => {
@@ -2115,7 +2213,61 @@ impl TerminalView {
                                             .respond_prompt(&prompt.prompt_id, accept, secret)
                                             .await;
                                     }
+                                    Some(
+                                        cterm_proto::proto::terminal_event::Event::TtyFileTransferApproval(
+                                            prompt,
+                                        ),
+                                    ) => {
+                                        // Do not block event delivery while consent is pending: the
+                                        // daemon may issue several bounded sessions and each expiry
+                                        // starts when its event arrives, not when a prior alert ends.
+                                        let prompt_session = event_session.clone();
+                                        let prompt_cancel = event_cancel_rx.clone();
+                                        let prompt_state = Arc::clone(&event_state);
+                                        let daemon_host = event_session.hostname().to_string();
+                                        // Anchor expiry when the event is received, before the
+                                        // spawned task can be delayed by other ready events.
+                                        let expires_at = tokio::time::Instant::now().checked_add(
+                                            Duration::from_millis(prompt.expires_in_ms),
+                                        );
+                                        file_transfer_prompts.spawn(async move {
+                                            let request_id = prompt.request_id;
+                                            let approve = request_tty_file_transfer_consent(
+                                                view_ptr,
+                                                prompt_state,
+                                                prompt,
+                                                daemon_host,
+                                                prompt_cancel,
+                                                expires_at,
+                                            )
+                                            .await;
+                                            match tokio::time::timeout(
+                                                TTY_FILE_TRANSFER_RESPONSE_TIMEOUT,
+                                                prompt_session.respond_tty_file_transfer_approval(
+                                                    request_id,
+                                                    approve,
+                                                ),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(true)) => {}
+                                                Ok(Ok(false)) => log::debug!(
+                                                    "OSC 5113 approval request {request_id} was already resolved"
+                                                ),
+                                                Ok(Err(error)) => log::warn!(
+                                                    "Failed to send OSC 5113 approval response: {error}"
+                                                ),
+                                                Err(_) => log::warn!(
+                                                    "Timed out sending OSC 5113 approval response"
+                                                ),
+                                            }
+                                        });
+                                    }
                                     _ => {}
+                                },
+                                Err(error) => {
+                                    log::warn!("Daemon event stream error: {error}");
+                                    break;
                                 }
                             }
                         }
@@ -2124,12 +2276,35 @@ impl TerminalView {
                         log::warn!("Failed to start daemon event stream: {}", e);
                     }
                 }
+
+                // Closing the event stream invalidates every outstanding
+                // daemon token. Wake prompts before joining them so each sheet
+                // is dismissed and a best-effort denial is sent.
+                event_cancel_on_stream_end.send_replace(true);
+                while let Some(result) = file_transfer_prompts.join_next().await {
+                    if let Err(error) = result {
+                        log::warn!("OSC 5113 consent task failed: {error}");
+                    }
+                }
             });
 
-            // Read output stream, cancellable by process exit notification
+            // Read output stream, cancellable by process exit or pane removal.
+            // Pane invalidation is also observed directly so consent does not
+            // depend on a Destroy command reaching this reader first.
+            let lifecycle_state = Arc::clone(&state);
             tokio::select! {
                 _ = exit_notify.notified() => {
                     log::info!("Process exited, stopping output stream");
+                }
+                _ = async move {
+                    loop {
+                        if lifecycle_state.view_invalid.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tokio::time::sleep(DAEMON_VIEW_LIFECYCLE_POLL).await;
+                    }
+                } => {
+                    log::debug!("View invalidated, stopping daemon reader");
                 }
                 _ = async {
                     match session.stream_output().await {
@@ -2194,6 +2369,20 @@ impl TerminalView {
                         }
                     }
                 } => {}
+            }
+
+            // The event reader owns every pending OSC 5113 prompt. Cancel it,
+            // then await its prompt cleanup and denial RPCs. The abort fallback
+            // prevents a wedged daemon connection from retaining the reader.
+            event_cancel_tx.send_replace(true);
+            let mut event_task = event_task;
+            if tokio::time::timeout(EVENT_TASK_SHUTDOWN_TIMEOUT, &mut event_task)
+                .await
+                .is_err()
+            {
+                log::warn!("Timed out shutting down daemon event task");
+                event_task.abort();
+                let _ = event_task.await;
             }
 
             // Signal that the stream has ended

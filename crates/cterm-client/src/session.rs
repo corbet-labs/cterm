@@ -243,6 +243,28 @@ impl SessionHandle {
         Ok(response.into_inner().success)
     }
 
+    /// Approve or deny one still-pending OSC 5113 filesystem request.
+    ///
+    /// `request_id` is the opaque token delivered by the daemon event stream;
+    /// the OSC transfer id alone is deliberately insufficient authorization.
+    pub async fn respond_tty_file_transfer_approval(
+        &self,
+        request_id: u64,
+        approve: bool,
+    ) -> Result<bool> {
+        let response = self
+            .client
+            .lock()
+            .await
+            .respond_tty_file_transfer_approval(RespondTtyFileTransferApprovalRequest {
+                session_id: self.session_id.clone(),
+                request_id,
+                approve,
+            })
+            .await?;
+        Ok(response.into_inner().success)
+    }
+
     /// Clear the bell/alert state on this session.
     pub async fn clear_alert(&self) -> Result<()> {
         self.client

@@ -166,11 +166,16 @@ impl TtyTransferSendFilesystem {
             );
         }
 
-        let reservation = command.size.unwrap_or(self.limits.max_file_bytes);
+        // Kitty commonly omits `sz`. Reserve declared bytes eagerly, but let
+        // undeclared files grow under the real per-file and cumulative limits
+        // instead of pessimistically charging the entire per-file maximum.
+        let reservation = command.size.unwrap_or(0);
+        let planned_unwritten = session.planned_unwritten_bytes();
         if reservation > self.limits.max_file_bytes
             || session
-                .reserved_bytes
-                .checked_add(reservation)
+                .consumed_bytes
+                .checked_add(planned_unwritten)
+                .and_then(|total| total.checked_add(reservation))
                 .is_none_or(|total| total > self.limits.max_session_bytes)
         {
             session.rejected.insert(file_id);
@@ -220,7 +225,11 @@ impl TtyTransferSendFilesystem {
                 );
             }
         };
-        let output_limit = reservation.min(self.limits.max_file_bytes);
+        let output_limit = command.size.unwrap_or_else(|| {
+            self.limits
+                .max_file_bytes
+                .min(self.limits.max_session_bytes - session.reserved_bytes)
+        });
         let limited = LimitedTempFile::new(temporary, output_limit);
         let writer = match command.compression {
             Some(FileTransferCompression::Zlib) => {
@@ -238,6 +247,7 @@ impl TtyTransferSendFilesystem {
                 writer: Some(writer),
                 temporary: None,
                 bytes_written: 0,
+                reservation,
             },
         );
         response(&command, "STARTED", quiet, false, None)
@@ -263,8 +273,7 @@ impl TtyTransferSendFilesystem {
             return Vec::new();
         };
         let Some(writer) = file.writer.as_mut() else {
-            session.files.remove(file_id);
-            session.rejected.insert(file_id.to_string());
+            session.reject_file(file_id);
             return response(
                 &command,
                 "EINVAL:File data was already completed",
@@ -274,12 +283,51 @@ impl TtyTransferSendFilesystem {
             );
         };
 
+        // The cumulative session budget counts decompressed bytes even when a
+        // later protocol error discards the staged file. Tighten every writer
+        // immediately before use so many unknown-size files cannot each retain
+        // the full session allowance they observed at creation time.
+        let remaining_session = self
+            .limits
+            .max_session_bytes
+            .saturating_sub(session.consumed_bytes);
+        let output_limit = file
+            .expected_size
+            .unwrap_or(self.limits.max_file_bytes)
+            .min(self.limits.max_file_bytes)
+            .min(file.bytes_written.saturating_add(remaining_session));
+        writer.set_limit(output_limit);
+
         if let Err(error) = writer.write_all(&command.data) {
-            session.files.remove(file_id);
-            session.rejected.insert(file_id.to_string());
+            let bytes_written = writer.bytes_written();
+            session.consumed_bytes = session
+                .consumed_bytes
+                .saturating_add(bytes_written.saturating_sub(file.bytes_written));
+            session.reject_file(file_id);
             return response(&command, stage_write_status(&error), quiet, true, None);
         }
-        file.bytes_written = writer.bytes_written();
+        let bytes_written = writer.bytes_written();
+        session.consumed_bytes = session
+            .consumed_bytes
+            .saturating_add(bytes_written.saturating_sub(file.bytes_written));
+        let additional_reservation = bytes_written.saturating_sub(file.reservation);
+        if session
+            .reserved_bytes
+            .checked_add(additional_reservation)
+            .is_none_or(|total| total > self.limits.max_session_bytes)
+        {
+            session.reject_file(file_id);
+            return response(
+                &command,
+                "EFBIG:Transfer exceeds configured size limits",
+                quiet,
+                true,
+                None,
+            );
+        }
+        session.reserved_bytes += additional_reservation;
+        file.reservation += additional_reservation;
+        file.bytes_written = bytes_written;
 
         if !completes_file {
             return response(&command, "PROGRESS", quiet, false, Some(file.bytes_written));
@@ -289,8 +337,7 @@ impl TtyTransferSendFilesystem {
         let temporary = match writer.finish() {
             Ok(temporary) => temporary,
             Err(error) => {
-                session.files.remove(file_id);
-                session.rejected.insert(file_id.to_string());
+                session.reject_file(file_id);
                 return response(&command, stage_write_status(&error), quiet, true, None);
             }
         };
@@ -299,8 +346,7 @@ impl TtyTransferSendFilesystem {
             .expected_size
             .is_some_and(|expected| expected != file.bytes_written)
         {
-            session.files.remove(file_id);
-            session.rejected.insert(file_id.to_string());
+            session.reject_file(file_id);
             return response(
                 &command,
                 "EINVAL:Received size does not match file metadata",
@@ -310,8 +356,7 @@ impl TtyTransferSendFilesystem {
             );
         }
         if let Err(error) = temporary.file.as_file().sync_all() {
-            session.files.remove(file_id);
-            session.rejected.insert(file_id.to_string());
+            session.reject_file(file_id);
             return response(
                 &command,
                 io_status(&error, "Could not synchronize staged file"),
@@ -379,6 +424,25 @@ struct SendSession {
     files: HashMap<String, StagedFile>,
     rejected: HashSet<String>,
     reserved_bytes: u64,
+    consumed_bytes: u64,
+}
+
+impl SendSession {
+    fn planned_unwritten_bytes(&self) -> u64 {
+        let live_written = self
+            .files
+            .values()
+            .map(|file| file.bytes_written)
+            .sum::<u64>();
+        self.reserved_bytes.saturating_sub(live_written)
+    }
+
+    fn reject_file(&mut self, file_id: &str) {
+        if let Some(file) = self.files.remove(file_id) {
+            self.reserved_bytes = self.reserved_bytes.saturating_sub(file.reservation);
+        }
+        self.rejected.insert(file_id.to_string());
+    }
 }
 
 #[derive(Debug)]
@@ -389,6 +453,7 @@ struct StagedFile {
     writer: Option<StagedWriter>,
     temporary: Option<StagedTempFile>,
     bytes_written: u64,
+    reservation: u64,
 }
 
 #[derive(Debug)]
@@ -412,6 +477,13 @@ impl StagedWriter {
                 Ok(file)
             }
             Self::Zlib(decoder) => decoder.finish(),
+        }
+    }
+
+    fn set_limit(&mut self, limit: u64) {
+        match self {
+            Self::Plain(file) => file.limit = limit,
+            Self::Zlib(decoder) => decoder.inner.limit = limit,
         }
     }
 }
@@ -580,7 +652,7 @@ impl StagedTempFile {
             .file_name()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?
             .to_os_string();
-        let parent = open_parent_directory(parent_path)?;
+        let parent = open_or_create_parent_directory(parent_path)?;
         let staged = create_staged_file(parent_path, &parent)?;
 
         Ok(Self {
@@ -1005,12 +1077,50 @@ fn open_parent_directory(path: &Path) -> io::Result<fs::File> {
         .open(path)
 }
 
+#[cfg(unix)]
+fn open_or_create_parent_directory(path: &Path) -> io::Result<fs::File> {
+    use fs_at::os::unix::OpenOptionsExt;
+
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination parent is not absolute",
+        ));
+    }
+    let mut current = open_parent_directory(Path::new("/"))?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination parent contains a non-normal component",
+            ));
+        };
+
+        let mut open = OpenOptionsAt::default();
+        open.read(true).follow(true);
+        match open.open_dir_at(&current, name) {
+            Ok(next) => current = next,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut create = OpenOptionsAt::default();
+                create.create_new(true).follow(false).mode(0o755);
+                current = create.mkdir_at(&current, name)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(current)
+}
+
 #[cfg(windows)]
 fn open_parent_directory(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
     use winapi::um::winnt::{
-        FILE_ADD_FILE, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let mut options = fs::OpenOptions::new();
@@ -1018,10 +1128,61 @@ fn open_parent_directory(path: &Path) -> io::Result<fs::File> {
         .read(true)
         // FILE_RENAME_INFORMATION resolves the final name relative to this retained
         // handle, and Windows requires FILE_ADD_FILE on that target directory.
-        .access_mode(FILE_GENERIC_READ | FILE_ADD_FILE)
+        .access_mode(FILE_GENERIC_READ | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
+}
+
+#[cfg(windows)]
+fn open_or_create_parent_directory(path: &Path) -> io::Result<fs::File> {
+    use fs_at::os::windows::OpenOptionsExt;
+    use winapi::um::winnt::{FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_GENERIC_READ};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination parent has no Windows volume prefix",
+        ));
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination parent is not drive absolute",
+        ));
+    }
+    let mut root = PathBuf::from(prefix.as_os_str());
+    root.push("\\");
+    let mut current = open_parent_directory(&root)?;
+
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination parent contains a non-normal component",
+            ));
+        };
+        let mut open = OpenOptionsAt::default();
+        open.follow(true)
+            .desired_access(FILE_GENERIC_READ | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY);
+        match open.open_dir_at(&current, name) {
+            Ok(next) => current = next,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let security = WindowsPrivateSecurityDescriptor::new()?;
+                let mut create = OpenOptionsAt::default();
+                create
+                    .create_new(true)
+                    .follow(false)
+                    .security_descriptor(security.descriptor);
+                let created = create.mkdir_at(&current, name)?;
+                drop(created);
+                current = open.open_dir_at(&current, name)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(current)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1030,6 +1191,11 @@ fn open_parent_directory(_path: &Path) -> io::Result<fs::File> {
         io::ErrorKind::Unsupported,
         "handle-relative staging is unsupported on this platform",
     ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_or_create_parent_directory(path: &Path) -> io::Result<fs::File> {
+    open_parent_directory(path)
 }
 
 #[cfg(unix)]
@@ -1513,7 +1679,11 @@ fn resolve_protocol_path(home: &Path, path: &str) -> Option<PathBuf> {
     if let Some(relative) = path.strip_prefix("~/") {
         return append_normal_components(home.to_path_buf(), Path::new(relative));
     }
-    resolve_absolute_protocol_path(path)
+    if path.starts_with('/') {
+        resolve_absolute_protocol_path(path)
+    } else {
+        append_normal_components(home.to_path_buf(), Path::new(path))
+    }
 }
 
 #[cfg(not(windows))]
@@ -1749,6 +1919,188 @@ mod tests {
         .is_empty());
         assert_eq!(fs::read(&destination).unwrap(), b"abcdef");
         assert_eq!(filesystem.active_sessions(), 0);
+    }
+
+    #[test]
+    fn missing_parent_directories_are_created_for_relative_destinations() {
+        let home = tempfile::tempdir().unwrap();
+        let destination = home.path().join("new/subdirectory/received.txt");
+        let mut manager = TtyTransferManager::new();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits(1024)).unwrap();
+        approve_send(&mut manager, "parent-directories");
+
+        let started = start_file(
+            &mut manager,
+            &mut filesystem,
+            "parent-directories",
+            "new/subdirectory/received.txt",
+            4,
+        );
+        assert_eq!(status(&started).status.as_deref(), Some("STARTED"));
+        assert!(destination.parent().unwrap().is_dir());
+        assert!(!destination.exists());
+
+        let mut end = command(FileTransferAction::EndData, "parent-directories");
+        end.file_id = Some("f1".into());
+        end.data = b"data".to_vec();
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, end))
+                .status
+                .as_deref(),
+            Some("OK")
+        );
+        run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Finish, "parent-directories"),
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"data");
+    }
+
+    #[test]
+    fn omitted_sizes_use_actual_cumulative_bytes_and_relative_paths_use_home() {
+        let home = tempfile::tempdir().unwrap();
+        let mut manager = TtyTransferManager::new();
+        let limits = TtyTransferLimits::new(8, 8, 12).unwrap();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+        approve_send(&mut manager, "unknown-sizes");
+
+        for (file_id, name, contents) in [
+            ("f1", "relative-one.txt", &b"first!"[..]),
+            ("f2", "relative-two.txt", &b"second"[..]),
+        ] {
+            let mut file = command(FileTransferAction::File, "unknown-sizes");
+            file.file_id = Some(file_id.into());
+            file.name = Some(name.into());
+            assert_eq!(
+                status(&run(&mut manager, &mut filesystem, file))
+                    .status
+                    .as_deref(),
+                Some("STARTED")
+            );
+
+            let mut end = command(FileTransferAction::EndData, "unknown-sizes");
+            end.file_id = Some(file_id.into());
+            end.data = contents.to_vec();
+            assert_eq!(
+                status(&run(&mut manager, &mut filesystem, end))
+                    .status
+                    .as_deref(),
+                Some("OK")
+            );
+        }
+
+        run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Finish, "unknown-sizes"),
+        );
+        assert_eq!(
+            fs::read(home.path().join("relative-one.txt")).unwrap(),
+            b"first!"
+        );
+        assert_eq!(
+            fs::read(home.path().join("relative-two.txt")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn duplicate_data_releases_completed_file_reservation() {
+        let home = tempfile::tempdir().unwrap();
+        let mut manager = TtyTransferManager::new();
+        let limits = TtyTransferLimits::new(8, 8, 16).unwrap();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+        approve_send(&mut manager, "duplicate-data");
+
+        let started = start_file(
+            &mut manager,
+            &mut filesystem,
+            "duplicate-data",
+            "first.txt",
+            8,
+        );
+        assert_eq!(status(&started).status.as_deref(), Some("STARTED"));
+        let mut end = command(FileTransferAction::EndData, "duplicate-data");
+        end.file_id = Some("f1".into());
+        end.data = b"12345678".to_vec();
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, end.clone()))
+                .status
+                .as_deref(),
+            Some("OK")
+        );
+        assert!(status(&run(&mut manager, &mut filesystem, end))
+            .status
+            .as_deref()
+            .is_some_and(|value| value.starts_with("EINVAL:")));
+
+        let mut replacement = command(FileTransferAction::File, "duplicate-data");
+        replacement.file_id = Some("f2".into());
+        replacement.name = Some("replacement.txt".into());
+        replacement.size = Some(8);
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, replacement))
+                .status
+                .as_deref(),
+            Some("STARTED")
+        );
+    }
+
+    #[test]
+    fn rejected_unknown_sizes_still_consume_the_decompressed_session_budget() {
+        let home = tempfile::tempdir().unwrap();
+        let mut manager = TtyTransferManager::new();
+        let limits = TtyTransferLimits::new(8, 8, 12).unwrap();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+        approve_send(&mut manager, "cumulative-budget");
+
+        for (file_id, name) in [("f1", "first.txt"), ("f2", "second.txt")] {
+            let mut file = command(FileTransferAction::File, "cumulative-budget");
+            file.file_id = Some(file_id.into());
+            file.name = Some(name.into());
+            file.compression = Some(FileTransferCompression::Zlib);
+            assert_eq!(
+                status(&run(&mut manager, &mut filesystem, file))
+                    .status
+                    .as_deref(),
+                Some("STARTED")
+            );
+
+            let mut end = command(FileTransferAction::EndData, "cumulative-budget");
+            end.file_id = Some(file_id.into());
+            end.data = zlib_bytes(b"12345678");
+            let response = status(&run(&mut manager, &mut filesystem, end));
+            if file_id == "f1" {
+                assert_eq!(response.status.as_deref(), Some("OK"));
+            } else {
+                assert!(response
+                    .status
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("EFBIG:")));
+            }
+        }
+
+        let mut third = command(FileTransferAction::File, "cumulative-budget");
+        third.file_id = Some("f3".into());
+        third.name = Some("third.txt".into());
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, third))
+                .status
+                .as_deref(),
+            Some("STARTED")
+        );
+        let mut end = command(FileTransferAction::EndData, "cumulative-budget");
+        end.file_id = Some("f3".into());
+        end.data = b"x".to_vec();
+        assert!(status(&run(&mut manager, &mut filesystem, end))
+            .status
+            .as_deref()
+            .is_some_and(|value| value.starts_with("EFBIG:")));
     }
 
     #[test]
@@ -2012,7 +2364,10 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.starts_with("EINVAL:")));
 
-        let mut backslash = command(FileTransferAction::File, "paths");
+        // The authorization layer closes a session after a malformed command,
+        // so exercise the filesystem-only backslash rejection in a fresh one.
+        approve_send(&mut manager, "paths-rest");
+        let mut backslash = command(FileTransferAction::File, "paths-rest");
         backslash.file_id = Some("f-backslash".into());
         backslash.name = Some("~/safe/..\\escape".into());
         let rejected = run(&mut manager, &mut filesystem, backslash);
@@ -2021,7 +2376,7 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.starts_with("EINVAL:")));
 
-        let mut directory = command(FileTransferAction::File, "paths");
+        let mut directory = command(FileTransferAction::File, "paths-rest");
         directory.file_id = Some("f2".into());
         directory.name = Some("~/directory".into());
         directory.file_type = Some(FileTransferType::Directory);

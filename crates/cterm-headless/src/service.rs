@@ -265,6 +265,7 @@ impl TerminalService for TerminalServiceImpl {
         let req = request.into_inner();
         self.session_manager
             .destroy_session(&req.session_id, req.signal)
+            .await
             .map_err(Status::from)?;
 
         Ok(Response::new(DestroySessionResponse { success: true }))
@@ -683,7 +684,34 @@ impl TerminalService for TerminalServiceImpl {
             Err(_) => None,
         });
 
-        let stream = events.merge(prompts);
+        // OSC 5113 consent is an authorization boundary, so late subscribers
+        // first receive the bounded current set before live events. The state
+        // subscribes while holding the registry lock, closing the snapshot race.
+        let (tty_transfer_snapshot, tty_transfer_rx) = session.subscribe_tty_transfer_prompts();
+        // Tonic fixes the stream error type to its intentionally rich Status;
+        // this finite snapshot is infallible and never constructs that variant.
+        #[allow(clippy::result_large_err)]
+        let tty_transfer_snapshot =
+            tokio_stream::iter(tty_transfer_snapshot.into_iter().map(|approval| {
+                Ok(TerminalEvent {
+                    event: Some(terminal_event::Event::TtyFileTransferApproval(approval)),
+                })
+            }));
+        let tty_transfer_live =
+            BroadcastStream::new(tty_transfer_rx).filter_map(|result| match result {
+                Ok(approval) => Some(Ok(TerminalEvent {
+                    event: Some(terminal_event::Event::TtyFileTransferApproval(approval)),
+                })),
+                Err(BroadcastStreamRecvError::Lagged(count)) => {
+                    log::error!(
+                        "stream_events: unexpectedly lagged by {count} bounded OSC 5113 prompts"
+                    );
+                    None
+                }
+            });
+        let tty_transfers = tty_transfer_snapshot.chain(tty_transfer_live);
+
+        let stream = events.merge(prompts).merge(tty_transfers);
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -708,6 +736,24 @@ impl TerminalService for TerminalServiceImpl {
         Ok(Response::new(RespondPromptResponse { success }))
     }
 
+    async fn respond_tty_file_transfer_approval(
+        &self,
+        request: Request<RespondTtyFileTransferApprovalRequest>,
+    ) -> Result<Response<RespondTtyFileTransferApprovalResponse>, Status> {
+        let req = request.into_inner();
+        let session = self
+            .session_manager
+            .get_session(&req.session_id)
+            .map_err(Status::from)?;
+        let success = session
+            .respond_tty_transfer_approval(req.request_id, req.approve)
+            .await;
+
+        Ok(Response::new(RespondTtyFileTransferApprovalResponse {
+            success,
+        }))
+    }
+
     // ========================================================================
     // Connection Management (new RPCs)
     // ========================================================================
@@ -717,6 +763,13 @@ impl TerminalService for TerminalServiceImpl {
         request: Request<HandshakeRequest>,
     ) -> Result<Response<HandshakeResponse>, Status> {
         let req = request.into_inner();
+        if req.protocol_version != cterm_proto::PROTOCOL_VERSION {
+            return Err(Status::failed_precondition(format!(
+                "protocol version mismatch: client {}, daemon {}",
+                req.protocol_version,
+                cterm_proto::PROTOCOL_VERSION,
+            )));
+        }
         log::info!(
             "Client connected: {} (version {})",
             req.client_id,
@@ -810,6 +863,7 @@ impl TerminalService for TerminalServiceImpl {
             // Destroy the session
             self.session_manager
                 .destroy_session(&req.session_id, None)
+                .await
                 .map_err(Status::from)?;
         }
 
@@ -1111,7 +1165,11 @@ impl TerminalService for TerminalServiceImpl {
         if req.force {
             let sessions = self.session_manager.list_sessions();
             for session in &sessions {
-                if let Err(e) = self.session_manager.destroy_session(&session.id, None) {
+                if let Err(e) = self
+                    .session_manager
+                    .destroy_session(&session.id, None)
+                    .await
+                {
                     log::warn!(
                         "Failed to destroy session {} during shutdown: {}",
                         session.id,
@@ -1162,6 +1220,16 @@ impl TerminalService for TerminalServiceImpl {
                 "Relaunch requested (binary: {})",
                 binary_path.unwrap_or("<current>")
             );
+
+            let _transfer_guard = self
+                .session_manager
+                .begin_relaunch_transfer_quiesce()
+                .map_err(|active_sessions| {
+                    Status::failed_precondition(format!(
+                        "daemon relaunch refused while OSC 5113 transfers are active in sessions: {}",
+                        active_sessions.join(", ")
+                    ))
+                })?;
 
             // perform_relaunch calls exec() and does not return on success
             match crate::relaunch::perform_relaunch(

@@ -4,7 +4,7 @@
 //! this module. Decoding an escape sequence must never grant file access.
 //! Protocol: <https://sw.kovidgoyal.net/kitty/file-transfer-protocol/>
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD as PADDED_BASE64, STANDARD_NO_PAD as KITTY_BASE64};
 use base64::Engine;
 use thiserror::Error;
 
@@ -131,7 +131,6 @@ impl FileTransferCommand {
             return Err(FileTransferCodecError::InvalidField("quiet"));
         }
         validate_optional_safe_string("file_id", self.file_id.as_deref())?;
-        validate_optional_safe_string("bypass", self.bypass.as_deref())?;
         validate_optional_safe_string("parent", self.parent.as_deref())?;
         validate_decoded_lengths(self)?;
 
@@ -143,7 +142,7 @@ impl FileTransferCommand {
             append_raw(&mut fields, b"fid", value.as_bytes());
         }
         if let Some(value) = &self.bypass {
-            append_raw(&mut fields, b"pw", value.as_bytes());
+            append_base64(&mut fields, b"pw", value.as_bytes());
         }
         if self.quiet != 0 {
             append_raw(&mut fields, b"q", self.quiet.to_string().as_bytes());
@@ -264,7 +263,8 @@ pub fn parse_file_transfer_command(
             }
             b"pw" => {
                 mark_seen(&mut seen, 3, "bypass")?;
-                bypass = Some(parse_safe_string("bypass", value)?);
+                let decoded = decode_utf8("bypass", value, MAX_FILE_TRANSFER_SAFE_STRING_BYTES)?;
+                bypass = Some(decoded);
             }
             b"q" => {
                 mark_seen(&mut seen, 4, "quiet")?;
@@ -420,8 +420,9 @@ fn decode_base64(
     if value.len() > limit.saturating_add(2) / 3 * 4 {
         return Err(FileTransferCodecError::LimitExceeded(field));
     }
-    let decoded = BASE64
+    let decoded = KITTY_BASE64
         .decode(value)
+        .or_else(|_| PADDED_BASE64.decode(value))
         .map_err(|_| FileTransferCodecError::InvalidField(field))?;
     if decoded.len() > limit {
         return Err(FileTransferCodecError::LimitExceeded(field));
@@ -430,6 +431,13 @@ fn decode_base64(
 }
 
 fn validate_decoded_lengths(command: &FileTransferCommand) -> Result<(), FileTransferCodecError> {
+    if command
+        .bypass
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_FILE_TRANSFER_SAFE_STRING_BYTES)
+    {
+        return Err(FileTransferCodecError::LimitExceeded("bypass"));
+    }
     if command
         .name
         .as_ref()
@@ -458,7 +466,7 @@ fn append_raw(output: &mut Vec<u8>, key: &[u8], value: &[u8]) {
 }
 
 fn append_base64(output: &mut Vec<u8>, key: &[u8], value: &[u8]) {
-    append_raw(output, key, BASE64.encode(value).as_bytes());
+    append_raw(output, key, KITTY_BASE64.encode(value).as_bytes());
 }
 
 #[cfg(test)]
@@ -486,6 +494,25 @@ mod tests {
     }
 
     #[test]
+    fn accepts_kitty_unpadded_base64_and_decodes_bypass() {
+        let command =
+            parse(b"ac=file;id=test;pw=c2hhMjU2OmFiY2Q;n=c29tZWZpbGU;st=U1RBUlRFRA;d=AQI").unwrap();
+        assert_eq!(command.bypass.as_deref(), Some("sha256:abcd"));
+        assert_eq!(command.name.as_deref(), Some("somefile"));
+        assert_eq!(command.status.as_deref(), Some("STARTED"));
+        assert_eq!(command.data, [1, 2]);
+    }
+
+    #[test]
+    fn bypass_accepts_bounded_kitty_json_payloads() {
+        let bypass = r#"kitty-1:{"password":"a;b", "timestamp":42}"#;
+        let encoded = KITTY_BASE64.encode(bypass);
+        let command = parse(format!("ac=send;id=test;pw={encoded}").as_bytes()).unwrap();
+        assert_eq!(command.bypass.as_deref(), Some(bypass));
+        assert_eq!(parse(&command.encode().unwrap()).unwrap(), command);
+    }
+
+    #[test]
     fn supports_all_metadata_and_round_trips() {
         let command = FileTransferCommand {
             action: FileTransferAction::File,
@@ -505,7 +532,14 @@ mod tests {
             transmission_type: Some(FileTransmissionType::Rsync),
         };
 
-        assert_eq!(parse(&command.encode().unwrap()).unwrap(), command);
+        let encoded = command.encode().unwrap();
+        assert!(encoded
+            .windows(b"pw=c2hhMjU2OmFiY2Q".len())
+            .any(|window| window == b"pw=c2hhMjU2OmFiY2Q"));
+        assert!(!encoded
+            .windows(b"pw=sha256:abcd".len())
+            .any(|window| { window == b"pw=sha256:abcd" }));
+        assert_eq!(parse(&encoded).unwrap(), command);
     }
 
     #[test]
@@ -546,7 +580,7 @@ mod tests {
         );
 
         let oversized = vec![0_u8; MAX_FILE_TRANSFER_CHUNK_BYTES + 1];
-        let encoded = BASE64.encode(oversized);
+        let encoded = KITTY_BASE64.encode(oversized);
         let command = format!("ac=data;id=x;fid=f;d={encoded}");
         assert_eq!(
             parse(command.as_bytes()),

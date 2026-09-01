@@ -53,6 +53,10 @@ service TerminalService {
   // Reply to a SessionPromptEvent raised during SSH session establishment.
   rpc RespondPrompt(RespondPromptRequest) returns (RespondPromptResponse);
 
+  // Approve or deny an OSC 5113 filesystem request surfaced through
+  // TtyFileTransferApprovalEvent.
+  rpc RespondTtyFileTransferApproval(RespondTtyFileTransferApprovalRequest) returns (RespondTtyFileTransferApprovalResponse);
+
   // Daemon Management
   rpc GetDaemonInfo(GetDaemonInfoRequest) returns (GetDaemonInfoResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
@@ -831,7 +835,44 @@ message TerminalEvent {
     // password, or key passphrase). The client replies via RespondPrompt.
     SessionPromptEvent session_prompt = 6;
     DesktopNotificationEvent desktop_notification = 7;
+    // Daemon-injected: an OSC 5113 session requires explicit native consent.
+    TtyFileTransferApprovalEvent tty_file_transfer_approval = 8;
   }
+}
+
+enum TtyFileTransferDirection {
+  TTY_FILE_TRANSFER_DIRECTION_UNSPECIFIED = 0;
+  // The process connected to the TTY sends files to the ctermd host.
+  TTY_FILE_TRANSFER_DIRECTION_SEND = 1;
+  // The process connected to the TTY reads files from the ctermd host.
+  TTY_FILE_TRANSFER_DIRECTION_RECEIVE = 2;
+}
+
+message TtyFileTransferApprovalEvent {
+  // Opaque token bound to this daemon terminal session and pending request.
+  uint64 request_id = 1;
+  // OSC 5113 transfer-session identifier supplied by the TTY peer.
+  string transfer_id = 2;
+  TtyFileTransferDirection direction = 3;
+  // Requested local paths for receive sessions. Send sessions have no paths
+  // until after approval, as required by the OSC 5113 protocol.
+  repeated string paths = 4;
+  // Consent and resource limits enforced by ctermd for this request.
+  uint64 expires_in_ms = 5;
+  uint32 max_files = 6;
+  uint64 max_file_bytes = 7;
+  uint64 max_session_bytes = 8;
+}
+
+message RespondTtyFileTransferApprovalRequest {
+  string session_id = 1;
+  uint64 request_id = 2;
+  bool approve = 3;
+}
+
+message RespondTtyFileTransferApprovalResponse {
+  // False means the request was already answered, expired, or unknown.
+  bool success = 1;
 }
 
 message DesktopNotificationEvent {

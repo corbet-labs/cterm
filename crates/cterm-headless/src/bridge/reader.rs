@@ -56,7 +56,7 @@ impl PtyReader {
                         .unwrap_or(0);
 
                     // Process the data through the terminal
-                    let events = session.process_output(&data);
+                    let events = session.process_output(&data).await;
 
                     // Broadcast the raw output
                     session.broadcast_output(OutputData {
@@ -84,6 +84,7 @@ impl PtyReader {
             }
         }
 
+        session.shutdown_tty_transfers().await;
         log::debug!("PTY reader task exiting for session {}", session.id);
     }
 }

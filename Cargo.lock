@@ -782,9 +782,11 @@ version = "0.0.20"
 dependencies = [
  "anyhow",
  "clap",
+ "cterm-app",
  "cterm-client",
  "cterm-core",
  "cterm-proto",
+ "directories",
  "env_logger",
  "futures",
  "hyper-util",

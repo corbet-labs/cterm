@@ -2,8 +2,8 @@
 
 use crate::error::{HeadlessError, Result};
 use crate::session::{generate_session_id, SessionState};
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use parking_lot::{Mutex, MutexGuard, RwLock};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,6 +32,26 @@ pub struct SessionManager {
     scrollback_lines: usize,
     /// Whether at least one session has ever been created
     had_sessions: AtomicBool,
+    /// Serializes session creation/destruction with exec-in-place relaunch.
+    lifecycle_gate: Mutex<()>,
+    /// Sessions removed from the public map whose non-serializable transfer
+    /// actors are still draining. Relaunch treats every entry as active.
+    draining_tty_transfers: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Keeps new OSC 5113 work and session-map mutations quiesced until relaunch
+/// either execs successfully or returns an error.
+pub struct RelaunchTransferGuard<'a> {
+    manager: &'a SessionManager,
+    _lifecycle: MutexGuard<'a, ()>,
+}
+
+impl Drop for RelaunchTransferGuard<'_> {
+    fn drop(&mut self) {
+        for session in self.manager.list_sessions() {
+            session.resume_tty_transfers();
+        }
+    }
 }
 
 impl SessionManager {
@@ -47,6 +67,8 @@ impl SessionManager {
             named_sessions: RwLock::new(HashMap::new()),
             scrollback_lines,
             had_sessions: AtomicBool::new(false),
+            lifecycle_gate: Mutex::new(()),
+            draining_tty_transfers: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -117,6 +139,7 @@ impl SessionManager {
         cursor_style: cterm_core::CursorStyle,
         cursor_blink: bool,
     ) -> Result<Arc<SessionState>> {
+        let _lifecycle = self.lifecycle_gate.lock();
         let size = size.normalized();
         let cols = size.cols as usize;
         let rows = size.rows as usize;
@@ -203,6 +226,7 @@ impl SessionManager {
         cursor_style: cterm_core::CursorStyle,
         cursor_blink: bool,
     ) -> Result<Arc<SessionState>> {
+        let _lifecycle = self.lifecycle_gate.lock();
         let size = size.normalized();
         let cols = size.cols as usize;
         let rows = size.rows as usize;
@@ -254,15 +278,23 @@ impl SessionManager {
     }
 
     /// Destroy a session
-    pub fn destroy_session(&self, id: &str, signal: Option<i32>) -> Result<()> {
-        let session = self
-            .sessions
-            .write()
-            .remove(id)
-            .ok_or_else(|| HeadlessError::SessionNotFound(id.to_string()))?;
+    pub async fn destroy_session(&self, id: &str, signal: Option<i32>) -> Result<()> {
+        let session = {
+            let _lifecycle = self.lifecycle_gate.lock();
+            let session = self
+                .sessions
+                .write()
+                .remove(id)
+                .ok_or_else(|| HeadlessError::SessionNotFound(id.to_string()))?;
 
-        // Clean up named session mapping
-        self.named_sessions.write().retain(|_, v| v != id);
+            // Reject new filesystem commands before releasing the lifecycle
+            // gate. A concurrent relaunch can no longer observe this session,
+            // while its actor is drained explicitly below.
+            session.quiesce_tty_transfers();
+            self.draining_tty_transfers.lock().insert(id.to_string());
+            self.named_sessions.write().retain(|_, v| v != id);
+            session
+        };
 
         // Send signal to terminate the process
         #[cfg(unix)]
@@ -271,6 +303,19 @@ impl SessionManager {
         let sig = signal.unwrap_or(15); // SIGTERM
 
         let _ = session.send_signal(sig);
+        // A spawned cleanup is not cancelled when the requesting gRPC future
+        // disconnects. The draining marker is removed only after staging and
+        // the actor queue are fully gone.
+        let draining = Arc::clone(&self.draining_tty_transfers);
+        let draining_id = id.to_string();
+        tokio::spawn(async move {
+            session.shutdown_tty_transfers().await;
+            draining.lock().remove(&draining_id);
+        })
+        .await
+        .map_err(|error| {
+            HeadlessError::Internal(format!("OSC 5113 session cleanup failed: {error}"))
+        })?;
 
         log::info!("Destroyed session {}", id);
 
@@ -298,6 +343,7 @@ impl SessionManager {
         scrollback_lines: usize,
         screen_snapshot: Option<&cterm_proto::proto::GetScreenResponse>,
     ) -> Result<Arc<SessionState>> {
+        let _lifecycle = self.lifecycle_gate.lock();
         let state = SessionState::from_raw_fd(
             id.clone(),
             fd,
@@ -395,8 +441,40 @@ impl SessionManager {
         self.had_sessions.load(Ordering::Relaxed)
     }
 
+    /// Freeze session-map mutation and reject new OSC 5113 starts, then prove
+    /// that no actor queue, approval, or approved filesystem session remains.
+    pub fn begin_relaunch_transfer_quiesce(
+        &self,
+    ) -> std::result::Result<RelaunchTransferGuard<'_>, Vec<String>> {
+        let lifecycle = self.lifecycle_gate.lock();
+        let sessions = self.list_sessions();
+        for session in &sessions {
+            session.quiesce_tty_transfers();
+        }
+        let mut active: Vec<_> = self.draining_tty_transfers.lock().iter().cloned().collect();
+        active.extend(
+            sessions
+                .iter()
+                .filter(|session| session.has_active_tty_transfers())
+                .map(|session| session.id.clone()),
+        );
+        active.sort();
+        active.dedup();
+        if !active.is_empty() {
+            for session in sessions {
+                session.resume_tty_transfers();
+            }
+            return Err(active);
+        }
+        Ok(RelaunchTransferGuard {
+            manager: self,
+            _lifecycle: lifecycle,
+        })
+    }
+
     /// Clean up dead sessions, returns the number of sessions removed
     pub fn cleanup_dead_sessions(&self) -> usize {
+        let _lifecycle = self.lifecycle_gate.lock();
         // Snapshot (id, Arc) pairs under a SHORT read lock, then drop the lock.
         // Crucially, we do NOT call `is_running()` (which acquires a session's
         // terminal lock) while holding the global `sessions` lock — otherwise a
@@ -411,11 +489,21 @@ impl SessionManager {
         };
 
         // Check liveness without holding the map lock.
-        let dead_ids: Vec<String> = snapshot
-            .iter()
-            .filter(|(_, s)| !s.is_running())
-            .map(|(id, _)| id.clone())
-            .collect();
+        let mut dead_ids = Vec::new();
+        for (id, session) in &snapshot {
+            if session.is_running() {
+                continue;
+            }
+            // Close admission before checking the actor. The PTY reader may
+            // have parsed its final chunk but not yet submitted the contained
+            // command; the controller's double-check then rejects that race.
+            session.quiesce_tty_transfers();
+            if !session.has_active_tty_transfers() {
+                dead_ids.push(id.clone());
+            }
+            // Active dead sessions stay quiesced until the EOF reader drains
+            // them, then the next cleanup pass can remove them safely.
+        }
 
         // Take the write lock only to remove the dead ids.
         let count = dead_ids.len();
@@ -478,5 +566,61 @@ mod tests {
         assert!(restored.screen().grid().text().contains("beforeafter"));
         assert_eq!(restored.screen().cursor.style, cterm_core::CursorStyle::Bar);
         assert!(!restored.screen().cursor.blink.enabled());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relaunch_quiescence_rejects_new_transfers_and_refuses_active_sessions() {
+        let manager = SessionManager::new();
+        let session = manager
+            .create_session(
+                80,
+                24,
+                Some("/bin/sh".to_string()),
+                Vec::new(),
+                None,
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        let (_, mut approvals) = session.subscribe_tty_transfer_prompts();
+
+        let guard = manager.begin_relaunch_transfer_quiesce().unwrap();
+        session
+            .process_output(b"\x1b]5113;ac=send;id=blocked-during-relaunch\x1b\\")
+            .await;
+        assert!(matches!(
+            approvals.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        drop(guard);
+
+        session
+            .process_output(b"\x1b]5113;ac=send;id=active-transfer\x1b\\")
+            .await;
+        let approval = tokio::time::timeout(std::time::Duration::from_secs(1), approvals.recv())
+            .await
+            .expect("approval event timed out")
+            .expect("approval channel closed");
+        assert_eq!(approval.transfer_id, "active-transfer");
+        assert!(session.has_active_tty_transfers());
+
+        let active_sessions = manager
+            .begin_relaunch_transfer_quiesce()
+            .err()
+            .expect("active transfer must refuse relaunch");
+        assert_eq!(
+            active_sessions.as_slice(),
+            std::slice::from_ref(&session.id)
+        );
+        assert!(
+            session
+                .respond_tty_transfer_approval(approval.request_id, true)
+                .await
+        );
+
+        manager.destroy_session(&session.id, None).await.unwrap();
+        assert!(!session.has_active_tty_transfers());
+        assert!(session.subscribe_tty_transfer_prompts().0.is_empty());
     }
 }

@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 cterm-core.workspace = true
+cterm-app.workspace = true
 cterm-proto.workspace = true
+directories.workspace = true
 tonic.workspace = true
 prost.workspace = true
 prost-types.workspace = true

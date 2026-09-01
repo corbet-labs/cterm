@@ -41,6 +41,7 @@ pub mod ssh_prompt;
 pub mod tab_bar;
 pub mod tab_templates;
 pub mod terminal_view;
+mod tty_file_transfer_prompt;
 pub mod update_dialog;
 #[cfg(unix)]
 pub mod upgrade_receiver;

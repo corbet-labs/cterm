@@ -96,6 +96,7 @@ struct TransferSession {
 pub struct TtyTransferManager {
     sessions: HashMap<String, TransferSession>,
     next_request_id: u64,
+    receive_supported: bool,
 }
 
 impl Default for TtyTransferManager {
@@ -103,6 +104,7 @@ impl Default for TtyTransferManager {
         Self {
             sessions: HashMap::new(),
             next_request_id: 1,
+            receive_supported: true,
         }
     }
 }
@@ -110,6 +112,16 @@ impl Default for TtyTransferManager {
 impl TtyTransferManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a manager for an executor that does not yet implement local
+    /// filesystem reads. Unsupported receive requests fail before a consent
+    /// prompt or an `OK` response can imply that data will follow.
+    pub fn send_only() -> Self {
+        Self {
+            receive_supported: false,
+            ..Self::default()
+        }
     }
 
     /// Consume one decoded command without performing filesystem I/O.
@@ -159,26 +171,59 @@ impl TtyTransferManager {
 
     /// Refuse and discard the exact still-pending approval request.
     pub fn deny(&mut self, request_id: u64) -> Vec<TtyTransferAction> {
+        self.reject(request_id, "EPERM:User refused the transfer")
+    }
+
+    /// Refuse a pending request for a daemon policy reason such as expiry.
+    pub fn reject(&mut self, request_id: u64, status: &str) -> Vec<TtyTransferAction> {
         let Some(session_id) = self.session_id_for_request(request_id) else {
             return Vec::new();
         };
-        let Some(session) = self.sessions.remove(&session_id) else {
+        self.reject_session(&session_id, status)
+    }
+
+    /// End one pending or approved session for a daemon lifecycle reason.
+    /// Approved sessions emit `Abort` before their terminal-visible error so
+    /// filesystem staging is discarded before the peer can retry.
+    pub fn reject_session(&mut self, session_id: &str, status: &str) -> Vec<TtyTransferAction> {
+        let Some(session) = self.sessions.remove(session_id) else {
             return Vec::new();
         };
-        status_response(
-            &session_id,
-            None,
-            "EPERM:User refused the transfer",
-            session.quiet,
-            true,
-        )
-        .map(TtyTransferAction::Write)
-        .into_iter()
-        .collect()
+        let mut actions = Vec::new();
+        if session.phase == SessionPhase::Approved {
+            actions.push(TtyTransferAction::Abort {
+                session_id: session_id.to_string(),
+            });
+        }
+        if let Some(response) = status_response(session_id, None, status, session.quiet, true) {
+            actions.push(TtyTransferAction::Write(response));
+        }
+        actions
+    }
+
+    /// End every live session, used for PTY EOF and daemon shutdown cleanup.
+    pub fn reject_all(&mut self, status: &str) -> Vec<TtyTransferAction> {
+        let session_ids: Vec<_> = self.sessions.keys().cloned().collect();
+        session_ids
+            .into_iter()
+            .flat_map(|session_id| self.reject_session(&session_id, status))
+            .collect()
     }
 
     pub fn active_sessions(&self) -> usize {
         self.sessions.len()
+    }
+
+    pub fn has_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
+    /// Whether this exact opaque token still names a session awaiting consent.
+    ///
+    /// Executors use this after processing protocol input so duplicate or
+    /// otherwise rejected commands cannot accidentally dismiss a live prompt.
+    pub fn is_approval_pending(&self, request_id: u64) -> bool {
+        self.session_id_for_request(request_id).is_some()
     }
 
     fn start(
@@ -186,6 +231,9 @@ impl TtyTransferManager {
         command: FileTransferCommand,
         direction: TtyTransferDirection,
     ) -> Vec<TtyTransferAction> {
+        if direction == TtyTransferDirection::Receive && !self.receive_supported {
+            return error_response(&command, "ENOTSUP:Receive sessions are not implemented");
+        }
         if self.sessions.contains_key(&command.id) {
             return error_response(&command, "EEXIST:Transfer session already exists");
         }
@@ -428,11 +476,10 @@ fn valid_protocol_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= MAX_FILE_TRANSFER_PATH_BYTES
-        && (bytes.starts_with(b"/") || bytes.starts_with(b"~/"))
         && !bytes.contains(&0)
         && bytes
             .split(|byte| *byte == b'/')
-            .all(|part| part.len() <= 255)
+            .all(|part| part.len() <= 255 && part != b"." && part != b"..")
 }
 
 fn error_response(command: &FileTransferCommand, status: &str) -> Vec<TtyTransferAction> {
@@ -535,6 +582,42 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_start_does_not_invalidate_original_approval() {
+        let mut manager = TtyTransferManager::new();
+        let request_id =
+            approval(&manager.handle(command(FileTransferAction::Send, "duplicate"))).request_id;
+
+        assert!(matches!(
+            manager
+                .handle(command(FileTransferAction::Send, "duplicate"))
+                .as_slice(),
+            [TtyTransferAction::Write(_)]
+        ));
+        assert!(manager.is_approval_pending(request_id));
+        assert!(matches!(
+            manager.approve(request_id).as_slice(),
+            [TtyTransferAction::Write(_)]
+        ));
+    }
+
+    #[test]
+    fn lifecycle_rejection_aborts_approved_staging_and_clears_state() {
+        let mut manager = TtyTransferManager::new();
+        let request_id =
+            approval(&manager.handle(command(FileTransferAction::Send, "idle"))).request_id;
+        manager.approve(request_id);
+
+        let actions = manager.reject_session("idle", "ETIMEDOUT:Transfer session idle");
+
+        assert!(matches!(
+            actions.as_slice(),
+            [TtyTransferAction::Abort { session_id }, TtyTransferAction::Write(_)]
+                if session_id == "idle"
+        ));
+        assert_eq!(manager.active_sessions(), 0);
+    }
+
+    #[test]
     fn receive_collects_bounded_paths_before_requesting_consent() {
         let mut manager = TtyTransferManager::new();
         let mut start = command(FileTransferAction::Receive, "receive-1");
@@ -576,7 +659,7 @@ mod tests {
         manager.handle(start);
         let mut path = command(FileTransferAction::File, "bad-path");
         path.file_id = Some("f1".into());
-        path.name = Some("relative/path".into());
+        path.name = Some("../outside".into());
         assert!(matches!(
             manager.handle(path).as_slice(),
             [TtyTransferAction::Write(_)]
@@ -589,6 +672,35 @@ mod tests {
             manager.handle(oversized).as_slice(),
             [TtyTransferAction::Write(_)]
         ));
+    }
+
+    #[test]
+    fn ordinary_relative_paths_are_valid_home_relative_protocol_names() {
+        let mut manager = TtyTransferManager::new();
+        let request_id =
+            approval(&manager.handle(command(FileTransferAction::Send, "relative"))).request_id;
+        manager.approve(request_id);
+        let mut file = command(FileTransferAction::File, "relative");
+        file.file_id = Some("f1".into());
+        file.name = Some("downloads/report.txt".into());
+
+        assert!(matches!(
+            manager.handle(file).as_slice(),
+            [TtyTransferAction::Execute(_)]
+        ));
+    }
+
+    #[test]
+    fn send_only_manager_rejects_receive_before_requesting_consent() {
+        let mut manager = TtyTransferManager::send_only();
+        let mut start = command(FileTransferAction::Receive, "receive-disabled");
+        start.size = Some(1);
+
+        assert!(matches!(
+            manager.handle(start).as_slice(),
+            [TtyTransferAction::Write(_)]
+        ));
+        assert_eq!(manager.active_sessions(), 0);
     }
 
     #[test]

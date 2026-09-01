@@ -3,8 +3,8 @@
 //! Manages the main window, tabs, terminal rendering, and message handling.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -71,8 +71,260 @@ pub const WM_APP_NATIVE_NOTIFICATION: u32 = WM_APP + 6;
 pub const WM_APP_DAEMON_SESSION_READY: u32 = WM_APP + 7;
 pub const WM_APP_PLUGIN_RESULT: u32 = WM_APP + 8;
 pub const WM_APP_DND_COMMAND: u32 = WM_APP + 9;
+pub const WM_APP_TTY_FILE_TRANSFER_PROMPT: u32 = WM_APP + 10;
+
+const MAX_PENDING_TTY_FILE_TRANSFER_PROMPTS: usize = 16;
+const MAX_TTY_FILE_TRANSFER_PROMPT_LIFETIME: Duration = Duration::from_secs(5 * 60);
 
 type PluginCommandResult = Result<PluginExecution, PluginRuntimeError>;
+
+struct TtyFileTransferPromptEnvelope {
+    hwnd: usize,
+    source_id: u64,
+    daemon_session_id: String,
+    daemon_hostname: String,
+    event: cterm_proto::proto::TtyFileTransferApprovalEvent,
+    expires_at: Instant,
+    decision_tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+struct TtyFileTransferPromptRegistry {
+    next_token: AtomicUsize,
+    capacity: usize,
+    state: Mutex<TtyFileTransferPromptRegistryState>,
+}
+
+#[derive(Default)]
+struct TtyFileTransferPromptRegistryState {
+    pending: HashMap<usize, TtyFileTransferPromptEnvelope>,
+    active: HashMap<usize, ActiveTtyFileTransferPrompt>,
+}
+
+struct ActiveTtyFileTransferPrompt {
+    hwnd: usize,
+    source_id: u64,
+    daemon_session_id: String,
+    dialog_hwnd: Option<usize>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TtyFileTransferPromptRegistry {
+    fn new(capacity: usize) -> Self {
+        Self {
+            next_token: AtomicUsize::new(1),
+            capacity,
+            state: Mutex::new(TtyFileTransferPromptRegistryState::default()),
+        }
+    }
+
+    fn insert(&self, envelope: TtyFileTransferPromptEnvelope) -> Option<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.pending.len() + state.active.len() >= self.capacity {
+            drop(state);
+            let _ = envelope.decision_tx.send(false);
+            return None;
+        }
+
+        loop {
+            let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+            if token != 0
+                && !state.pending.contains_key(&token)
+                && !state.active.contains_key(&token)
+            {
+                state.pending.insert(token, envelope);
+                return Some(token);
+            }
+        }
+    }
+
+    fn begin(
+        &self,
+        hwnd: usize,
+        token: usize,
+    ) -> Option<(TtyFileTransferPromptEnvelope, Arc<AtomicBool>)> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state
+            .pending
+            .get(&token)
+            .is_some_and(|entry| entry.hwnd == hwnd)
+        {
+            return None;
+        }
+        let envelope = state.pending.remove(&token)?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.active.insert(
+            token,
+            ActiveTtyFileTransferPrompt {
+                hwnd,
+                source_id: envelope.source_id,
+                daemon_session_id: envelope.daemon_session_id.clone(),
+                dialog_hwnd: None,
+                cancelled: Arc::clone(&cancelled),
+            },
+        );
+        Some((envelope, cancelled))
+    }
+
+    fn finish(&self, hwnd: usize, token: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .active
+            .get(&token)
+            .is_some_and(|entry| entry.hwnd == hwnd)
+        {
+            state.active.remove(&token);
+        }
+    }
+
+    fn cancel_token(&self, hwnd: usize, token: usize) {
+        let (pending, dialog) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pending = state
+                .pending
+                .get(&token)
+                .is_some_and(|entry| entry.hwnd == hwnd)
+                .then(|| state.pending.remove(&token))
+                .flatten();
+            let dialog = state.active.get_mut(&token).and_then(|entry| {
+                (entry.hwnd == hwnd).then(|| {
+                    entry.cancelled.store(true, Ordering::Release);
+                    entry.dialog_hwnd
+                })
+            });
+            (pending, dialog.flatten())
+        };
+        if let Some(envelope) = pending {
+            let _ = envelope.decision_tx.send(false);
+        }
+        if let Some(dialog) = dialog {
+            dismiss_tty_file_transfer_dialog(dialog);
+        }
+    }
+
+    fn cancel_window(&self, hwnd: usize) {
+        self.cancel_matching(|entry_hwnd, _, _| entry_hwnd == hwnd);
+    }
+
+    fn cancel_source(&self, hwnd: usize, source_id: u64, daemon_session_id: &str) {
+        self.cancel_matching(|entry_hwnd, entry_source_id, entry_session_id| {
+            entry_hwnd == hwnd
+                && entry_source_id == source_id
+                && entry_session_id == daemon_session_id
+        });
+    }
+
+    fn cancel_matching(&self, predicate: impl Fn(usize, u64, &str) -> bool) {
+        let (removed, dialogs) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tokens: Vec<_> = state
+                .pending
+                .iter()
+                .filter_map(|(token, entry)| {
+                    predicate(entry.hwnd, entry.source_id, &entry.daemon_session_id)
+                        .then_some(*token)
+                })
+                .collect();
+            let removed = tokens
+                .into_iter()
+                .filter_map(|token| state.pending.remove(&token))
+                .collect::<Vec<_>>();
+            let dialogs = state
+                .active
+                .values_mut()
+                .filter_map(|entry| {
+                    predicate(entry.hwnd, entry.source_id, &entry.daemon_session_id)
+                        .then(|| {
+                            entry.cancelled.store(true, Ordering::Release);
+                            entry.dialog_hwnd
+                        })
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            (removed, dialogs)
+        };
+        for envelope in removed {
+            let _ = envelope.decision_tx.send(false);
+        }
+        for dialog in dialogs {
+            dismiss_tty_file_transfer_dialog(dialog);
+        }
+    }
+
+    fn dialog_created(&self, token: usize, dialog_hwnd: usize) {
+        let cancelled = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(entry) = state.active.get_mut(&token) else {
+                return;
+            };
+            entry.dialog_hwnd = Some(dialog_hwnd);
+            entry.cancelled.load(Ordering::Acquire)
+        };
+        if cancelled {
+            dismiss_tty_file_transfer_dialog(dialog_hwnd);
+        }
+    }
+
+    fn dialog_destroyed(&self, token: usize, dialog_hwnd: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.active.get_mut(&token) {
+            if entry.dialog_hwnd == Some(dialog_hwnd) {
+                entry.dialog_hwnd = None;
+            }
+        }
+    }
+}
+
+struct PostedTtyFileTransferPrompt {
+    token: Option<usize>,
+    expires_at: Instant,
+    decision_rx: tokio::sync::oneshot::Receiver<bool>,
+}
+
+fn tty_file_transfer_prompt_registry() -> &'static TtyFileTransferPromptRegistry {
+    static REGISTRY: OnceLock<TtyFileTransferPromptRegistry> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| TtyFileTransferPromptRegistry::new(MAX_PENDING_TTY_FILE_TRANSFER_PROMPTS))
+}
+
+fn dismiss_tty_file_transfer_dialog(dialog_hwnd: usize) {
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(dialog_hwnd as *mut _)),
+            crate::tty_file_transfer_prompt::WM_TTY_FILE_TRANSFER_DIALOG_CANCEL,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+pub(crate) fn tty_file_transfer_dialog_created(token: usize, dialog_hwnd: usize) {
+    tty_file_transfer_prompt_registry().dialog_created(token, dialog_hwnd);
+}
+
+pub(crate) fn tty_file_transfer_dialog_destroyed(token: usize, dialog_hwnd: usize) {
+    tty_file_transfer_prompt_registry().dialog_destroyed(token, dialog_hwnd);
+}
 
 /// Commands sent to the daemon I/O thread
 pub enum DaemonCmd {
@@ -380,6 +632,12 @@ pub struct WindowState {
     plugin_commands: menu::PluginCommandRegistry,
     /// Skip close confirmation (set during relaunch)
     pub skip_close_confirm: bool,
+    /// An OSC 5113 consent dialog is running its nested message loop.
+    tty_file_transfer_prompt_active: bool,
+    /// `WM_CLOSE` arrived while the consent prompt owned this window. Window
+    /// destruction is deferred until the prompt has returned and denied any
+    /// stale request.
+    tty_file_transfer_close_pending: bool,
     /// Remote host connection manager
     pub remote_manager: cterm_client::RemoteManager,
     blink_clock: BlinkClock,
@@ -497,6 +755,8 @@ impl WindowState {
             tool_commands,
             plugin_commands,
             skip_close_confirm: false,
+            tty_file_transfer_prompt_active: false,
+            tty_file_transfer_close_pending: false,
             remote_manager: cterm_client::RemoteManager::new(),
             blink_clock: BlinkClock::default(),
             blink_started: Instant::now(),
@@ -1799,6 +2059,9 @@ impl WindowState {
         if !self.confirm_close_panes(tab.active_pane().into_iter()) {
             return;
         }
+        if let Some(pane) = self.tabs[self.active_tab_index].active_pane() {
+            self.cancel_tty_file_transfer_prompts_for_pane(pane);
+        }
 
         let had_focus = self.window_has_focus();
         let (tab_id, pane_id, next_pane_id, mut removed) = {
@@ -2036,6 +2299,9 @@ impl WindowState {
         if let Some(index) = self.tabs.iter().position(|t| t.id == tab_id) {
             if !self.confirm_close_panes(self.tabs[index].panes.values()) {
                 return;
+            }
+            for pane in self.tabs[index].panes.values() {
+                self.cancel_tty_file_transfer_prompts_for_pane(pane);
             }
             let old_active_index = self.active_tab_index;
             let was_active = index == old_active_index;
@@ -3467,7 +3733,110 @@ impl WindowState {
 
     /// Handle PTY exit
     pub fn on_pty_exit(&mut self, source_id: u64) {
+        if let Some((tab_index, pane_id)) = self.source_location(source_id) {
+            if let Some(pane) = self.tabs[tab_index].panes.get(&pane_id) {
+                self.cancel_tty_file_transfer_prompts_for_pane(pane);
+            }
+        }
         self.close_pane_source(source_id);
+    }
+
+    fn cancel_tty_file_transfer_prompts_for_pane(&self, pane: &PaneEntry) {
+        if let Some(session_id) = pane.session_id.as_deref() {
+            tty_file_transfer_prompt_registry().cancel_source(
+                self.hwnd.0 as usize,
+                pane.source_id,
+                session_id,
+            );
+        }
+    }
+
+    fn tty_file_transfer_prompt_context(
+        &self,
+        source_id: u64,
+        daemon_session_id: &str,
+        daemon_hostname: &str,
+    ) -> Option<crate::tty_file_transfer_prompt::TtyFileTransferPromptContext> {
+        let (tab_index, pane_id) = self.source_location(source_id)?;
+        let pane = self.tabs.get(tab_index)?.panes.get(&pane_id)?;
+        if !tty_file_transfer_prompt_identity_matches(
+            source_id,
+            daemon_session_id,
+            pane.source_id,
+            pane.session_id.as_deref(),
+        ) {
+            return None;
+        }
+        Some(
+            crate::tty_file_transfer_prompt::TtyFileTransferPromptContext {
+                pane_title: pane.title.clone(),
+                daemon_hostname: daemon_hostname.to_string(),
+                daemon_session_id: daemon_session_id.to_string(),
+            },
+        )
+    }
+
+    fn on_tty_file_transfer_prompt(&mut self, token: usize) {
+        let hwnd = self.hwnd.0 as usize;
+        let registry = tty_file_transfer_prompt_registry();
+        let Some((envelope, cancelled)) = registry.begin(hwnd, token) else {
+            return;
+        };
+        let TtyFileTransferPromptEnvelope {
+            source_id,
+            daemon_session_id,
+            daemon_hostname,
+            event,
+            expires_at,
+            decision_tx,
+            ..
+        } = envelope;
+
+        // DialogBox runs a nested Win32 message loop. Do not nest consent
+        // dialogs: queued concurrent requests fail closed and remain bounded.
+        if self.tty_file_transfer_prompt_active {
+            registry.finish(hwnd, token);
+            let _ = decision_tx.send(false);
+            return;
+        }
+
+        let Some(context) =
+            self.tty_file_transfer_prompt_context(source_id, &daemon_session_id, &daemon_hostname)
+        else {
+            registry.finish(hwnd, token);
+            let _ = decision_tx.send(false);
+            return;
+        };
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= expires_at {
+            registry.finish(hwnd, token);
+            let _ = decision_tx.send(false);
+            return;
+        }
+
+        self.tty_file_transfer_prompt_active = true;
+        let approved =
+            crate::tty_file_transfer_prompt::show_prompt(self.hwnd, token, &event, &context);
+        self.tty_file_transfer_prompt_active = false;
+        // A modal dialog runs a nested Win32 message loop. Revalidate the exact
+        // source/session after it returns so pane teardown cannot turn a stale
+        // Yes click into authorization for another pane.
+        let still_current = self
+            .tty_file_transfer_prompt_context(source_id, &daemon_session_id, &daemon_hostname)
+            .is_some();
+        let close_pending = std::mem::take(&mut self.tty_file_transfer_close_pending);
+        let decision = approved
+            && still_current
+            && !close_pending
+            && !cancelled.load(Ordering::Acquire)
+            && Instant::now() < expires_at;
+        registry.finish(hwnd, token);
+        let _ = decision_tx.send(decision);
+
+        if close_pending {
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
     }
 
     fn on_daemon_session_ready(&mut self, source_id: u64, ready: DaemonSessionReady) {
@@ -5017,13 +5386,14 @@ fn start_daemon_attach_thread(
 /// Run the daemon I/O loop: handles write/resize commands and streams output.
 async fn run_daemon_io_loop(
     hwnd: usize,
-    tab_id: u64,
+    source_id: u64,
     terminal: Arc<Mutex<Terminal>>,
     session: cterm_client::SessionHandle,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCmd>,
 ) {
     // Shared cancellation for process exit and explicit frontend detach.
     let exit_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let daemon_session_id = session.session_id().to_string();
 
     // Spawn command handler for write/resize
     let cmd_session = session.clone();
@@ -5144,7 +5514,7 @@ async fn run_daemon_io_loop(
     // Subscribe to event stream (process exit, etc.)
     let event_session = session.clone();
     let exit_notify_event = std::sync::Arc::clone(&exit_notify);
-    tokio::spawn(async move {
+    let event_task = tokio::spawn(async move {
         match event_session.stream_events().await {
             Ok(mut stream) => {
                 use futures::StreamExt;
@@ -5170,6 +5540,46 @@ async fn run_daemon_io_loop(
                                 let _ = event_session
                                     .respond_prompt(&prompt.prompt_id, accept, secret)
                                     .await;
+                            }
+                            Some(
+                                cterm_proto::proto::terminal_event::Event::TtyFileTransferApproval(
+                                    prompt,
+                                ),
+                            ) => {
+                                let request_id = prompt.request_id;
+                                let posted = post_tty_file_transfer_prompt(
+                                    hwnd,
+                                    source_id,
+                                    event_session.session_id().to_string(),
+                                    event_session.hostname().to_string(),
+                                    prompt,
+                                );
+                                let decision = tokio::time::timeout_at(
+                                    tokio::time::Instant::from_std(posted.expires_at),
+                                    posted.decision_rx,
+                                )
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .unwrap_or(false);
+                                if let Some(token) = posted.token {
+                                    tty_file_transfer_prompt_registry().cancel_token(hwnd, token);
+                                }
+                                match event_session
+                                    .respond_tty_file_transfer_approval(request_id, decision)
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => log::warn!(
+                                        "OSC 5113 approval {} was already expired or unknown",
+                                        request_id
+                                    ),
+                                    Err(error) => log::warn!(
+                                        "Failed to answer OSC 5113 approval {}: {}",
+                                        request_id,
+                                        error
+                                    ),
+                                }
                             }
                             _ => {}
                         }
@@ -5208,20 +5618,20 @@ async fn run_daemon_io_loop(
                                     for event in events {
                                         match event {
                                             TerminalEvent::TitleChanged(_) => {
-                                                post_message(hwnd, WM_APP_TITLE_CHANGED, tab_id);
+                                                post_message(hwnd, WM_APP_TITLE_CHANGED, source_id);
                                             }
                                             TerminalEvent::Bell => {
-                                                post_message(hwnd, WM_APP_BELL, tab_id);
+                                                post_message(hwnd, WM_APP_BELL, source_id);
                                             }
                                             TerminalEvent::DesktopNotification(notification) => {
                                                 post_desktop_notification(
                                                     hwnd,
-                                                    tab_id,
+                                                    source_id,
                                                     notification,
                                                 );
                                             }
                                             TerminalEvent::DndCommand(command) => {
-                                                post_dnd_command(hwnd, tab_id, command);
+                                                post_dnd_command(hwnd, source_id, command);
                                             }
                                             TerminalEvent::ContentChanged => content_changed = true,
                                             _ => {}
@@ -5229,7 +5639,7 @@ async fn run_daemon_io_loop(
                                     }
                                     drop(term);
                                     if content_changed {
-                                        post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                                        post_message(hwnd, WM_APP_PTY_DATA, source_id);
                                     }
                                     }
                                     Err(e) => {
@@ -5240,7 +5650,7 @@ async fn run_daemon_io_loop(
                             }
                             _ = sync_watchdog.tick() => {
                                 if terminal.lock().unwrap().expire_synchronized_update() {
-                                    post_message(hwnd, WM_APP_PTY_DATA, tab_id);
+                                    post_message(hwnd, WM_APP_PTY_DATA, source_id);
                                 }
                             }
                         }
@@ -5253,7 +5663,10 @@ async fn run_daemon_io_loop(
         } => {}
     }
 
-    post_tab_exit(hwnd, tab_id);
+    tty_file_transfer_prompt_registry().cancel_source(hwnd, source_id, &daemon_session_id);
+    event_task.abort();
+    let _ = event_task.await;
+    post_tab_exit(hwnd, source_id);
 }
 
 /// Post a WM_APP message to the window
@@ -5265,6 +5678,59 @@ fn post_message(hwnd: usize, msg: u32, tab_id: u64) {
             WPARAM(tab_id as usize),
             LPARAM(0),
         );
+    }
+}
+
+fn post_tty_file_transfer_prompt(
+    hwnd: usize,
+    source_id: u64,
+    daemon_session_id: String,
+    daemon_hostname: String,
+    event: cterm_proto::proto::TtyFileTransferApprovalEvent,
+) -> PostedTtyFileTransferPrompt {
+    let requested_lifetime = Duration::from_millis(event.expires_in_ms);
+    let lifetime = requested_lifetime.min(MAX_TTY_FILE_TRANSFER_PROMPT_LIFETIME);
+    let expires_at = Instant::now()
+        .checked_add(lifetime)
+        .unwrap_or_else(Instant::now);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+
+    if !crate::tty_file_transfer_prompt::valid_prompt_event(&event) {
+        let _ = decision_tx.send(false);
+        return PostedTtyFileTransferPrompt {
+            token: None,
+            expires_at,
+            decision_rx,
+        };
+    }
+
+    let token = tty_file_transfer_prompt_registry().insert(TtyFileTransferPromptEnvelope {
+        hwnd,
+        source_id,
+        daemon_session_id,
+        daemon_hostname,
+        event,
+        expires_at,
+        decision_tx,
+    });
+    if let Some(token) = token {
+        let posted = unsafe {
+            PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                WM_APP_TTY_FILE_TRANSFER_PROMPT,
+                WPARAM(token),
+                LPARAM(0),
+            )
+        };
+        if posted.is_err() {
+            tty_file_transfer_prompt_registry().cancel_token(hwnd, token);
+        }
+    }
+
+    PostedTtyFileTransferPrompt {
+        token,
+        expires_at,
+        decision_rx,
     }
 }
 
@@ -5379,6 +5845,17 @@ fn signed_point_from_lparam(value: isize) -> (i32, i32) {
         (value & 0xFFFF) as u16 as i16 as i32,
         ((value >> 16) & 0xFFFF) as u16 as i16 as i32,
     )
+}
+
+fn tty_file_transfer_prompt_identity_matches(
+    requested_source_id: u64,
+    requested_session_id: &str,
+    pane_source_id: u64,
+    pane_session_id: Option<&str>,
+) -> bool {
+    requested_source_id == pane_source_id
+        && !requested_session_id.is_empty()
+        && pane_session_id == Some(requested_session_id)
 }
 
 extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -5637,6 +6114,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
 
+        WM_APP_TTY_FILE_TRANSFER_PROMPT => {
+            state.on_tty_file_transfer_prompt(wparam.0);
+            LRESULT(0)
+        }
+
         WM_APP_DESKTOP_NOTIFICATION => {
             if lparam.0 != 0 {
                 let notification = unsafe {
@@ -5671,6 +6153,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         }
 
         WM_CLOSE => {
+            // An owned modal dialog pumps this window's posted messages. Keep the
+            // state allocation alive until its handler has returned and
+            // revalidated the daemon session.
+            if state.tty_file_transfer_prompt_active {
+                state.tty_file_transfer_close_pending = true;
+                tty_file_transfer_prompt_registry().cancel_window(hwnd.0 as usize);
+                return LRESULT(0);
+            }
             // Check if we should confirm before closing
             if state.should_confirm_close() {
                 // Show confirmation dialog
@@ -5695,7 +6185,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             unsafe {
                 let _ = KillTimer(Some(hwnd), BLINK_TIMER_ID);
             }
+            tty_file_transfer_prompt_registry().cancel_window(hwnd.0 as usize);
             let mut state = unsafe { Box::from_raw(state_ptr) };
+            // Nested or late messages must never observe a pointer after state
+            // teardown begins.
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
             if !state.skip_close_confirm {
                 for tab in &mut state.tabs {
                     for pane in tab.panes.values_mut() {
@@ -5704,7 +6198,6 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 }
             }
             drop(state);
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -5964,6 +6457,153 @@ fn reusable_template_location(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transfer_prompt_envelope(
+        hwnd: usize,
+        source_id: u64,
+        session_id: &str,
+    ) -> (
+        TtyFileTransferPromptEnvelope,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
+        let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+        (
+            TtyFileTransferPromptEnvelope {
+                hwnd,
+                source_id,
+                daemon_session_id: session_id.to_string(),
+                daemon_hostname: "host".to_string(),
+                event: cterm_proto::proto::TtyFileTransferApprovalEvent {
+                    request_id: 1,
+                    transfer_id: "transfer".to_string(),
+                    direction: cterm_proto::proto::TtyFileTransferDirection::Send as i32,
+                    paths: Vec::new(),
+                    expires_in_ms: 60_000,
+                    max_files: 8,
+                    max_file_bytes: 1024,
+                    max_session_bytes: 4096,
+                },
+                expires_at: Instant::now() + Duration::from_secs(60),
+                decision_tx,
+            },
+            decision_rx,
+        )
+    }
+
+    #[test]
+    fn tty_transfer_route_requires_exact_source_and_daemon_session() {
+        assert!(tty_file_transfer_prompt_identity_matches(
+            41,
+            "session-a",
+            41,
+            Some("session-a")
+        ));
+        assert!(!tty_file_transfer_prompt_identity_matches(
+            41,
+            "session-a",
+            42,
+            Some("session-a")
+        ));
+        assert!(!tty_file_transfer_prompt_identity_matches(
+            41,
+            "session-a",
+            41,
+            Some("session-b")
+        ));
+        assert!(!tty_file_transfer_prompt_identity_matches(
+            41,
+            "session-a",
+            41,
+            None
+        ));
+        assert!(!tty_file_transfer_prompt_identity_matches(
+            41,
+            "",
+            41,
+            Some("")
+        ));
+    }
+
+    #[test]
+    fn tty_transfer_registry_ignores_foreign_tokens_and_fails_closed_on_cancel() {
+        let registry = TtyFileTransferPromptRegistry::new(1);
+        let (envelope, mut decision_rx) = transfer_prompt_envelope(100, 41, "session-a");
+        let token = registry.insert(envelope).unwrap();
+
+        assert!(registry.begin(200, token).is_none());
+        registry.cancel_source(100, 41, "session-b");
+        assert!(matches!(
+            decision_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        registry.cancel_source(100, 41, "session-a");
+        assert_eq!(decision_rx.try_recv(), Ok(false));
+    }
+
+    #[test]
+    fn tty_transfer_registry_is_bounded_and_denies_overflow() {
+        let registry = TtyFileTransferPromptRegistry::new(1);
+        let (first, mut first_rx) = transfer_prompt_envelope(100, 41, "session-a");
+        let (overflow, mut overflow_rx) = transfer_prompt_envelope(100, 42, "session-b");
+
+        assert!(registry.insert(first).is_some());
+        assert!(registry.insert(overflow).is_none());
+        assert_eq!(overflow_rx.try_recv(), Ok(false));
+        registry.cancel_window(100);
+        assert_eq!(first_rx.try_recv(), Ok(false));
+    }
+
+    #[test]
+    fn tty_transfer_active_prompt_expiry_cancels_and_releases_capacity() {
+        let registry = TtyFileTransferPromptRegistry::new(1);
+        let (envelope, mut decision_rx) = transfer_prompt_envelope(100, 41, "session-a");
+        let token = registry.insert(envelope).unwrap();
+        let (active, cancelled) = registry.begin(100, token).unwrap();
+        let (overflow, mut overflow_rx) = transfer_prompt_envelope(100, 42, "session-b");
+        assert!(registry.insert(overflow).is_none());
+        assert_eq!(overflow_rx.try_recv(), Ok(false));
+
+        registry.dialog_created(token, 12345);
+        registry.cancel_token(100, token);
+        assert!(cancelled.load(Ordering::Acquire));
+        registry.dialog_destroyed(token, 12345);
+        registry.finish(100, token);
+        let _ = active.decision_tx.send(false);
+        assert_eq!(decision_rx.try_recv(), Ok(false));
+
+        let (next, _) = transfer_prompt_envelope(100, 42, "session-b");
+        assert!(registry.insert(next).is_some());
+    }
+
+    #[test]
+    fn tty_transfer_active_prompt_requires_exact_cancel_identity() {
+        let registry = TtyFileTransferPromptRegistry::new(2);
+        let (envelope, _) = transfer_prompt_envelope(100, 41, "session-a");
+        let token = registry.insert(envelope).unwrap();
+        let (_active, cancelled) = registry.begin(100, token).unwrap();
+
+        registry.cancel_source(100, 41, "session-b");
+        assert!(!cancelled.load(Ordering::Acquire));
+        registry.cancel_source(100, 42, "session-a");
+        assert!(!cancelled.load(Ordering::Acquire));
+        registry.cancel_source(100, 41, "session-a");
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn tty_transfer_window_teardown_cancels_pending_and_active_prompts() {
+        let registry = TtyFileTransferPromptRegistry::new(2);
+        let (active_envelope, _) = transfer_prompt_envelope(100, 41, "session-a");
+        let active_token = registry.insert(active_envelope).unwrap();
+        let (_active, cancelled) = registry.begin(100, active_token).unwrap();
+        let (pending, mut pending_rx) = transfer_prompt_envelope(100, 42, "session-b");
+        assert!(registry.insert(pending).is_some());
+
+        registry.cancel_window(100);
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(pending_rx.try_recv(), Ok(false));
+    }
 
     #[test]
     fn native_cursor_config_initializes_protocol_defaults() {

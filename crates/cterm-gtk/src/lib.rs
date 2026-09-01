@@ -19,6 +19,7 @@ mod ssh_prompt;
 mod tab_bar;
 mod tab_templates_dialog;
 mod terminal_widget;
+mod tty_file_transfer_prompt;
 mod update_dialog;
 mod upgrade_receiver;
 mod window;

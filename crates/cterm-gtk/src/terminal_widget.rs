@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1775,6 +1776,7 @@ impl TerminalWidget {
         release_snapshot_attachment: bool,
     ) {
         let drawing_area = self.drawing_area.clone();
+        let prompt_owner: glib::SendWeakRef<DrawingArea> = self.drawing_area.downgrade().into();
 
         let (tx, rx) = std::sync::mpsc::channel::<PtyMessage>();
 
@@ -1979,11 +1981,31 @@ impl TerminalWidget {
                 let tx_events = tx.clone();
                 let event_session = session.clone();
                 let exit_notify_event = Arc::clone(&exit_notify);
-                tokio::spawn(async move {
+                let prompt_active = Arc::new(AtomicBool::new(true));
+                let prompt_active_event = Arc::clone(&prompt_active);
+                let daemon_hostname = event_session.hostname().to_string();
+                let (event_cancel_tx, mut event_cancel_rx) = tokio::sync::watch::channel(false);
+                let prompt_gate = Arc::new(tokio::sync::Semaphore::new(1));
+                let mut event_task = tokio::spawn(async move {
+                    let mut file_transfer_prompts = tokio::task::JoinSet::new();
                     match event_session.stream_events().await {
                         Ok(mut stream) => {
                             use tokio_stream::StreamExt;
-                            while let Some(result) = stream.next().await {
+                            loop {
+                                while let Some(result) = file_transfer_prompts.try_join_next() {
+                                    if let Err(error) = result {
+                                        log::warn!("OSC 5113 consent task failed: {error}");
+                                    }
+                                }
+                                let result = tokio::select! {
+                                    biased;
+                                    changed = event_cancel_rx.changed() => {
+                                        let _ = changed;
+                                        break;
+                                    }
+                                    result = stream.next() => result,
+                                };
+                                let Some(result) = result else { break };
                                 if let Ok(event) = result {
                                     match event.event {
                                         Some(cterm_proto::proto::terminal_event::Event::ProcessExited(_)) => {
@@ -2008,6 +2030,49 @@ impl TerminalWidget {
                                                 .respond_prompt(&prompt.prompt_id, accept, secret)
                                                 .await;
                                         }
+                                        Some(cterm_proto::proto::terminal_event::Event::TtyFileTransferApproval(prompt)) => {
+                                            let request_id = prompt.request_id;
+                                            let hostname = daemon_hostname.clone();
+                                            let active = Arc::clone(&prompt_active_event);
+                                            let owner = prompt_owner.clone();
+                                            let cancel = event_cancel_rx.clone();
+                                            let gate = Arc::clone(&prompt_gate);
+                                            let prompt_session = event_session.clone();
+                                            let expires_at = tokio::time::Instant::now()
+                                                .checked_add(Duration::from_millis(prompt.expires_in_ms));
+                                            file_transfer_prompts.spawn(async move {
+                                                let approve = match expires_at {
+                                                    Some(expires_at) => crate::tty_file_transfer_prompt::resolve_tty_file_transfer_prompt(
+                                                        prompt,
+                                                        hostname,
+                                                        owner,
+                                                        active,
+                                                        cancel,
+                                                        gate,
+                                                        expires_at,
+                                                    ).await,
+                                                    None => false,
+                                                };
+                                                match tokio::time::timeout(
+                                                    Duration::from_secs(2),
+                                                    prompt_session.respond_tty_file_transfer_approval(
+                                                        request_id,
+                                                        approve,
+                                                    ),
+                                                ).await {
+                                                    Ok(Ok(true)) => {}
+                                                    Ok(Ok(false)) => log::debug!(
+                                                        "OSC 5113 approval {request_id} was already resolved",
+                                                    ),
+                                                    Ok(Err(error)) => log::warn!(
+                                                        "Failed to answer OSC 5113 approval {request_id}: {error}",
+                                                    ),
+                                                    Err(_) => log::warn!(
+                                                        "Timed out answering OSC 5113 approval {request_id}",
+                                                    ),
+                                                }
+                                            });
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -2015,6 +2080,12 @@ impl TerminalWidget {
                         }
                         Err(e) => {
                             log::warn!("Failed to start daemon event stream: {}", e);
+                        }
+                    }
+                    prompt_active_event.store(false, Ordering::Release);
+                    while let Some(result) = file_transfer_prompts.join_next().await {
+                        if let Err(error) = result {
+                            log::warn!("OSC 5113 consent task failed: {error}");
                         }
                     }
                 });
@@ -2047,6 +2118,14 @@ impl TerminalWidget {
                             }
                         }
                     } => {}
+                }
+                prompt_active.store(false, Ordering::Release);
+                let _ = event_cancel_tx.send(true);
+                if tokio::time::timeout(Duration::from_secs(1), &mut event_task)
+                    .await
+                    .is_err()
+                {
+                    event_task.abort();
                 }
                 let _ = tx.send(PtyMessage::Exited);
             });

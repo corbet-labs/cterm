@@ -510,17 +510,21 @@ requests are not yet implemented and are never advertised as available.
 Kitty OSC 5113 commands pass through a bounded shared codec and an exact-token
 authorization state machine before any filesystem access is possible. The
 approved remote-to-local regular-file executor uses explicit file/session
-limits, strict bounded single-member zlib decompression, private handle-relative
-same-filesystem staging, metadata preservation, best-effort cancellation
-cleanup, and per-file atomic commit at session finish. Retained source and
+limits with cumulative decompressed-byte accounting, strict bounded
+single-member zlib decompression, private handle-relative same-filesystem
+staging, metadata preservation, deterministic lifecycle cleanup, and per-file
+atomic commit at session finish. Missing destination directories are created
+component by component through retained handles. Retained source and
 destination-directory handles prevent namespace replacement after staging
 begins from redirecting the payload or its commit. On Unix, unsafe shared
 destination directories that are group/world-writable without the sticky bit
 are rejected; Windows staging directories use a protected owner-only DACL and
 retain the payload with read/write sharing disabled until its atomic commit.
-Native consent dialogs and
-event-loop integration, receive sessions, directory/link trees, rsync/XXH3,
-and authorization bypass remain open and are tracked in the
+GTK/Wayland, Cocoa, and Win32 surface daemon-owned, deny-by-default native
+consent dialogs with exact token, expiry, pane/session cancellation, and
+reconnect replay semantics; the daemon refuses relaunch while any transfer
+actor is pending, queued, staged, or draining. Receive sessions, directory/link
+trees, rsync/XXH3, and authorization bypass remain open and are tracked in the
 [parity inventory](docs/parity.md); cterm does not advertise the protocol as
 complete yet.
 

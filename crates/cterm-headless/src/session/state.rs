@@ -2,16 +2,19 @@
 
 use crate::bridge::{PtyReader, PtyWriter};
 use crate::error::Result;
+use cterm_app::{TtyTransferApprovalRequest, TtyTransferDirection};
 use cterm_core::screen::ScreenConfig;
 use cterm_core::term::TerminalEvent;
 #[cfg(unix)]
 use cterm_core::Pty;
-use cterm_core::{PtyConfig, PtySize, Terminal};
+use cterm_core::{FileTransferAction, FileTransferCommand, PtyConfig, PtySize, Terminal};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
+
+use super::tty_transfer::TtyTransferController;
 
 /// Output chunk with timestamp
 #[derive(Clone, Debug)]
@@ -27,6 +30,29 @@ pub struct PromptReply {
     pub accept: bool,
     /// For password/passphrase prompts: the entered secret (None = cancelled).
     pub secret: Option<String>,
+}
+
+#[derive(Clone)]
+struct TtyTransferPrompt {
+    event: crate::proto::TtyFileTransferApprovalEvent,
+    expires_at: tokio::time::Instant,
+}
+
+impl TtyTransferPrompt {
+    fn event_with_remaining_time(
+        &self,
+        now: tokio::time::Instant,
+    ) -> Option<crate::proto::TtyFileTransferApprovalEvent> {
+        let remaining = self.expires_at.checked_duration_since(now)?;
+        if remaining.is_zero() {
+            return None;
+        }
+        let mut event = self.event.clone();
+        event.expires_in_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        Some(event)
+    }
 }
 
 /// Session state wrapping a Terminal instance
@@ -74,6 +100,19 @@ pub struct SessionState {
 
     /// Monotonic counter for generating prompt ids.
     prompt_counter: AtomicU64,
+
+    /// Per-session OSC 5113 authorization/filesystem actor. `None` records a
+    /// fail-closed initialization failure.
+    tty_transfer: OnceLock<Option<TtyTransferController>>,
+
+    /// Whether new transfer commands may enter the non-serializable actor.
+    tty_transfer_accepting: AtomicBool,
+
+    /// Live OSC 5113 approval events for attached native clients.
+    tty_transfer_prompt_tx: broadcast::Sender<crate::proto::TtyFileTransferApprovalEvent>,
+
+    /// Current bounded approval set, replayed to reconnecting subscribers.
+    tty_transfer_prompt_registry: parking_lot::Mutex<HashMap<u64, TtyTransferPrompt>>,
 
     /// Dedicated off-thread writer for the PTY master. All input and parser responses
     /// are routed here so blocking PTY writes never stall a tokio worker thread or run
@@ -157,6 +196,10 @@ impl SessionState {
             prompt_tx: broadcast::channel(16).0,
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
+            tty_transfer: OnceLock::new(),
+            tty_transfer_accepting: AtomicBool::new(true),
+            tty_transfer_prompt_tx: broadcast::channel(32).0,
+            tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             pty_writer: OnceLock::new(),
             sync_update_active: AtomicBool::new(false),
         });
@@ -198,6 +241,10 @@ impl SessionState {
             prompt_tx,
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
+            tty_transfer: OnceLock::new(),
+            tty_transfer_accepting: AtomicBool::new(true),
+            tty_transfer_prompt_tx: broadcast::channel(32).0,
+            tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             pty_writer: OnceLock::new(),
             sync_update_active: AtomicBool::new(false),
         })
@@ -240,7 +287,9 @@ impl SessionState {
                 }
                 Ok(Err(e)) => {
                     log::warn!("SSH connect failed for {}: {}", state.id, e);
-                    state.process_output(format!("\r\nSSH connection failed: {e}\r\n").as_bytes());
+                    state
+                        .process_output(format!("\r\nSSH connection failed: {e}\r\n").as_bytes())
+                        .await;
                     state.broadcast_event(TerminalEvent::ProcessExited(1));
                 }
                 Err(e) => {
@@ -283,6 +332,106 @@ impl SessionState {
         } else {
             false
         }
+    }
+
+    /// Subscribe to current and future OSC 5113 consent requests.
+    ///
+    /// The live receiver is created while the registry is locked, then the
+    /// bounded snapshot is copied. A request therefore appears in at least one
+    /// side of the returned pair, never neither.
+    pub fn subscribe_tty_transfer_prompts(
+        &self,
+    ) -> (
+        Vec<crate::proto::TtyFileTransferApprovalEvent>,
+        broadcast::Receiver<crate::proto::TtyFileTransferApprovalEvent>,
+    ) {
+        let registry = self.tty_transfer_prompt_registry.lock();
+        let rx = self.tty_transfer_prompt_tx.subscribe();
+        let now = tokio::time::Instant::now();
+        let mut snapshot: Vec<_> = registry
+            .values()
+            .filter_map(|prompt| prompt.event_with_remaining_time(now))
+            .collect();
+        snapshot.sort_by_key(|event| event.request_id);
+        (snapshot, rx)
+    }
+
+    /// Deliver an approval decision to the actor that owns the exact pending
+    /// token. Queue admission alone is not reported as authorization success.
+    pub async fn respond_tty_transfer_approval(&self, request_id: u64, approve: bool) -> bool {
+        if !self
+            .tty_transfer_prompt_registry
+            .lock()
+            .contains_key(&request_id)
+        {
+            return false;
+        }
+        let Some(controller) = self.tty_transfer.get().and_then(Option::as_ref) else {
+            return false;
+        };
+        controller.respond(request_id, approve).await
+    }
+
+    /// Abort all OSC 5113 work and wait until filesystem staging has been
+    /// discarded. Idempotent when the per-session executor never started.
+    pub async fn shutdown_tty_transfers(&self) {
+        if let Some(controller) = self.tty_transfer.get().and_then(Option::as_ref) {
+            controller.shutdown().await;
+        }
+        self.tty_transfer_prompt_registry.lock().clear();
+    }
+
+    pub fn quiesce_tty_transfers(&self) {
+        self.tty_transfer_accepting.store(false, Ordering::SeqCst);
+        if let Some(controller) = self.tty_transfer.get().and_then(Option::as_ref) {
+            controller.quiesce();
+        }
+    }
+
+    pub fn resume_tty_transfers(&self) {
+        self.tty_transfer_accepting.store(true, Ordering::SeqCst);
+        if let Some(controller) = self.tty_transfer.get().and_then(Option::as_ref) {
+            controller.resume();
+        }
+    }
+
+    pub fn has_active_tty_transfers(&self) -> bool {
+        self.tty_transfer
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(TtyTransferController::has_work)
+    }
+
+    pub(super) fn register_tty_transfer_prompt(
+        &self,
+        request: TtyTransferApprovalRequest,
+        expires_at: tokio::time::Instant,
+    ) {
+        let direction = match request.direction {
+            TtyTransferDirection::Send => crate::proto::TtyFileTransferDirection::Send,
+            TtyTransferDirection::Receive => crate::proto::TtyFileTransferDirection::Receive,
+        };
+        let event = crate::proto::TtyFileTransferApprovalEvent {
+            request_id: request.request_id,
+            transfer_id: request.session_id,
+            direction: direction as i32,
+            paths: request.paths,
+            expires_in_ms: 0,
+            max_files: super::tty_transfer::DEFAULT_MAX_FILES_PER_SESSION as u32,
+            max_file_bytes: super::tty_transfer::DEFAULT_MAX_FILE_BYTES,
+            max_session_bytes: super::tty_transfer::DEFAULT_MAX_SESSION_BYTES,
+        };
+        let prompt = TtyTransferPrompt { event, expires_at };
+        let mut registry = self.tty_transfer_prompt_registry.lock();
+        let Some(event) = prompt.event_with_remaining_time(tokio::time::Instant::now()) else {
+            return;
+        };
+        registry.insert(event.request_id, prompt);
+        let _ = self.tty_transfer_prompt_tx.send(event);
+    }
+
+    pub(super) fn clear_tty_transfer_prompt(&self, request_id: u64) {
+        self.tty_transfer_prompt_registry.lock().remove(&request_id);
     }
 
     fn next_prompt_id(&self) -> String {
@@ -389,6 +538,10 @@ impl SessionState {
             prompt_tx: broadcast::channel(16).0,
             prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             prompt_counter: AtomicU64::new(0),
+            tty_transfer: OnceLock::new(),
+            tty_transfer_accepting: AtomicBool::new(true),
+            tty_transfer_prompt_tx: broadcast::channel(32).0,
+            tty_transfer_prompt_registry: parking_lot::Mutex::new(HashMap::new()),
             pty_writer: OnceLock::new(),
             sync_update_active: AtomicBool::new(false),
         });
@@ -401,6 +554,18 @@ impl SessionState {
         let pty_reader = self.terminal.read().pty_reader();
 
         if let Some(reader) = pty_reader {
+            self.tty_transfer
+                .get_or_init(|| match TtyTransferController::spawn(self) {
+                    Ok(controller) if !self.tty_transfer_accepting.load(Ordering::SeqCst) => {
+                        controller.quiesce();
+                        Some(controller)
+                    }
+                    Ok(controller) => Some(controller),
+                    Err(error) => {
+                        log::error!("OSC 5113 is unavailable for session {}: {error}", self.id);
+                        None
+                    }
+                });
             // Now that a PTY exists, spin up the dedicated writer thread (owns its own
             // dup'd master fd). Idempotent: a no-op if already initialized.
             if let Some(file) = self.terminal.read().pty_writer() {
@@ -617,20 +782,74 @@ impl SessionState {
     /// parser-generated responses (DSR/DA/cursor reports) to the PTY writer thread.
     /// This guarantees the terminal lock is never held across a (potentially blocking)
     /// PTY write — the root cause of the daemon deadlock this avoids.
-    pub fn process_output(&self, data: &[u8]) -> Vec<TerminalEvent> {
-        let (events, responses) = {
+    pub async fn process_output(&self, data: &[u8]) -> Vec<TerminalEvent> {
+        let (events, responses, commands) = {
             let mut term = self.terminal.write();
-            let (events, responses) = term.process_collecting(data);
+            let (events, responses, commands) = term.process_collecting_with_file_transfers(data);
             self.sync_update_active.store(
                 term.synchronized_update_deadline().is_some(),
                 Ordering::Relaxed,
             );
-            (events, responses)
+            (events, responses, commands)
         }; // terminal lock released here
 
         self.send_terminal_responses(responses);
 
+        for command in commands {
+            if !self.tty_transfer_accepting.load(Ordering::SeqCst) {
+                self.send_tty_transfer_error(&command, "EBUSY:Daemon relaunch in progress");
+                continue;
+            }
+            let Some(controller) = self.tty_transfer.get().and_then(Option::as_ref) else {
+                self.send_tty_transfer_error(
+                    &command,
+                    "ENOTSUP:Local transfer executor is unavailable",
+                );
+                continue;
+            };
+            if let Err(command) = controller.submit(command).await {
+                self.send_tty_transfer_error(&command, "EIO:Local transfer executor stopped");
+            }
+        }
+
         events
+    }
+
+    fn send_tty_transfer_error(&self, command: &FileTransferCommand, status: &str) {
+        if command.quiet >= 2 {
+            return;
+        }
+        let response = FileTransferCommand {
+            action: FileTransferAction::Status,
+            id: command.id.clone(),
+            file_id: command.file_id.clone(),
+            bypass: None,
+            quiet: 0,
+            mtime: None,
+            permissions: None,
+            size: None,
+            name: None,
+            status: Some(status.to_string()),
+            parent: None,
+            data: Vec::new(),
+            compression: None,
+            file_type: None,
+            transmission_type: None,
+        };
+        if let Ok(bytes) = response.encode() {
+            self.send_tty_transfer_response(&bytes);
+        }
+    }
+
+    pub(super) fn send_tty_transfer_response(&self, response: &[u8]) {
+        match self.pty_writer.get() {
+            Some(writer) => writer.send(response),
+            None => {
+                if let Err(error) = self.terminal.write().write(response) {
+                    log::error!("Failed to send OSC 5113 response to PTY: {error}");
+                }
+            }
+        }
     }
 
     fn send_terminal_responses(&self, responses: Vec<Vec<u8>>) {
@@ -726,5 +945,50 @@ mod tests {
             session.with_terminal_mut(|terminal| terminal.process_collecting(b"\x1bP$q q\x1b\\"));
 
         assert_eq!(responses, vec![b"\x1bP1$r6 q\x1b\\".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn transfer_prompt_is_replayed_and_exactly_one_decision_succeeds() {
+        let session = SessionState::new_ssh_connecting(
+            "tty-transfer-consent".to_string(),
+            PtySize::default(),
+            0,
+        );
+        let controller = TtyTransferController::spawn(&session).unwrap();
+        assert!(session.tty_transfer.set(Some(controller)).is_ok());
+        let (_, mut live) = session.subscribe_tty_transfer_prompts();
+
+        session
+            .process_output(b"\x1b]5113;ac=send;id=consent-test\x1b\\")
+            .await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), live.recv())
+            .await
+            .expect("approval event timed out")
+            .expect("approval channel closed");
+        assert_eq!(event.transfer_id, "consent-test");
+        assert_eq!(
+            event.direction,
+            crate::proto::TtyFileTransferDirection::Send as i32
+        );
+        assert!((1..=60_000).contains(&event.expires_in_ms));
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (snapshot, _) = session.subscribe_tty_transfer_prompts();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].request_id, event.request_id);
+        assert_eq!(snapshot[0].transfer_id, event.transfer_id);
+        assert!(snapshot[0].expires_in_ms < event.expires_in_ms);
+        assert!(
+            session
+                .respond_tty_transfer_approval(event.request_id, false)
+                .await
+        );
+        assert!(
+            !session
+                .respond_tty_transfer_approval(event.request_id, true)
+                .await
+        );
+        assert!(session.subscribe_tty_transfer_prompts().0.is_empty());
+        session.shutdown_tty_transfers().await;
     }
 }

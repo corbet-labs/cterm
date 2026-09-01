@@ -26,6 +26,7 @@ pub mod ssh_prompt;
 pub mod tab_bar;
 pub mod templates_dialog;
 pub mod terminal_canvas;
+mod tty_file_transfer_prompt;
 pub mod update_dialog;
 pub mod upgrade_receiver;
 pub mod window;
