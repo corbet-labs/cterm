@@ -259,7 +259,7 @@ fn format_byte_count(bytes: u64) -> String {
 
     for (unit_bytes, suffix) in [(TIB, "TiB"), (GIB, "GiB"), (MIB, "MiB"), (KIB, "KiB")] {
         if bytes >= unit_bytes {
-            if bytes % unit_bytes == 0 {
+            if bytes.is_multiple_of(unit_bytes) {
                 return format!("{} {suffix}", bytes / unit_bytes);
             }
             return format!("{:.1} {suffix}", bytes as f64 / unit_bytes as f64);
@@ -272,7 +272,7 @@ fn format_expiry(milliseconds: u64) -> String {
     if milliseconds < 1_000 {
         return format!("{milliseconds} ms");
     }
-    if milliseconds % 1_000 == 0 {
+    if milliseconds.is_multiple_of(1_000) {
         let seconds = milliseconds / 1_000;
         return format!(
             "{seconds} {}",

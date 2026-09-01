@@ -77,21 +77,21 @@ impl TtyTransferController {
     pub(super) async fn submit(
         &self,
         command: FileTransferCommand,
-    ) -> Result<(), FileTransferCommand> {
+    ) -> Result<(), Box<FileTransferCommand>> {
         if !self.accepting.load(Ordering::SeqCst) {
-            return Err(command);
+            return Err(Box::new(command));
         }
         self.queued.fetch_add(1, Ordering::SeqCst);
         if !self.accepting.load(Ordering::SeqCst) {
             self.queued.fetch_sub(1, Ordering::SeqCst);
-            return Err(command);
+            return Err(Box::new(command));
         }
         let result = self
             .tx
             .send(WorkerMessage::Protocol(command))
             .await
             .map_err(|error| match error.0 {
-                WorkerMessage::Protocol(command) => command,
+                WorkerMessage::Protocol(command) => Box::new(command),
                 WorkerMessage::Approval { .. } => {
                     unreachable!("submit only sends protocol messages")
                 }

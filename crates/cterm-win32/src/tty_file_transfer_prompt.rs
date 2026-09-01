@@ -193,7 +193,7 @@ unsafe extern "system" fn dialog_proc(
                 IDYES => EndDialog(hwnd, IDYES as isize),
                 IDNO | IDCANCEL => EndDialog(hwnd, IDNO as isize),
                 _ => return 0,
-            }
+            };
             1
         }
         WM_CLOSE | WM_TTY_FILE_TRANSFER_DIALOG_CANCEL => {

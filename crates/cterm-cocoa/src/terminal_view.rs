@@ -204,6 +204,17 @@ enum DaemonCommand {
     SetFrontendState(cterm_core::FrontendState),
 }
 
+struct DaemonReaderContext {
+    session_id: String,
+    terminal: Arc<Mutex<Terminal>>,
+    state: Arc<ViewState>,
+    view_ptr: usize,
+    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
+    daemon_socket: Option<std::path::PathBuf>,
+    base_palette: cterm_core::ColorPalette,
+    frontend_state: cterm_core::FrontendState,
+}
+
 #[derive(Clone, Default)]
 struct PaneSessionContext {
     /// Remote daemons safely select their own defaults when an older upgrade
@@ -1829,16 +1840,16 @@ impl TerminalView {
             ..Default::default()
         };
         std::thread::spawn(move || {
-            Self::read_daemon_loop(
-                sid,
+            Self::read_daemon_loop(DaemonReaderContext {
+                session_id: sid,
                 terminal,
-                state_clone,
+                state: state_clone,
                 view_ptr,
                 cmd_rx,
                 daemon_socket,
                 base_palette,
                 frontend_state,
-            );
+            });
         });
 
         this.schedule_redraw_check(view_ptr, state);
@@ -1934,16 +1945,16 @@ impl TerminalView {
             ..Default::default()
         };
         std::thread::spawn(move || {
-            Self::read_daemon_loop(
-                sid,
+            Self::read_daemon_loop(DaemonReaderContext {
+                session_id: sid,
                 terminal,
-                state_clone,
+                state: state_clone,
                 view_ptr,
                 cmd_rx,
                 daemon_socket,
                 base_palette,
                 frontend_state,
-            );
+            });
         });
 
         this.schedule_redraw_check(view_ptr, state);
@@ -1962,16 +1973,17 @@ impl TerminalView {
     /// `daemon_socket` specifies which socket to connect to. For remote (SSH-tunneled)
     /// sessions this is the local forwarded socket; for local sessions it's None
     /// (which falls back to `connect_local()`).
-    fn read_daemon_loop(
-        session_id: String,
-        terminal: Arc<Mutex<Terminal>>,
-        state: Arc<ViewState>,
-        view_ptr: usize,
-        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DaemonCommand>,
-        daemon_socket: Option<std::path::PathBuf>,
-        base_palette: cterm_core::ColorPalette,
-        frontend_state: cterm_core::FrontendState,
-    ) {
+    fn read_daemon_loop(context: DaemonReaderContext) {
+        let DaemonReaderContext {
+            session_id,
+            terminal,
+            state,
+            view_ptr,
+            cmd_rx,
+            daemon_socket,
+            base_palette,
+            frontend_state,
+        } = context;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
