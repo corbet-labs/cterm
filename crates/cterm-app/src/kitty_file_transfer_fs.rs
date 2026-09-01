@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cterm_core::{
     FileTransferAction, FileTransferCommand, FileTransferCompression, FileTransferType,
-    FileTransmissionType, MAX_FILE_TRANSFER_PATH_BYTES,
+    FileTransmissionType, MAX_FILE_TRANSFER_CHUNK_BYTES, MAX_FILE_TRANSFER_PATH_BYTES,
 };
 use filetime::{set_file_handle_times, FileTime};
 use flate2::{Decompress, FlushDecompress, Status};
@@ -26,6 +26,7 @@ use crate::kitty_file_transfer::{
     AuthorizedTtyTransferCommand, TtyTransferAction, TtyTransferDirection,
 };
 use crate::kitty_file_transfer_receive::TtyTransferReceiveFilesystem;
+use crate::kitty_rsync::{write_signature, DeltaPatcher, Signature};
 
 /// Explicit resource policy for transfers accepted by the local frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +226,7 @@ impl TtyTransferSendFilesystem {
         }
         if !matches!(
             command.transmission_type,
-            None | Some(FileTransmissionType::Simple)
+            None | Some(FileTransmissionType::Simple | FileTransmissionType::Rsync)
         ) {
             session.rejected.insert(file_id);
             return response(
@@ -238,6 +239,18 @@ impl TtyTransferSendFilesystem {
         }
 
         let file_type = command.file_type.unwrap_or(FileTransferType::Regular);
+        if command.transmission_type == Some(FileTransmissionType::Rsync)
+            && file_type != FileTransferType::Regular
+        {
+            session.rejected.insert(file_id);
+            return response(
+                &command,
+                "EINVAL:Rsync transmission is valid only for regular files",
+                quiet,
+                true,
+                None,
+            );
+        }
         if file_type != FileTransferType::Regular
             && !matches!(
                 command.compression,
@@ -362,12 +375,35 @@ impl TtyTransferSendFilesystem {
                 .max_file_bytes
                 .min(self.limits.max_session_bytes - session.reserved_bytes)
         });
-        let limited = LimitedTempFile::new(temporary, output_limit);
-        let writer = match command.compression {
-            Some(FileTransferCompression::Zlib) => {
-                StagedWriter::Zlib(StrictZlibDecoder::new(limited))
-            }
-            None | Some(FileTransferCompression::None) => StagedWriter::Plain(limited),
+        let requested_rsync = command.transmission_type == Some(FileTransmissionType::Rsync);
+        let rsync = requested_rsync
+            .then(|| prepare_rsync_base(&temporary, self.limits.max_file_bytes))
+            .transpose()
+            .ok()
+            .flatten();
+        let (writer, signature) = if let Some((base, base_size, signature)) = rsync {
+            let parsed_signature = Signature::parse(&signature, signature.len())
+                .expect("a locally generated rsync signature is valid");
+            let block_size = parsed_signature.block_size();
+            let limited = LimitedTempFile::new(temporary, output_limit);
+            let patcher = DeltaPatcher::new(base, limited, base_size, block_size, output_limit)
+                .expect("a locally generated rsync block size is valid");
+            let writer = match command.compression {
+                Some(FileTransferCompression::Zlib) => {
+                    StagedWriter::ZlibRsync(StrictZlibDecoder::new(patcher))
+                }
+                None | Some(FileTransferCompression::None) => StagedWriter::Rsync(patcher),
+            };
+            (writer, Some((signature, base_size)))
+        } else {
+            let limited = LimitedTempFile::new(temporary, output_limit);
+            let writer = match command.compression {
+                Some(FileTransferCompression::Zlib) => {
+                    StagedWriter::Zlib(StrictZlibDecoder::new(limited))
+                }
+                None | Some(FileTransferCompression::None) => StagedWriter::Plain(limited),
+            };
+            (writer, None)
         };
         session.reserved_bytes += reservation;
         session.files.insert(
@@ -383,7 +419,11 @@ impl TtyTransferSendFilesystem {
                 reservation,
             },
         );
-        response(&command, "STARTED", quiet, false, None)
+        if let Some((signature, base_size)) = signature {
+            rsync_started_response(&command, base_size, &signature)
+        } else {
+            response(&command, "STARTED", quiet, false, None)
+        }
     }
 
     fn write_file_data(
@@ -907,6 +947,7 @@ impl StagedLink {
                     )
                 })?;
                 create_hard_link_at(
+                    source.as_file(),
                     &source.source_directory,
                     &source.temporary_name,
                     &self.scaffold.source_directory,
@@ -1110,6 +1151,8 @@ struct StagedFile {
 enum StagedWriter {
     Plain(LimitedTempFile),
     Zlib(StrictZlibDecoder<LimitedTempFile>),
+    Rsync(DeltaPatcher<fs::File, LimitedTempFile>),
+    ZlibRsync(StrictZlibDecoder<DeltaPatcher<fs::File, LimitedTempFile>>),
 }
 
 impl StagedWriter {
@@ -1117,6 +1160,8 @@ impl StagedWriter {
         match self {
             Self::Plain(file) => file.bytes_written,
             Self::Zlib(decoder) => decoder.get_ref().bytes_written,
+            Self::Rsync(patcher) => patcher.bytes_written(),
+            Self::ZlibRsync(decoder) => decoder.get_ref().bytes_written(),
         }
     }
 
@@ -1127,6 +1172,8 @@ impl StagedWriter {
                 Ok(file)
             }
             Self::Zlib(decoder) => decoder.finish(),
+            Self::Rsync(patcher) => patcher.finish(),
+            Self::ZlibRsync(decoder) => decoder.finish()?.finish(),
         }
     }
 
@@ -1134,6 +1181,8 @@ impl StagedWriter {
         match self {
             Self::Plain(file) => file.limit = limit,
             Self::Zlib(decoder) => decoder.inner.limit = limit,
+            Self::Rsync(patcher) => patcher.set_output_limit(limit),
+            Self::ZlibRsync(decoder) => decoder.inner.set_output_limit(limit),
         }
     }
 }
@@ -1143,6 +1192,8 @@ impl Write for StagedWriter {
         match self {
             Self::Plain(file) => file.write(buffer),
             Self::Zlib(decoder) => decoder.write(buffer),
+            Self::Rsync(patcher) => patcher.write(buffer),
+            Self::ZlibRsync(decoder) => decoder.write(buffer),
         }
     }
 
@@ -1150,6 +1201,8 @@ impl Write for StagedWriter {
         match self {
             Self::Plain(file) => file.flush(),
             Self::Zlib(decoder) => decoder.flush(),
+            Self::Rsync(patcher) => patcher.flush(),
+            Self::ZlibRsync(decoder) => decoder.flush(),
         }
     }
 }
@@ -1939,7 +1992,9 @@ fn remove_created_directory(
     Ok(())
 }
 
+#[cfg(unix)]
 fn create_hard_link_at(
+    _source_file: &fs::File,
     source_directory: &fs::File,
     source_name: &OsStr,
     destination_directory: &fs::File,
@@ -1948,6 +2003,97 @@ fn create_hard_link_at(
     let source_directory = cap_std::fs::Dir::reopen_dir(source_directory)?;
     let destination_directory = cap_std::fs::Dir::reopen_dir(destination_directory)?;
     source_directory.hard_link(source_name, &destination_directory, destination_name)
+}
+
+#[cfg(windows)]
+fn create_hard_link_at(
+    source_file: &fs::File,
+    _source_directory: &fs::File,
+    _source_name: &OsStr,
+    destination_directory: &fs::File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    use std::mem;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FileLinkInformation, NtSetInformationFile, FILE_LINK_INFORMATION,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let name: Vec<u16> = destination_name.encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hardlink destination name is empty or contains NUL",
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(mem::size_of::<u16>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hardlink name is too long"))?;
+    let buffer_bytes = mem::size_of::<FILE_LINK_INFORMATION>()
+        .checked_add(name_bytes as usize - mem::size_of::<u16>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hardlink name is too long"))?;
+    let buffer_length = u32::try_from(buffer_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "hardlink name is too long"))?;
+    let words = buffer_bytes.div_ceil(mem::size_of::<usize>());
+    let mut storage = vec![0usize; words];
+    let information = storage.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
+
+    // FILE_LINK_INFORMATION ends in a flexible UTF-16 array. Keeping the
+    // allocation usize-aligned satisfies the API's four-byte alignment rule.
+    // The retained destination-directory handle makes name resolution immune
+    // to concurrent ancestor renames, while the existing staged-file handle
+    // avoids reopening private transfer data by pathname.
+    unsafe {
+        (*information).Anonymous.Flags = 0;
+        (*information).RootDirectory = destination_directory.as_raw_handle();
+        (*information).FileNameLength = name_bytes;
+        ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // SAFETY: Both handles are retained and valid, `information` points to an
+    // aligned buffer containing the fixed header plus the declared UTF-16
+    // name, and the staged source was opened with DELETE access.
+    let status = unsafe {
+        NtSetInformationFile(
+            source_file.as_raw_handle(),
+            &mut status_block,
+            information.cast(),
+            buffer_length,
+            FileLinkInformation,
+        )
+    };
+    if status >= 0 {
+        Ok(())
+    } else {
+        // SAFETY: RtlNtStatusToDosError accepts every NTSTATUS value.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        Err(io::Error::from_raw_os_error(code as i32))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_hard_link_at(
+    _source_file: &fs::File,
+    _source_directory: &fs::File,
+    _source_name: &OsStr,
+    _destination_directory: &fs::File,
+    _destination_name: &OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "handle-relative hardlinks are unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -2391,16 +2537,94 @@ fn stage_write_status(error: &io::Error) -> &'static str {
         .get_ref()
         .and_then(|source| source.downcast_ref::<OutputLimitExceeded>())
         .is_some()
+        || error.kind() == io::ErrorKind::FileTooLarge
     {
         "EFBIG:File exceeds configured size limit"
     } else if matches!(
         error.kind(),
         io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
     ) {
-        "EINVAL:Invalid zlib stream"
+        "EINVAL:Invalid transfer stream"
     } else {
         "EIO:Could not write staged file"
     }
+}
+
+fn prepare_rsync_base(
+    temporary: &StagedTempFile,
+    max_file_bytes: u64,
+) -> io::Result<(fs::File, u64, Vec<u8>)> {
+    let mut options = OpenOptionsAt::default();
+    options.read(true).follow(false);
+    let mut base = options.open_at(&temporary.parent, &temporary.destination_name)?;
+    let metadata = base.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_file_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rsync base is not a supported regular file",
+        ));
+    }
+    let base_size = metadata.len();
+    let mut signature = Vec::new();
+    write_signature(&mut base, base_size, &mut signature)?;
+    Ok((base, base_size, signature))
+}
+
+fn rsync_started_response(
+    request: &FileTransferCommand,
+    base_size: u64,
+    signature: &[u8],
+) -> Vec<Vec<u8>> {
+    let mut output =
+        Vec::with_capacity(1 + signature.len().div_ceil(MAX_FILE_TRANSFER_CHUNK_BYTES));
+    let status = FileTransferCommand {
+        action: FileTransferAction::Status,
+        id: request.id.clone(),
+        file_id: request.file_id.clone(),
+        bypass: None,
+        quiet: 0,
+        mtime: None,
+        permissions: None,
+        size: Some(base_size),
+        name: request.name.clone(),
+        status: Some("STARTED".to_string()),
+        parent: None,
+        data: Vec::new(),
+        compression: None,
+        file_type: None,
+        transmission_type: Some(FileTransmissionType::Rsync),
+    };
+    if let Ok(encoded) = status.encode() {
+        output.push(encoded);
+    }
+    let last = signature.len().div_ceil(MAX_FILE_TRANSFER_CHUNK_BYTES) - 1;
+    for (index, chunk) in signature.chunks(MAX_FILE_TRANSFER_CHUNK_BYTES).enumerate() {
+        let command = FileTransferCommand {
+            action: if index == last {
+                FileTransferAction::EndData
+            } else {
+                FileTransferAction::Data
+            },
+            id: request.id.clone(),
+            file_id: request.file_id.clone(),
+            bypass: None,
+            quiet: 0,
+            mtime: None,
+            permissions: None,
+            size: None,
+            name: None,
+            status: None,
+            parent: None,
+            data: chunk.to_vec(),
+            compression: None,
+            file_type: None,
+            transmission_type: None,
+        };
+        if let Ok(encoded) = command.encode() {
+            output.push(encoded);
+        }
+    }
+    output
 }
 
 fn response(
@@ -2660,8 +2884,15 @@ mod tests {
     }
 
     fn status(actions: &[TtyTransferAction]) -> FileTransferCommand {
-        let [TtyTransferAction::Write(encoded)] = actions else {
+        let [action] = actions else {
             panic!("expected one status response, got {actions:?}")
+        };
+        decode_action(action)
+    }
+
+    fn decode_action(action: &TtyTransferAction) -> FileTransferCommand {
+        let TtyTransferAction::Write(encoded) = action else {
+            panic!("expected encoded protocol output, got {action:?}")
         };
         let body = encoded
             .strip_prefix(b"\x1b]5113;")
@@ -2798,12 +3029,13 @@ mod tests {
         assert!(directory_path.is_dir());
         assert_eq!(fs::read(&file_path).unwrap(), b"old destination");
         assert!(!hardlink_path.exists());
-        assert!(run(
+        let finish = run(
             &mut manager,
             &mut filesystem,
-            command(FileTransferAction::Finish, "tree")
-        )
-        .is_empty());
+            command(FileTransferAction::Finish, "tree"),
+        );
+        let decoded: Vec<_> = finish.iter().map(decode_action).collect();
+        assert!(finish.is_empty(), "tree commit failed: {decoded:?}");
         assert_eq!(fs::read(&file_path).unwrap(), b"data");
         assert_eq!(fs::read(&hardlink_path).unwrap(), b"data");
         fs::write(&file_path, b"same inode").unwrap();
@@ -3362,7 +3594,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_relative_components_and_unsupported_transmission_never_stage() {
+    fn unsafe_relative_components_never_stage() {
         let home = tempfile::tempdir().unwrap();
         let mut manager = TtyTransferManager::new();
         let mut filesystem =
@@ -3386,16 +3618,126 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.starts_with("EINVAL:")));
 
-        let mut rsync = command(FileTransferAction::File, "paths-rest");
-        rsync.file_id = Some("f2".into());
-        rsync.name = Some("~/rsync".into());
-        rsync.transmission_type = Some(FileTransmissionType::Rsync);
-        let unsupported = run(&mut manager, &mut filesystem, rsync);
-        assert!(status(&unsupported)
-            .status
-            .as_deref()
-            .is_some_and(|value| value.starts_with("ENOTSUP:")));
         assert!(fs::read_dir(home.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn rsync_plain_and_zlib_deltas_atomically_replace_an_existing_file() {
+        let mut base = Vec::new();
+        for index in 0..128 {
+            base.extend_from_slice(format!("block-{index:03}-xxxxxxxxxxxxxxxxxxxx\n").as_bytes());
+        }
+        let mut source = base.clone();
+        source[800..814].copy_from_slice(b"changed-delta!");
+
+        for (session_id, compression) in [
+            ("rsync-plain", None),
+            ("rsync-zlib", Some(FileTransferCompression::Zlib)),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let destination = home.path().join("rsync.txt");
+            fs::write(&destination, &base).unwrap();
+            let mut manager = TtyTransferManager::new();
+            let mut filesystem = TtyTransferSendFilesystem::new(
+                home.path().to_path_buf(),
+                limits(source.len() as u64 * 2),
+            )
+            .unwrap();
+            approve_send(&mut manager, session_id);
+
+            let mut file = command(FileTransferAction::File, session_id);
+            file.file_id = Some("file".into());
+            file.name = Some("~/rsync.txt".into());
+            file.size = Some(source.len() as u64);
+            file.transmission_type = Some(FileTransmissionType::Rsync);
+            file.compression = compression;
+            let started = run(&mut manager, &mut filesystem, file);
+            let decoded: Vec<_> = started.iter().map(decode_action).collect();
+            assert_eq!(decoded[0].status.as_deref(), Some("STARTED"));
+            assert_eq!(
+                decoded[0].transmission_type,
+                Some(FileTransmissionType::Rsync)
+            );
+            assert_eq!(decoded[0].size, Some(base.len() as u64));
+            assert_eq!(decoded.last().unwrap().action, FileTransferAction::EndData);
+            let signature_bytes: Vec<_> = decoded[1..]
+                .iter()
+                .flat_map(|command| command.data.iter().copied())
+                .collect();
+            let signature = Signature::parse(&signature_bytes, signature_bytes.len()).unwrap();
+            let mut delta = Vec::new();
+            crate::kitty_rsync::write_delta(io::Cursor::new(&source), &signature, &mut delta)
+                .unwrap();
+            let wire_delta = if compression == Some(FileTransferCompression::Zlib) {
+                zlib_bytes(&delta)
+            } else {
+                delta
+            };
+
+            for (index, chunk) in wire_delta.chunks(MAX_FILE_TRANSFER_CHUNK_BYTES).enumerate() {
+                let mut data = command(
+                    if (index + 1) * MAX_FILE_TRANSFER_CHUNK_BYTES >= wire_delta.len() {
+                        FileTransferAction::EndData
+                    } else {
+                        FileTransferAction::Data
+                    },
+                    session_id,
+                );
+                data.file_id = Some("file".into());
+                data.data = chunk.to_vec();
+                let response = run(&mut manager, &mut filesystem, data);
+                assert!(matches!(
+                    status(&response).status.as_deref(),
+                    Some("PROGRESS" | "OK")
+                ));
+            }
+
+            assert_eq!(fs::read(&destination).unwrap(), base);
+            assert!(run(
+                &mut manager,
+                &mut filesystem,
+                command(FileTransferAction::Finish, session_id)
+            )
+            .is_empty());
+            assert_eq!(fs::read(destination).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn rsync_without_a_usable_base_negotiates_a_simple_transfer() {
+        let home = tempfile::tempdir().unwrap();
+        let destination = home.path().join("new.txt");
+        let mut manager = TtyTransferManager::new();
+        let mut filesystem =
+            TtyTransferSendFilesystem::new(home.path().to_path_buf(), limits(1024)).unwrap();
+        approve_send(&mut manager, "rsync-fallback");
+
+        let mut file = command(FileTransferAction::File, "rsync-fallback");
+        file.file_id = Some("file".into());
+        file.name = Some("~/new.txt".into());
+        file.size = Some(7);
+        file.transmission_type = Some(FileTransmissionType::Rsync);
+        let started = run(&mut manager, &mut filesystem, file);
+        let started = status(&started);
+        assert_eq!(started.status.as_deref(), Some("STARTED"));
+        assert_eq!(started.transmission_type, None);
+
+        let mut data = command(FileTransferAction::EndData, "rsync-fallback");
+        data.file_id = Some("file".into());
+        data.data = b"created".to_vec();
+        assert_eq!(
+            status(&run(&mut manager, &mut filesystem, data))
+                .status
+                .as_deref(),
+            Some("OK")
+        );
+        assert!(run(
+            &mut manager,
+            &mut filesystem,
+            command(FileTransferAction::Finish, "rsync-fallback")
+        )
+        .is_empty());
+        assert_eq!(fs::read(destination).unwrap(), b"created");
     }
 
     #[test]
@@ -3682,7 +4024,9 @@ mod tests {
             .unwrap()
         {
             StagedWriter::Plain(file) => &file.file,
-            StagedWriter::Zlib(_) => panic!("expected plain staged file"),
+            StagedWriter::Zlib(_) | StagedWriter::Rsync(_) | StagedWriter::ZlibRsync(_) => {
+                panic!("expected plain staged file")
+            }
         };
         assert_eq!(
             staged

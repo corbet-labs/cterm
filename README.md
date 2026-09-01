@@ -526,16 +526,19 @@ Approved local-to-remote sessions recursively enumerate consented directory
 handles without following symlinks, correlate parent directories, symbolic
 links, and filesystem-identity hardlinks, and retain exact regular-file handles
 and symbolic-link values for later requests. Plain and zlib data use
-Kitty-sized chunks through a bounded backpressured PTY path, while changed,
-replaced, oversized, duplicate, and unlisted sources fail closed without
-reopening a client-selected pathname.
+Kitty-sized chunks through a bounded backpressured PTY path. Both directions
+also support Kitty's rsync transmission type with streaming rolling matches,
+XXH3-64 block hashes, XXH3-128 output verification, strict signature and delta
+validation, and bounded plain or zlib wire chunks. Changed, replaced,
+oversized, duplicate, and unlisted sources fail closed without reopening a
+client-selected pathname.
 GTK/Wayland, Cocoa, and Win32 surface daemon-owned, deny-by-default native
 consent dialogs with exact token, expiry, pane/session cancellation, and
 reconnect replay semantics; the daemon refuses relaunch while any transfer
-actor is pending, queued, staged, or draining. Rsync/XXH3, authorization bypass,
-and native prompt interaction automation remain open and are tracked in the
-[parity inventory](docs/parity.md); cterm does not advertise the protocol as
-complete yet.
+actor is pending, queued, staged, or draining. Authorization bypass policy,
+native prompt interaction automation, and Kitty differential tests remain open
+and are tracked in the [parity inventory](docs/parity.md); cterm does not
+advertise the protocol as complete yet.
 
 ### Kitty Multiple Cursors
 

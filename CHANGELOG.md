@@ -12,11 +12,11 @@ is omitted for readability.
 ### Added
 - A living, evidence-backed foot and Kitty parity inventory that distinguishes
   implementation from user-observable verification.
-- Kitty OSC 5113 decoding and exact-token consent, plus a consent-gated
-  remote-to-local regular-file executor with explicit resource limits, strict
-  bounded zlib decompression, metadata preservation, private handle-relative
-  staging with exclusive Windows payload handles, best-effort cancellation
-  cleanup, and per-file atomic commit at session finish.
+- Kitty OSC 5113 decoding and exact-token consent, plus bidirectional
+  consent-listed files and directory trees with symlink/hardlink identity,
+  metadata, bounded plain/zlib streaming, Kitty-compatible rsync/XXH3 deltas,
+  private handle-relative staging, cumulative resource limits, deterministic
+  cancellation cleanup, and per-entry atomic commit at session finish.
 - Kitty OSC 72 destination negotiation and local file drops on GTK/Wayland,
   Cocoa, and Win32/OLE.
 - A fail-closed command-plugin foundation with fixed WebAssembly packages,
@@ -44,6 +44,8 @@ is omitted for readability.
   oversized sequences atomically instead of leaving the VTE parser inside a
   partial control string. Large replay and decoded-transfer spill files are
   unique and private, and failed receptions remove their temporary storage.
+- Windows file-transfer hardlinks are created from retained source and
+  destination handles, preserving private staging and ancestor-rename safety.
 
 ### Security
 - Plugin package files are size-checked before allocation, read through a

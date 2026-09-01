@@ -20,6 +20,7 @@ filetime.workspace = true
 fs_at.workspace = true
 cap-std.workspace = true
 pathdiff.workspace = true
+twox-hash.workspace = true
 log.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true

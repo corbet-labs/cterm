@@ -23,6 +23,10 @@ use crate::kitty_file_transfer::{AuthorizedTtyTransferCommand, TtyTransferDirect
 use crate::kitty_file_transfer_fs::{
     resolve_protocol_path, TtyTransferFilesystemConfigError, TtyTransferLimits,
 };
+use crate::kitty_rsync::{write_delta, Signature};
+
+const MAX_RSYNC_SIGNATURE_BYTES_PER_FILE: usize = 16 * 1024 * 1024;
+const MAX_RSYNC_SIGNATURE_BYTES_PER_SESSION: usize = 64 * 1024 * 1024;
 
 /// Filesystem stage for approved local-to-remote file-tree transfers.
 #[derive(Debug)]
@@ -77,15 +81,9 @@ impl TtyTransferReceiveFilesystem {
                     self.transmit_source(command, quiet, emit)
                 }
             }
-            FileTransferAction::Data | FileTransferAction::EndData => emit_status(
-                emit,
-                &command,
-                "ENOTSUP:Rsync signatures are not implemented",
-                quiet,
-                true,
-                None,
-                None,
-            ),
+            FileTransferAction::Data | FileTransferAction::EndData => {
+                self.receive_signature(command, quiet, emit)
+            }
             FileTransferAction::Finished => {
                 self.sessions.remove(&command.id);
                 true
@@ -323,20 +321,10 @@ impl TtyTransferReceiveFilesystem {
     where
         F: FnMut(Vec<u8>) -> bool,
     {
-        if !matches!(
+        debug_assert!(matches!(
             command.transmission_type,
-            None | Some(FileTransmissionType::Simple)
-        ) {
-            return emit_status(
-                emit,
-                &command,
-                "ENOTSUP:Rsync transmission is not implemented",
-                quiet,
-                true,
-                None,
-                None,
-            );
-        }
+            None | Some(FileTransmissionType::Simple | FileTransmissionType::Rsync)
+        ));
         let file_id = command
             .file_id
             .as_deref()
@@ -392,6 +380,43 @@ impl TtyTransferReceiveFilesystem {
         };
         if sources.is_empty() {
             session.sources.remove(requested_name);
+        }
+        if command.transmission_type == Some(FileTransmissionType::Rsync) {
+            let ReceiveSource::Regular { file, size } = source else {
+                return emit_status(
+                    emit,
+                    &command,
+                    "EINVAL:Rsync can be requested only for regular files",
+                    quiet,
+                    true,
+                    None,
+                    None,
+                );
+            };
+            if match file.metadata() {
+                Ok(metadata) => metadata.len() != size,
+                Err(_) => true,
+            } {
+                return emit_status(
+                    emit,
+                    &command,
+                    "ESTALE:Source file changed after approval",
+                    quiet,
+                    true,
+                    None,
+                    None,
+                );
+            }
+            session.rsync.insert(
+                file_id.to_string(),
+                PendingRsyncSource {
+                    file,
+                    size,
+                    compression: command.compression,
+                    signature: Vec::new(),
+                },
+            );
+            return true;
         }
         let result = match source {
             ReceiveSource::Regular { mut file, size } => {
@@ -469,6 +494,116 @@ impl TtyTransferReceiveFilesystem {
             ),
         }
     }
+
+    fn receive_signature<F>(
+        &mut self,
+        command: FileTransferCommand,
+        quiet: u8,
+        emit: &mut F,
+    ) -> bool
+    where
+        F: FnMut(Vec<u8>) -> bool,
+    {
+        let Some(file_id) = command.file_id.as_deref() else {
+            return true;
+        };
+        let Some(session) = self.sessions.get_mut(&command.id) else {
+            return emit_status(
+                emit,
+                &command,
+                "ENOENT:Unknown receive filesystem session",
+                quiet,
+                true,
+                None,
+                None,
+            );
+        };
+        let Some(pending) = session.rsync.get_mut(file_id) else {
+            return emit_status(
+                emit,
+                &command,
+                "EINVAL:No rsync signature is pending for this file",
+                quiet,
+                true,
+                None,
+                None,
+            );
+        };
+        let new_file_bytes = pending.signature.len().checked_add(command.data.len());
+        let new_session_bytes = session
+            .rsync_signature_bytes
+            .checked_add(command.data.len());
+        if new_file_bytes.is_none_or(|length| length > MAX_RSYNC_SIGNATURE_BYTES_PER_FILE)
+            || new_session_bytes.is_none_or(|length| length > MAX_RSYNC_SIGNATURE_BYTES_PER_SESSION)
+        {
+            let removed = session
+                .rsync
+                .remove(file_id)
+                .expect("pending rsync source was checked above");
+            session.rsync_signature_bytes = session
+                .rsync_signature_bytes
+                .saturating_sub(removed.signature.len());
+            return emit_status(
+                emit,
+                &command,
+                "EFBIG:Rsync signature exceeds configured limits",
+                quiet,
+                true,
+                None,
+                None,
+            );
+        }
+        pending.signature.extend_from_slice(&command.data);
+        session.rsync_signature_bytes += command.data.len();
+        if command.action != FileTransferAction::EndData {
+            return true;
+        }
+
+        let pending = session
+            .rsync
+            .remove(file_id)
+            .expect("pending rsync source was checked above");
+        session.rsync_signature_bytes = session
+            .rsync_signature_bytes
+            .saturating_sub(pending.signature.len());
+        let signature =
+            match Signature::parse(&pending.signature, MAX_RSYNC_SIGNATURE_BYTES_PER_FILE) {
+                Ok(signature) => signature,
+                Err(_) => {
+                    return emit_status(
+                        emit,
+                        &command,
+                        "EINVAL:Invalid rsync signature",
+                        quiet,
+                        true,
+                        None,
+                        None,
+                    );
+                }
+            };
+        let result = stream_delta(
+            pending.file,
+            pending.size,
+            &signature,
+            &command.id,
+            file_id,
+            pending.compression,
+            emit,
+        );
+        match result {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => false,
+            Err(error) => emit_status(
+                emit,
+                &command,
+                receive_io_status(&error, "EIO:Could not create rsync delta"),
+                quiet,
+                true,
+                None,
+                None,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -476,10 +611,20 @@ struct ReceiveSession {
     entries: Vec<PendingReceiveListingItem>,
     sources: HashMap<String, VecDeque<ReceiveSource>>,
     transmitted_ids: HashSet<String>,
+    rsync: HashMap<String, PendingRsyncSource>,
+    rsync_signature_bytes: usize,
     listed_files: usize,
     planned_bytes: u64,
     next_actual_id: u64,
     listing_complete: bool,
+}
+
+#[derive(Debug)]
+struct PendingRsyncSource {
+    file: fs::File,
+    size: u64,
+    compression: Option<FileTransferCompression>,
+    signature: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -1097,6 +1242,39 @@ where
     chunks.finish()
 }
 
+fn stream_delta<F>(
+    file: fs::File,
+    expected_size: u64,
+    signature: &Signature,
+    session_id: &str,
+    file_id: &str,
+    compression: Option<FileTransferCompression>,
+    emit: &mut F,
+) -> io::Result<()>
+where
+    F: FnMut(Vec<u8>) -> bool,
+{
+    let mut source = file.take(expected_size);
+    let mut chunks = ProtocolChunkWriter::new(session_id, file_id, emit);
+    match compression {
+        Some(FileTransferCompression::Zlib) => {
+            let mut encoder = ZlibEncoder::new(chunks, Compression::default());
+            write_delta(&mut source, signature, &mut encoder)?;
+            chunks = encoder.finish()?;
+        }
+        None | Some(FileTransferCompression::None) => {
+            write_delta(&mut source, signature, &mut chunks)?;
+        }
+    }
+    if source.limit() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "source was truncated during rsync delta generation",
+        ));
+    }
+    chunks.finish()
+}
+
 fn stream_bytes<F>(data: &[u8], session_id: &str, file_id: &str, emit: &mut F) -> io::Result<()>
 where
     F: FnMut(Vec<u8>) -> bool,
@@ -1305,6 +1483,7 @@ fn protocol_absolute_path(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::kitty_file_transfer::{TtyTransferAction, TtyTransferManager};
+    use crate::kitty_rsync::write_signature;
     use flate2::read::ZlibDecoder;
 
     fn command(action: FileTransferAction, id: &str) -> FileTransferCommand {
@@ -1468,6 +1647,131 @@ mod tests {
             };
             assert_eq!(received, contents);
         }
+    }
+
+    #[test]
+    fn rsync_signatures_produce_bounded_plain_and_zlib_deltas() {
+        let home = tempfile::tempdir().unwrap();
+        let mut basis = Vec::new();
+        for index in 0..256 {
+            basis.extend_from_slice(
+                format!("line-{index:03}-xxxxxxxxxxxxxxxxxxxxxxxx\n").as_bytes(),
+            );
+        }
+        let mut source = basis.clone();
+        source[777..791].copy_from_slice(b"changed-delta!");
+        fs::write(home.path().join("rsync.bin"), &source).unwrap();
+        let limits =
+            TtyTransferLimits::new(8, source.len() as u64 * 2, source.len() as u64 * 4).unwrap();
+
+        for (run, compression) in [
+            ("rsync-plain", None),
+            ("rsync-zlib", Some(FileTransferCompression::Zlib)),
+        ] {
+            let mut filesystem =
+                TtyTransferReceiveFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+            let mut manager = TtyTransferManager::new();
+            let listing = run_actions(
+                &mut filesystem,
+                approve_receive(&mut manager, run, &[("spec", "rsync.bin")]),
+            );
+            let metadata = decode(&listing[1]);
+            let mut request = command(FileTransferAction::File, run);
+            request.file_id = Some("out".into());
+            request.name = metadata.name;
+            request.transmission_type = Some(FileTransmissionType::Rsync);
+            request.compression = compression;
+            assert!(run_actions(&mut filesystem, manager.handle(request)).is_empty());
+
+            let mut serialized_signature = Vec::new();
+            write_signature(
+                io::Cursor::new(&basis),
+                basis.len() as u64,
+                &mut serialized_signature,
+            )
+            .unwrap();
+            let signature =
+                Signature::parse(&serialized_signature, MAX_RSYNC_SIGNATURE_BYTES_PER_FILE)
+                    .unwrap();
+            let block_size = signature.block_size();
+            let mut output = Vec::new();
+            for (index, chunk) in serialized_signature
+                .chunks(MAX_FILE_TRANSFER_CHUNK_BYTES)
+                .enumerate()
+            {
+                let mut packet = command(
+                    if (index + 1) * MAX_FILE_TRANSFER_CHUNK_BYTES >= serialized_signature.len() {
+                        FileTransferAction::EndData
+                    } else {
+                        FileTransferAction::Data
+                    },
+                    run,
+                );
+                packet.file_id = Some("out".into());
+                packet.data = chunk.to_vec();
+                output.extend(run_actions(&mut filesystem, manager.handle(packet)));
+            }
+            let decoded: Vec<_> = output.iter().map(|packet| decode(packet)).collect();
+            assert!(decoded
+                .iter()
+                .all(|packet| packet.data.len() <= MAX_FILE_TRANSFER_CHUNK_BYTES));
+            assert_eq!(decoded.last().unwrap().action, FileTransferAction::EndData);
+            let wire_delta: Vec<_> = decoded.into_iter().flat_map(|packet| packet.data).collect();
+            let delta = if compression == Some(FileTransferCompression::Zlib) {
+                let mut decoded = Vec::new();
+                ZlibDecoder::new(wire_delta.as_slice())
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+                decoded
+            } else {
+                wire_delta
+            };
+            let mut patcher = crate::kitty_rsync::DeltaPatcher::new(
+                io::Cursor::new(&basis),
+                Vec::new(),
+                basis.len() as u64,
+                block_size,
+                source.len() as u64,
+            )
+            .unwrap();
+            for chunk in delta.chunks(11) {
+                patcher.write_all(chunk).unwrap();
+            }
+            assert_eq!(patcher.finish().unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn invalid_rsync_signature_fails_closed_and_releases_its_buffer() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("rsync.bin"), b"approved source").unwrap();
+        let limits = TtyTransferLimits::new(4, 1024, 4096).unwrap();
+        let mut filesystem =
+            TtyTransferReceiveFilesystem::new(home.path().to_path_buf(), limits).unwrap();
+        let mut manager = TtyTransferManager::new();
+        let listing = run_actions(
+            &mut filesystem,
+            approve_receive(&mut manager, "bad-rsync", &[("spec", "rsync.bin")]),
+        );
+        let metadata = decode(&listing[1]);
+        let mut request = command(FileTransferAction::File, "bad-rsync");
+        request.file_id = Some("out".into());
+        request.name = metadata.name;
+        request.transmission_type = Some(FileTransmissionType::Rsync);
+        assert!(run_actions(&mut filesystem, manager.handle(request)).is_empty());
+
+        let mut signature = command(FileTransferAction::EndData, "bad-rsync");
+        signature.file_id = Some("out".into());
+        signature.data = vec![0; 12];
+        let rejected = run_actions(&mut filesystem, manager.handle(signature));
+        assert_eq!(rejected.len(), 1);
+        assert!(decode(&rejected[0])
+            .status
+            .as_deref()
+            .is_some_and(|status| status.starts_with("EINVAL:")));
+        let session = filesystem.sessions.get("bad-rsync").unwrap();
+        assert!(session.rsync.is_empty());
+        assert_eq!(session.rsync_signature_bytes, 0);
     }
 
     #[test]

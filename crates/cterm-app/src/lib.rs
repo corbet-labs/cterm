@@ -16,6 +16,7 @@ pub mod kitty_dnd;
 pub mod kitty_file_transfer;
 pub mod kitty_file_transfer_fs;
 mod kitty_file_transfer_receive;
+mod kitty_rsync;
 pub mod log_capture;
 pub mod plugin_broker;
 pub mod plugin_runtime;

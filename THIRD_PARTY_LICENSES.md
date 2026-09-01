@@ -10,7 +10,7 @@ components listed here. The original notices are preserved in the derived files.
 | rio-vt-benchmark | `a49a7062c964034d5192032fe8e18fb7e262dbec` | Workload taxonomy and comparison methodology used to inform original Criterion benchmarks in `cterm-core`; no source code copied | MIT (declared in upstream README) |
 | Alacritty VTE | `89c12df969145ffb5084d1122627d7292c2c638f` (`vte` 0.13.1) | Adapted tested SGR parameter grouping and extended-color validation in `cterm-core` | MIT |
 | foot | `765ca4070bb6f095fc58c030f2154ed03857701d` (1.27.0) | Behavioral reference and adapted DEC rectangular-editing, xterm palette-stack, Sixel aspect/palette/resource-management, theme/visibility-reporting, and cursor/cell blink source, timing and rearm semantics, validation and tests in `cterm-core` and `cterm-ui` | MIT |
-| Kitty | `41095672e8c17868f9a290fd0481be8de11c00e9` | Behavioral reference for OSC 5113 session ordering, recursive metadata and parent correlation, symlink/hardlink identity semantics, source streaming, destination reconstruction, and quiet-response behavior; no source copied | GPL-3.0 |
+| Kitty | `41095672e8c17868f9a290fd0481be8de11c00e9`; `03fbdad855490470233954bc810e517027e5e640` (rsync wire oracle) | Behavioral reference for OSC 5113 session ordering, recursive metadata and parent correlation, symlink/hardlink identity semantics, source streaming, destination reconstruction, quiet-response behavior, and the documented little-endian rsync/XXH3 wire format; no source copied | GPL-3.0 |
 | Zellij | `e839bfffa586992364309a685b2c71f3b23c247e` | Adapted all-or-none bounded control-string interception and split/recovery test structure for streamed OSC 1337, plus the Kitty graphics command vocabulary, chunk state, and error model in `cterm-core` | MIT |
 | Noa | `8d843ce352e2f10ef1c130bcf7f94198f1ccaca6` | Adapted the tested Rust full-canvas `Arc` frame-store, quota-accounting, monotonic animation-tick structure, Unicode-placeholder scanner, and 297-entry diacritic table; cterm's command mapping, playback, placeholder inference, aspect ratio, and layer behavior are corrected against Kitty's specification and reference implementation | MIT |
 | Qwertty Term / Ghostty | `9021f511bf053ec4155298e43a65de4365a13f80`; `2da015cd6` | Adapted Qwertty Term's Rust port of Ghostty's complete Kitty OSC 72 command vocabulary and parser test matrix in `cterm-core`; cterm adds strict integer, duplicate-key, terminator, chunk-chain, and payload bounds | MIT |
@@ -20,9 +20,11 @@ components listed here. The original notices are preserved in the derived files.
 | Baseview | `c36ca154f882353f04684973dfe683c1b3d6abb3` | Behavioral reference for client-coordinate drag movement and retaining parsed file data across Win32 drag callbacks; no source copied | MIT OR Apache-2.0 |
 | `stretch` | `20e0748c15ceb0695bd2ebb821a8eee7364f3c8d` (`0.3.2`) | Transitive Rust flexbox dependency of `native-windows-gui`; the published crate omits its declared license file, so cterm pins a reviewed cargo-deny clarification and ships the upstream notice | MIT |
 | `fs_at` | `e8b58a0682496a0c6ddc9eae80942a2f29a5a7e4` (`0.2.1`) | Cargo dependency providing tested handle-relative file creation, no-follow file and directory reads, directory iteration, and cleanup through `openat` on Unix and `NtCreateFile` on Windows for OSC 5113; cterm supplies bounded transfer orchestration and the final platform rename operation | Apache-2.0 |
-| `cap-std` | `cd4c6330089e3731c68b7b98d4dde0cda27402ff` (`3.4.6`) | Cargo dependency providing tested capability-oriented hardlink creation between retained OSC 5113 staging and destination directories; no source copied | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| `cap-std` | `cd4c6330089e3731c68b7b98d4dde0cda27402ff` (`3.4.6`) | Cargo dependency providing tested capability-oriented hardlink creation between retained OSC 5113 staging directories on Unix; no source copied | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | `pathdiff` | `5180ff5b23d9d7eef0a14de13a3d814eb5d8d65c` (`0.2.3`) | Cargo dependency providing tested lexical relative-path construction for OSC 5113 symbolic links that target another approved transfer entry; no source copied | MIT OR Apache-2.0 |
-| Microsoft OpenVMM | `ef54fd16f6449c51efe62ea46ddcfabd9e9cd589` | Adapted the tested Rust `NtSetInformationFile` buffer construction, retained-root rename, and NTSTATUS conversion for atomic OSC 5113 commits on Windows | MIT |
+| Microsoft OpenVMM | `ef54fd16f6449c51efe62ea46ddcfabd9e9cd589` | Adapted the tested Rust `NtSetInformationFile` buffer construction, retained-root rename/hardlink operations, and NTSTATUS conversion for atomic OSC 5113 commits on Windows | MIT |
+| Dropbox `fast_rsync` | `36e230d88d523f438d461d99ff1fae2584a335a6` (`0.2.0`) | Bounded adaptation of its tested Rust rolling-window matching and queued contiguous-copy structure for Kitty rsync; cterm supplies a streaming ring buffer, Kitty wire records, XXH3 hashes, strict limits, and final verification | Apache-2.0 |
+| `twox-hash` | `6f866bffe73900c63df2650be4eed41e3ed9b500` (`2.1.4`) | Pinned Cargo dependency providing pure-Rust, tested XXH3-64 and XXH3-128 implementations for Kitty rsync; default random/legacy hash features are disabled and no source is copied | MIT |
 | `shared_memory-rs` | `68563b3aa82b832dfb73b18a59f4db34ff182df2` (`0.12.4`) | Cargo dependency providing tested Windows named-mapping lifecycle for Kitty shared-memory transfers; no source copied | MIT OR Apache-2.0 |
 | `nix` | `9cd968a1af35b46b05ed41e05acfcca5d02a5645` (`0.31.3`) | Cargo dependency providing safe POSIX `shm_open`, `shm_unlink`, descriptor ownership, staged-file identity checks, and handle-relative `renameat` commit on Linux, macOS, and FreeBSD; no source copied | MIT |
 | `memmap2` | `7710019665fec7bdac1dc18cf6661fbe215a1ad2` (`0.9.11`) | Cargo dependency providing tested read-only POSIX mapping for Kitty shared-memory payload snapshots; no source copied | MIT OR Apache-2.0 |
@@ -35,7 +37,7 @@ MIT grant and notice in `LICENSES/KARPELESLAB-CTERM-MIT.txt`. Subsequent cterm
 contributions are provided under FSL-1.1-ALv2; see `LICENSE`.
 
 The selected Wasmi MIT notice is preserved in `LICENSES/WASMI-MIT.txt`.
-The standard Apache-2.0 terms covering Tao and `fs_at` are preserved in
+The standard Apache-2.0 terms covering Tao, `fs_at`, and `fast_rsync` are preserved in
 `LICENSES/WASI-COMMON-APACHE-2.0-WITH-LLVM-EXCEPTION.txt`; the exception at the
 end applies only to `wasi-common`.
 The `process-wrap` provenance notice and MIT option are preserved in
@@ -43,6 +45,7 @@ The `process-wrap` provenance notice and MIT option are preserved in
 full Apache-2.0 terms are also present in the `wasi-common` license file.
 The MIT notice omitted from the published `stretch` 0.3.2 crate is preserved in
 `LICENSES/STRETCH-MIT.txt`.
+The `twox-hash` MIT notice is preserved in `LICENSES/TWOX-HASH-MIT.txt`.
 
 ## Rio / Sugarloaf MIT license
 

@@ -75,6 +75,7 @@ filetime = "0.2"
 fs_at = "=0.2.1"
 cap-std = "=3.4.6"
 pathdiff = "=0.2.3"
+twox-hash = { version = "=2.1.4", default-features = false, features = ["std", "xxhash3_64", "xxhash3_128"] }
 
 # Encoding
 base64 = "0.22"
