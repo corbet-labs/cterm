@@ -31,6 +31,35 @@ pub struct TtyTransferApprovalRequest {
     pub paths: Vec<String>,
 }
 
+/// A validated command from a session that received explicit user consent.
+///
+/// The fields are private so raw parser output cannot be passed to the
+/// filesystem executor without crossing the authorization state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedTtyTransferCommand {
+    direction: TtyTransferDirection,
+    quiet: u8,
+    command: FileTransferCommand,
+}
+
+impl AuthorizedTtyTransferCommand {
+    pub fn direction(&self) -> TtyTransferDirection {
+        self.direction
+    }
+
+    pub fn quiet(&self) -> u8 {
+        self.quiet
+    }
+
+    pub fn command(&self) -> &FileTransferCommand {
+        &self.command
+    }
+
+    pub(crate) fn into_parts(self) -> (TtyTransferDirection, u8, FileTransferCommand) {
+        (self.direction, self.quiet, self.command)
+    }
+}
+
 /// Work emitted by the UI-neutral authorization state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TtyTransferAction {
@@ -38,7 +67,11 @@ pub enum TtyTransferAction {
     /// A protocol response to write to the PTY.
     Write(Vec<u8>),
     /// A command whose session has received explicit user consent.
-    Execute(FileTransferCommand),
+    Execute(AuthorizedTtyTransferCommand),
+    /// Drop any filesystem staging owned by this session.
+    Abort {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,10 +140,18 @@ impl TtyTransferManager {
             actions.push(TtyTransferAction::Write(response));
         }
         if session.direction == TtyTransferDirection::Receive {
+            let direction = session.direction;
+            let quiet = session.quiet;
             actions.extend(
                 std::mem::take(&mut session.receive_requests)
                     .into_iter()
-                    .map(TtyTransferAction::Execute),
+                    .map(move |command| {
+                        TtyTransferAction::Execute(AuthorizedTtyTransferCommand {
+                            direction,
+                            quiet,
+                            command,
+                        })
+                    }),
             );
         }
         actions
@@ -200,10 +241,17 @@ impl TtyTransferManager {
         let Some(session) = self.sessions.remove(&command.id) else {
             return error_response(&command, "ENOENT:Unknown transfer session");
         };
-        status_response(&command.id, None, "CANCELED", session.quiet, false)
-            .map(TtyTransferAction::Write)
-            .into_iter()
-            .collect()
+        let mut actions = Vec::new();
+        if session.phase == SessionPhase::Approved {
+            actions.push(TtyTransferAction::Abort {
+                session_id: command.id.clone(),
+            });
+        }
+        if let Some(response) = status_response(&command.id, None, "CANCELED", session.quiet, false)
+        {
+            actions.push(TtyTransferAction::Write(response));
+        }
+        actions
     }
 
     fn continue_session(&mut self, command: FileTransferCommand) -> Vec<TtyTransferAction> {
@@ -326,21 +374,29 @@ impl TtyTransferManager {
                 .sessions
                 .remove(&command.id)
                 .map_or(command.quiet, |session| session.quiet);
-            return status_response(
+            let mut actions = vec![TtyTransferAction::Abort {
+                session_id: command.id.clone(),
+            }];
+            if let Some(response) = status_response(
                 &command.id,
                 command.file_id.as_deref(),
                 "EINVAL:Action is invalid for transfer direction",
                 quiet,
                 true,
-            )
-            .map(TtyTransferAction::Write)
-            .into_iter()
-            .collect();
+            ) {
+                actions.push(TtyTransferAction::Write(response));
+            }
+            return actions;
         }
+        let authorized = AuthorizedTtyTransferCommand {
+            direction,
+            quiet: self.sessions[&command.id].quiet,
+            command,
+        };
         if closes {
-            self.sessions.remove(&command.id);
+            self.sessions.remove(&authorized.command.id);
         }
-        vec![TtyTransferAction::Execute(command)]
+        vec![TtyTransferAction::Execute(authorized)]
     }
 
     fn session_id_for_request(&self, request_id: u64) -> Option<String> {
@@ -590,7 +646,7 @@ mod tests {
             manager
                 .handle(command(FileTransferAction::Finished, "send"))
                 .as_slice(),
-            [TtyTransferAction::Write(_)]
+            [TtyTransferAction::Abort { .. }, TtyTransferAction::Write(_)]
         ));
         assert_eq!(manager.active_sessions(), 0);
     }

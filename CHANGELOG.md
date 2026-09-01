@@ -10,6 +10,15 @@ is omitted for readability.
 ## [Unreleased]
 
 ### Added
+- A living, evidence-backed foot and Kitty parity inventory that distinguishes
+  implementation from user-observable verification.
+- Kitty OSC 5113 decoding and exact-token consent, plus a consent-gated
+  remote-to-local regular-file executor with explicit resource limits, strict
+  bounded zlib decompression, metadata preservation, private handle-relative
+  staging with exclusive Windows payload handles, best-effort cancellation
+  cleanup, and per-file atomic commit at session finish.
+- Kitty OSC 72 destination negotiation and local file drops on GTK/Wayland,
+  Cocoa, and Win32/OLE.
 - A fail-closed command-plugin foundation with fixed WebAssembly packages,
   strict manifests, content-addressed trust, exact per-action grants, and a
   bounded versioned protobuf ABI, plus a separate one-shot Wasmi/WASIp1 runner

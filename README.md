@@ -2,6 +2,9 @@
 
 A high-performance, customizable terminal emulator built in Rust. cterm uses native AppKit/CoreGraphics on macOS, Win32/Direct2D on Windows, and GTK4 on Wayland for Linux. X11 is intentionally not a supported Linux backend.
 
+The evidence-backed status of the foot and Kitty compatibility work is tracked
+in the living [parity inventory](docs/parity.md).
+
 ## Features
 
 ### Terminal Emulation
@@ -502,6 +505,25 @@ file URI drops and deliver them to applications only after MIME and copy-action
 negotiation. Source-side drags, native move operations, and remote filesystem
 requests are not yet implemented and are never advertised as available.
 
+### Kitty File Transfer
+
+Kitty OSC 5113 commands pass through a bounded shared codec and an exact-token
+authorization state machine before any filesystem access is possible. The
+approved remote-to-local regular-file executor uses explicit file/session
+limits, strict bounded single-member zlib decompression, private handle-relative
+same-filesystem staging, metadata preservation, best-effort cancellation
+cleanup, and per-file atomic commit at session finish. Retained source and
+destination-directory handles prevent namespace replacement after staging
+begins from redirecting the payload or its commit. On Unix, unsafe shared
+destination directories that are group/world-writable without the sticky bit
+are rejected; Windows staging directories use a protected owner-only DACL and
+retain the payload with read/write sharing disabled until its atomic commit.
+Native consent dialogs and
+event-loop integration, receive sessions, directory/link trees, rsync/XXH3,
+and authorization bypass remain open and are tracked in the
+[parity inventory](docs/parity.md); cterm does not advertise the protocol as
+complete yet.
+
 ### Kitty Multiple Cursors
 
 Kitty's multiple-cursors protocol supports block, beam, underline, and
@@ -618,7 +640,7 @@ Custom themes can be added as TOML files in the `themes/` configuration subdirec
 
 ### Future
 
-- Additional foot-compatible behavior and performance work
+- Close every open or unverified row in the living [parity inventory](docs/parity.md)
 - Android and iOS local-terminal frontends (distant targets)
 
 ## License

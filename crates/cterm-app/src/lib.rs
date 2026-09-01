@@ -14,6 +14,7 @@ pub mod file_transfer;
 pub mod git_sync;
 pub mod kitty_dnd;
 pub mod kitty_file_transfer;
+pub mod kitty_file_transfer_fs;
 pub mod log_capture;
 pub mod plugin_broker;
 pub mod plugin_runtime;
@@ -40,7 +41,11 @@ pub use git_sync::{
     PullResult, SyncStatus,
 };
 pub use kitty_file_transfer::{
-    TtyTransferAction, TtyTransferApprovalRequest, TtyTransferDirection, TtyTransferManager,
+    AuthorizedTtyTransferCommand, TtyTransferAction, TtyTransferApprovalRequest,
+    TtyTransferDirection, TtyTransferManager,
+};
+pub use kitty_file_transfer_fs::{
+    TtyTransferFilesystemConfigError, TtyTransferLimits, TtyTransferSendFilesystem,
 };
 pub use plugin_broker::{PluginBroker, PluginBrokerError, PluginBrokerOutput, PluginBrokerTimeout};
 pub use plugin_runtime::{

@@ -17,8 +17,10 @@ components listed here. The original notices are preserved in the derived files.
 | Elio | `3a39678609e927ea4f248a3cf40d7dbf353260fe` | Behavioral reference for tested Kitty OSC 72 client sequencing, local URI-list negotiation, and chunk boundaries; no source copied | MIT |
 | Tao | `2f9eecf236f4f6a8acfa03329c57039224a3ce99` | Adapted the tested Rust `IDropTarget`, `CF_HDROP`, dynamically sized path extraction, and OLE registration lifecycle for the Win32 Kitty OSC 72 adapter | Apache-2.0 |
 | Baseview | `c36ca154f882353f04684973dfe683c1b3d6abb3` | Behavioral reference for client-coordinate drag movement and retaining parsed file data across Win32 drag callbacks; no source copied | MIT OR Apache-2.0 |
+| `stretch` | `20e0748c15ceb0695bd2ebb821a8eee7364f3c8d` (`0.3.2`) | Transitive Rust flexbox dependency of `native-windows-gui`; the published crate omits its declared license file, so cterm pins a reviewed cargo-deny clarification and ships the upstream notice | MIT |
+| `fs_at` | `e8b58a0682496a0c6ddc9eae80942a2f29a5a7e4` (`0.2.1`) | Cargo dependency providing tested handle-relative file creation and cleanup through `openat` on Unix and `NtCreateFile` on Windows for OSC 5113 staging; cterm adds only the final platform rename operation | Apache-2.0 |
 | `shared_memory-rs` | `68563b3aa82b832dfb73b18a59f4db34ff182df2` (`0.12.4`) | Cargo dependency providing tested Windows named-mapping lifecycle for Kitty shared-memory transfers; no source copied | MIT OR Apache-2.0 |
-| `nix` | `9cd968a1af35b46b05ed41e05acfcca5d02a5645` (`0.31.3`) | Cargo dependency providing safe POSIX `shm_open`, `shm_unlink`, and descriptor ownership on Linux, macOS, and FreeBSD; no source copied | MIT |
+| `nix` | `9cd968a1af35b46b05ed41e05acfcca5d02a5645` (`0.31.3`) | Cargo dependency providing safe POSIX `shm_open`, `shm_unlink`, descriptor ownership, staged-file identity checks, and handle-relative `renameat` commit on Linux, macOS, and FreeBSD; no source copied | MIT |
 | `memmap2` | `7710019665fec7bdac1dc18cf6661fbe215a1ad2` (`0.9.11`) | Cargo dependency providing tested read-only POSIX mapping for Kitty shared-memory payload snapshots; no source copied | MIT OR Apache-2.0 |
 | Wasmi / `wasmi_wasi` | `c517895c2db09f660d6eae0bc4549861ab8fd88f` (`v1.1.0`) | Pinned Cargo runtime and WASIp1 adapter used only by the isolated `cterm-plugin-host`; no source copied | MIT OR Apache-2.0 (cterm distributes under the MIT option) |
 | Bytecode Alliance `wasi-common` | `3d0ec7e7c5ae4cd3f9b99d915276926d799b9a2b` (`v36.0.14`, constrained to the patched 36.x line) | Directly constrained transitive WASIp1 context and bounded virtual pipes for `cterm-plugin-host`; no source copied | Apache-2.0 WITH LLVM-exception |
@@ -29,12 +31,14 @@ MIT grant and notice in `LICENSES/KARPELESLAB-CTERM-MIT.txt`. Subsequent cterm
 contributions are provided under FSL-1.1-ALv2; see `LICENSE`.
 
 The selected Wasmi MIT notice is preserved in `LICENSES/WASMI-MIT.txt`.
-The standard Apache-2.0 terms covering Tao are preserved in
+The standard Apache-2.0 terms covering Tao and `fs_at` are preserved in
 `LICENSES/WASI-COMMON-APACHE-2.0-WITH-LLVM-EXCEPTION.txt`; the exception at the
 end applies only to `wasi-common`.
 The `process-wrap` provenance notice and MIT option are preserved in
 `LICENSES/PROCESS-WRAP-COPYRIGHT.txt` and `LICENSES/PROCESS-WRAP-MIT.txt`; the
 full Apache-2.0 terms are also present in the `wasi-common` license file.
+The MIT notice omitted from the published `stretch` 0.3.2 crate is preserved in
+`LICENSES/STRETCH-MIT.txt`.
 
 ## Rio / Sugarloaf MIT license
 
