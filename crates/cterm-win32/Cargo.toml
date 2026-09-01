@@ -38,6 +38,8 @@ windows = { version = "0.60", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_SystemServices",
     "Win32_Security",
     "Win32_Globalization",
 ]}
@@ -49,6 +51,7 @@ env_logger.workspace = true
 clap.workspace = true
 tokio.workspace = true
 futures.workspace = true
+url.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [

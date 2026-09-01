@@ -12,6 +12,7 @@ pub mod dialog_utils;
 pub mod dialogs;
 pub mod docker_dialog;
 pub mod dpi;
+mod drop_target;
 pub mod keycode;
 pub mod log_viewer;
 pub mod menu;

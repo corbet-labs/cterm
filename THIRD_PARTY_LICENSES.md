@@ -15,6 +15,8 @@ components listed here. The original notices are preserved in the derived files.
 | Qwertty Term / Ghostty | `9021f511bf053ec4155298e43a65de4365a13f80`; `2da015cd6` | Adapted Qwertty Term's Rust port of Ghostty's complete Kitty OSC 72 command vocabulary and parser test matrix in `cterm-core`; cterm adds strict integer, duplicate-key, terminator, chunk-chain, and payload bounds | MIT |
 | Yazi | `a73d235678db3a070b7e013ccf9573bf45a5324f` | Adapted Kitty OSC 72 chunk-state, bounded wire-framing, and MIME-payload test cases in `cterm-core` and `cterm-app` | MIT |
 | Elio | `3a39678609e927ea4f248a3cf40d7dbf353260fe` | Behavioral reference for tested Kitty OSC 72 client sequencing, local URI-list negotiation, and chunk boundaries; no source copied | MIT |
+| Tao | `2f9eecf236f4f6a8acfa03329c57039224a3ce99` | Adapted the tested Rust `IDropTarget`, `CF_HDROP`, dynamically sized path extraction, and OLE registration lifecycle for the Win32 Kitty OSC 72 adapter | Apache-2.0 |
+| Baseview | `c36ca154f882353f04684973dfe683c1b3d6abb3` | Behavioral reference for client-coordinate drag movement and retaining parsed file data across Win32 drag callbacks; no source copied | MIT OR Apache-2.0 |
 | `shared_memory-rs` | `68563b3aa82b832dfb73b18a59f4db34ff182df2` (`0.12.4`) | Cargo dependency providing tested Windows named-mapping lifecycle for Kitty shared-memory transfers; no source copied | MIT OR Apache-2.0 |
 | `nix` | `9cd968a1af35b46b05ed41e05acfcca5d02a5645` (`0.31.3`) | Cargo dependency providing safe POSIX `shm_open`, `shm_unlink`, and descriptor ownership on Linux, macOS, and FreeBSD; no source copied | MIT |
 | `memmap2` | `7710019665fec7bdac1dc18cf6661fbe215a1ad2` (`0.9.11`) | Cargo dependency providing tested read-only POSIX mapping for Kitty shared-memory payload snapshots; no source copied | MIT OR Apache-2.0 |
@@ -27,8 +29,9 @@ MIT grant and notice in `LICENSES/KARPELESLAB-CTERM-MIT.txt`. Subsequent cterm
 contributions are provided under FSL-1.1-ALv2; see `LICENSE`.
 
 The selected Wasmi MIT notice is preserved in `LICENSES/WASMI-MIT.txt`.
-`wasi-common`'s Apache-2.0 license with LLVM exception is preserved in
-`LICENSES/WASI-COMMON-APACHE-2.0-WITH-LLVM-EXCEPTION.txt`.
+The standard Apache-2.0 terms covering Tao are preserved in
+`LICENSES/WASI-COMMON-APACHE-2.0-WITH-LLVM-EXCEPTION.txt`; the exception at the
+end applies only to `wasi-common`.
 The `process-wrap` provenance notice and MIT option are preserved in
 `LICENSES/PROCESS-WRAP-COPYRIGHT.txt` and `LICENSES/PROCESS-WRAP-MIT.txt`; the
 full Apache-2.0 terms are also present in the `wasi-common` license file.

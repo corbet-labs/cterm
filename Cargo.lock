@@ -859,6 +859,7 @@ dependencies = [
  "parking_lot",
  "tempfile",
  "tokio",
+ "url",
  "winapi",
  "windows 0.60.0",
 ]

@@ -22,6 +22,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use cterm_app::config::Config;
 use cterm_app::file_transfer::PendingFileManager;
+use cterm_app::kitty_dnd::{
+    DndAdapterAction, DndDestination, DndLocation, DndOperation, DropData, URI_LIST_MIME,
+};
 use cterm_app::shortcuts::ShortcutManager;
 use cterm_app::{
     PluginAuthorization, PluginExecution, PluginRuntime, PluginRuntimeError, TemplateDaemonTarget,
@@ -46,6 +49,7 @@ use cterm_ui::{BlinkClock, BlinkNeeds, BLINK_POLL_INTERVAL};
 
 use crate::clipboard;
 use crate::dpi::{self, DpiInfo};
+use crate::drop_target::DropRegistration;
 use crate::keycode;
 use crate::keycode::{
     associated_key_text, mapped_terminal_key_with_layout, pc101_key_for_scan_code,
@@ -66,6 +70,7 @@ pub const WM_APP_DESKTOP_NOTIFICATION: u32 = WM_APP + 5;
 pub const WM_APP_NATIVE_NOTIFICATION: u32 = WM_APP + 6;
 pub const WM_APP_DAEMON_SESSION_READY: u32 = WM_APP + 7;
 pub const WM_APP_PLUGIN_RESULT: u32 = WM_APP + 8;
+pub const WM_APP_DND_COMMAND: u32 = WM_APP + 9;
 
 type PluginCommandResult = Result<PluginExecution, PluginRuntimeError>;
 
@@ -238,6 +243,7 @@ pub struct PaneEntry {
     pub has_bell: bool,
     /// Command sender for daemon-backed panes.
     pub daemon_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<DaemonCmd>>,
+    dnd_destination: DndDestination,
     backend: PaneBackendContext,
 }
 
@@ -331,6 +337,7 @@ impl TabEntry {
 /// Window state
 pub struct WindowState {
     pub hwnd: HWND,
+    drop_registration: Option<DropRegistration>,
     pub config: Config,
     pub theme: Theme,
     pub shortcuts: ShortcutManager,
@@ -462,6 +469,7 @@ impl WindowState {
 
         Self {
             hwnd,
+            drop_registration: None,
             config: config.clone(),
             theme: theme.clone(),
             shortcuts,
@@ -523,6 +531,62 @@ impl WindowState {
         let renderer = TerminalRenderer::new(self.hwnd, &self.theme, font_family, font_size)?;
         self.renderer = Some(renderer);
         Ok(())
+    }
+
+    fn init_drop_target(&mut self) {
+        self.drop_registration = DropRegistration::register(self.hwnd);
+    }
+
+    fn terminal_for_source(&self, source_id: u64) -> Option<Arc<Mutex<Terminal>>> {
+        let (tab_index, pane_id) = self.source_location(source_id)?;
+        self.tabs
+            .get(tab_index)?
+            .panes
+            .get(&pane_id)
+            .map(|pane| Arc::clone(&pane.terminal))
+    }
+
+    fn write_dnd_frames(&self, source_id: u64, frames: Vec<Vec<u8>>) {
+        if frames.is_empty() {
+            return;
+        }
+        let Some(terminal) = self.terminal_for_source(source_id) else {
+            return;
+        };
+        let mut terminal = terminal.lock().unwrap();
+        for frame in frames {
+            if let Err(error) = terminal.write(&frame) {
+                log::error!("Failed to write Kitty DND frame to PTY: {error}");
+                break;
+            }
+        }
+    }
+
+    fn apply_dnd_actions(&self, source_id: u64, actions: Vec<DndAdapterAction>) {
+        let frames = actions
+            .into_iter()
+            .filter_map(|action| match action {
+                DndAdapterAction::Write(frame) => Some(frame),
+                DndAdapterAction::RegistrationChanged { .. }
+                | DndAdapterAction::DropFinished(_) => None,
+            })
+            .collect();
+        self.write_dnd_frames(source_id, frames);
+    }
+
+    fn on_dnd_command(&mut self, source_id: u64, command: cterm_core::DndCommand) {
+        if command.command_type == cterm_core::DndCommandType::Query
+            && self.drop_registration.is_none()
+        {
+            return;
+        }
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return;
+        };
+        let actions = self.tabs[tab_index].panes[&pane_id]
+            .dnd_destination
+            .handle_command(command);
+        self.apply_dnd_actions(source_id, actions);
     }
 
     fn allocate_source_id(&self) -> u64 {
@@ -845,6 +909,7 @@ impl WindowState {
                 keep_open,
                 has_bell: false,
                 daemon_cmd_tx: Some(cmd_tx),
+                dnd_destination: DndDestination::default(),
                 backend,
             },
         );
@@ -1003,6 +1068,7 @@ impl WindowState {
                 keep_open: false,
                 has_bell: false,
                 daemon_cmd_tx: Some(cmd_tx),
+                dnd_destination: DndDestination::default(),
                 backend: PaneBackendContext::Daemon(Box::new(attached_context)),
             },
         );
@@ -1188,6 +1254,7 @@ impl WindowState {
             keep_open: pane_state.keep_open,
             has_bell: alerted,
             daemon_cmd_tx: Some(command_sender),
+            dnd_destination: DndDestination::default(),
             backend: PaneBackendContext::Daemon(Box::new(context)),
         })
     }
@@ -1227,6 +1294,7 @@ impl WindowState {
             keep_open: true,
             has_bell: true,
             daemon_cmd_tx: None,
+            dnd_destination: DndDestination::default(),
             backend: PaneBackendContext::Daemon(Box::new(
                 self.restored_daemon_context(pane_state, None, cols, rows),
             )),
@@ -1310,6 +1378,9 @@ impl WindowState {
                             },
                             TerminalEvent::DesktopNotification(notification) => {
                                 post_desktop_notification(hwnd, source_id, notification);
+                            }
+                            TerminalEvent::DndCommand(command) => {
+                                post_dnd_command(hwnd, source_id, command);
                             }
                             TerminalEvent::ProcessExited(_) => {
                                 unsafe {
@@ -1575,6 +1646,7 @@ impl WindowState {
             keep_open: false,
             has_bell: false,
             daemon_cmd_tx: None,
+            dnd_destination: DndDestination::default(),
             backend: PaneBackendContext::LocalPty,
         })
     }
@@ -1657,6 +1729,7 @@ impl WindowState {
             keep_open: false,
             has_bell: false,
             daemon_cmd_tx: Some(command_sender),
+            dnd_destination: DndDestination::default(),
             backend: PaneBackendContext::Daemon(Box::new(context)),
         })
     }
@@ -3487,6 +3560,124 @@ impl WindowState {
         )
     }
 
+    fn native_dnd_target_at(&self, x: i32, y: i32) -> Option<(u64, DndLocation)> {
+        let (pane_id, rect) = self.pane_at_client_point(x as f32, y as f32)?;
+        let tab = self.tabs.get(self.active_tab_index)?;
+        let source_id = tab.panes.get(&pane_id)?.source_id;
+        let dimensions = self.renderer.as_ref()?.cell_dimensions();
+        let pixel_x = x.saturating_sub(rect.x as i32).max(0);
+        let pixel_y = y
+            .saturating_sub(self.terminal_y_offset().floor() as i32)
+            .saturating_sub(rect.y as i32)
+            .max(0);
+        let (cell_x, cell_y) = mouse::pixel_to_cell(pixel_x, pixel_y, &dimensions, 0);
+        Some((
+            source_id,
+            DndLocation {
+                cell_x: cell_x.min(i32::MAX as usize) as i32,
+                cell_y: cell_y.min(i32::MAX as usize) as i32,
+                pixel_x,
+                pixel_y,
+            },
+        ))
+    }
+
+    fn source_accepts_uri_drop(&self, source_id: u64) -> bool {
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return false;
+        };
+        let destination = &self.tabs[tab_index].panes[&pane_id].dnd_destination;
+        destination.is_enabled()
+            && (destination.registered_mimes().is_empty()
+                || destination
+                    .registered_mimes()
+                    .iter()
+                    .any(|mime| mime == URI_LIST_MIME))
+    }
+
+    pub(crate) fn native_dnd_moved(
+        &mut self,
+        x: i32,
+        y: i32,
+        previous_source: Option<u64>,
+    ) -> (Option<u64>, bool) {
+        let target = self
+            .native_dnd_target_at(x, y)
+            .filter(|(source_id, _)| self.source_accepts_uri_drop(*source_id));
+        let target_source = target.map(|(source_id, _)| source_id);
+        if previous_source != target_source {
+            if let Some(source_id) = previous_source {
+                self.native_dnd_left(source_id);
+            }
+        }
+        let Some((source_id, location)) = target else {
+            return (None, false);
+        };
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return (None, false);
+        };
+        let destination = &mut self.tabs[tab_index].panes[&pane_id].dnd_destination;
+        let frames = match destination.drag_moved(
+            location,
+            DndOperation::Copy,
+            &[URI_LIST_MIME.to_string()],
+        ) {
+            Ok(frames) => frames,
+            Err(error) => {
+                log::warn!("Failed to report Kitty DND motion: {error:?}");
+                return (Some(source_id), false);
+            }
+        };
+        let accepted = destination.accepted_operation() == DndOperation::Copy;
+        self.write_dnd_frames(source_id, frames);
+        (Some(source_id), accepted)
+    }
+
+    pub(crate) fn native_dnd_left(&mut self, source_id: u64) {
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return;
+        };
+        let frames = self.tabs[tab_index].panes[&pane_id]
+            .dnd_destination
+            .drag_left();
+        self.write_dnd_frames(source_id, frames);
+    }
+
+    pub(crate) fn native_dnd_drop(
+        &mut self,
+        source_id: u64,
+        x: i32,
+        y: i32,
+        uri_list: Vec<u8>,
+    ) -> bool {
+        let Some((target_source, location)) = self.native_dnd_target_at(x, y) else {
+            return false;
+        };
+        if target_source != source_id || !self.source_accepts_uri_drop(source_id) {
+            return false;
+        }
+        let Some((tab_index, pane_id)) = self.source_location(source_id) else {
+            return false;
+        };
+        let frames = self.tabs[tab_index].panes[&pane_id]
+            .dnd_destination
+            .dropped(
+                location,
+                DndOperation::Copy,
+                vec![DropData::uri_list(uri_list)],
+            );
+        match frames {
+            Ok(frames) => {
+                self.write_dnd_frames(source_id, frames);
+                true
+            }
+            Err(error) => {
+                log::warn!("Rejected Kitty DND drop: {error:?}");
+                false
+            }
+        }
+    }
+
     fn divider_at_client_point(&self, x: f32, y: f32) -> Option<PaneDivider> {
         let offset = self.terminal_y_offset();
         if x < 0.0 || y < offset {
@@ -4378,6 +4569,7 @@ pub fn create_window(config: &Config, theme: &Theme) -> windows::core::Result<HW
             BLINK_POLL_INTERVAL.as_millis() as u32,
             None,
         );
+        (*state_ptr).init_drop_target();
     }
 
     if args.fullscreen {
@@ -4638,20 +4830,21 @@ pub fn create_window_from_upgrade(
     }
 
     // Store state pointer in window
+    let state_ptr = Box::into_raw(state);
     unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
         let _ = SetTimer(
             Some(hwnd),
             BLINK_TIMER_ID,
             BLINK_POLL_INTERVAL.as_millis() as u32,
             None,
         );
+        (*state_ptr).init_drop_target();
     }
 
     // Restore fullscreen/maximized state
     if window_state.fullscreen {
         // Toggle fullscreen via the window state method
-        let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
         if !state_ptr.is_null() {
             let state = unsafe { &mut *state_ptr };
             state.toggle_fullscreen();
@@ -5018,6 +5211,9 @@ async fn run_daemon_io_loop(
                                                     notification,
                                                 );
                                             }
+                                            TerminalEvent::DndCommand(command) => {
+                                                post_dnd_command(hwnd, tab_id, command);
+                                            }
                                             TerminalEvent::ContentChanged => content_changed = true,
                                             _ => {}
                                         }
@@ -5081,6 +5277,21 @@ fn post_desktop_notification(
         unsafe {
             drop(Box::from_raw(notification));
         }
+    }
+}
+
+fn post_dnd_command(hwnd: usize, source_id: u64, command: cterm_core::DndCommand) {
+    let command = Box::into_raw(Box::new(command));
+    let result = unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_APP_DND_COMMAND,
+            WPARAM(source_id as usize),
+            LPARAM(command as isize),
+        )
+    };
+    if result.is_err() {
+        unsafe { drop(Box::from_raw(command)) };
     }
 }
 
@@ -5405,6 +5616,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             if lparam.0 != 0 {
                 let result = unsafe { Box::from_raw(lparam.0 as *mut PluginCommandResult) };
                 state.on_plugin_result(*result);
+            }
+            LRESULT(0)
+        }
+
+        WM_APP_DND_COMMAND => {
+            if lparam.0 != 0 {
+                let command = unsafe { Box::from_raw(lparam.0 as *mut cterm_core::DndCommand) };
+                state.on_dnd_command(wparam.0 as u64, *command);
             }
             LRESULT(0)
         }
@@ -6148,6 +6367,7 @@ mod tests {
             keep_open: true,
             has_bell: false,
             daemon_cmd_tx: None,
+            dnd_destination: DndDestination::default(),
             backend: PaneBackendContext::LocalPty,
         };
         let tab = TabEntry {
