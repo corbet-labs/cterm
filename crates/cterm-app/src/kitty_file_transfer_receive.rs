@@ -931,7 +931,9 @@ fn file_identity(file: &fs::File, _metadata: &fs::Metadata) -> io::Result<FileId
     let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
     // SAFETY: the file handle is valid for this call and `information` points
     // to writable storage of the exact structure expected by Win32.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr()) }
+        == 0
+    {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the successful Win32 call initialized the structure.
